@@ -362,23 +362,6 @@ impl PyDynamicContext {
 
         (overlay_nodes, overlay_edges)
     }
-
-    fn to_rust(&self) -> DynamicContext {
-        let (overlay_nodes, overlay_edges) = self.parse_overlays();
-
-        DynamicContext {
-            semantic_boosts: self.semantic_boosts.clone(),
-            weight_overrides: self.weight_overrides.clone(),
-            noise_tags: self.noise_tags.clone(),
-            max_fan_out: self.max_fan_out,
-            w_base: self.w_base,
-            w_semantic: self.w_semantic,
-            w_noise: self.w_noise,
-            w_override: self.w_override,
-            overlay_nodes,
-            overlay_edges,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
