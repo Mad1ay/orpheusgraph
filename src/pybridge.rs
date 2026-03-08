@@ -41,6 +41,8 @@ impl GraphInner {
 #[pyclass(name = "OrpheusGraph")]
 pub struct PyOrpheusGraph {
     inner: Option<GraphInner>,
+    /// Risk #14: cache parsed overlay data per project_id to avoid FFI overhead.
+    overlay_cache: HashMap<String, (Vec<NodeData>, Vec<(String, String, EdgeData)>)>,
 }
 
 impl Drop for PyOrpheusGraph {
@@ -59,6 +61,36 @@ impl PyOrpheusGraph {
                     "Graph has been closed. Call build_graph() or from_rkyv() to create a new one.",
                 )
             })
+    }
+
+    /// Risk #14: resolve DynamicContext with overlay caching.
+    /// If overlay_cache_key is set, reuse cached parsed overlay data.
+    fn resolve_context(&mut self, ctx: &PyDynamicContext) -> DynamicContext {
+        let (overlay_nodes, overlay_edges) = match &ctx.overlay_cache_key {
+            Some(key) if !ctx.overlay_nodes_raw.is_empty() || !ctx.overlay_edges_raw.is_empty() => {
+                if let Some(cached) = self.overlay_cache.get(key) {
+                    cached.clone()
+                } else {
+                    let parsed = ctx.parse_overlays();
+                    self.overlay_cache.insert(key.clone(), parsed.clone());
+                    parsed
+                }
+            }
+            _ => ctx.parse_overlays(),
+        };
+
+        DynamicContext {
+            semantic_boosts: ctx.semantic_boosts.clone(),
+            weight_overrides: ctx.weight_overrides.clone(),
+            noise_tags: ctx.noise_tags.clone(),
+            max_fan_out: ctx.max_fan_out,
+            w_base: ctx.w_base,
+            w_semantic: ctx.w_semantic,
+            w_noise: ctx.w_noise,
+            w_override: ctx.w_override,
+            overlay_nodes,
+            overlay_edges,
+        }
     }
 }
 
@@ -113,15 +145,15 @@ impl PyOrpheusGraph {
 
     /// Top-K pruned BFS. GIL released during traversal.
     fn beam_traverse(
-        &self,
+        &mut self,
         py: Python<'_>,
         start: &str,
         k: usize,
         depth: usize,
         ctx: &PyDynamicContext,
     ) -> PyResult<Vec<PyNodeResult>> {
+        let rust_ctx = self.resolve_context(ctx);
         let graph = self.require_inner()?;
-        let rust_ctx = ctx.to_rust();
         let start_owned = start.to_string();
 
         let results = py.allow_threads(|| {
@@ -133,14 +165,14 @@ impl PyOrpheusGraph {
 
     /// Weighted Dijkstra. GIL released during traversal.
     fn find_path(
-        &self,
+        &mut self,
         py: Python<'_>,
         start: &str,
         end: &str,
         ctx: &PyDynamicContext,
     ) -> PyResult<Option<Vec<PyPathStep>>> {
+        let rust_ctx = self.resolve_context(ctx);
         let graph = self.require_inner()?;
-        let rust_ctx = ctx.to_rust();
         let start_owned = start.to_string();
         let end_owned = end.to_string();
 
@@ -153,13 +185,13 @@ impl PyOrpheusGraph {
 
     /// Contextual subgraph extraction. GIL released.
     fn contextual_subgraph(
-        &self,
+        &mut self,
         py: Python<'_>,
         ctx: &PyDynamicContext,
         k: usize,
     ) -> PyResult<PySubGraph> {
+        let rust_ctx = self.resolve_context(ctx);
         let graph = self.require_inner()?;
-        let rust_ctx = ctx.to_rust();
 
         let sg = py.allow_threads(|| {
             traversal::contextual_subgraph(graph, &rust_ctx, k)
@@ -235,6 +267,10 @@ pub struct PyDynamicContext {
     pub overlay_nodes_raw: Vec<HashMap<String, String>>,
     /// Virtual overlay edges: [{"from": ..., "to": ..., "kind": ...}].
     pub overlay_edges_raw: Vec<HashMap<String, String>>,
+    /// Risk #14: cache key for overlay data per project.
+    /// If set & matches previous call, reuse cached parsed overlay.
+    #[pyo3(get, set)]
+    pub overlay_cache_key: Option<String>,
 }
 
 #[pymethods]
@@ -250,7 +286,8 @@ impl PyDynamicContext {
         w_noise = 1.0,
         w_override = 1.0,
         overlay_nodes = None,
-        overlay_edges = None
+        overlay_edges = None,
+        overlay_cache_key = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -264,6 +301,7 @@ impl PyDynamicContext {
         w_override: f32,
         overlay_nodes: Option<Vec<HashMap<String, String>>>,
         overlay_edges: Option<Vec<HashMap<String, String>>>,
+        overlay_cache_key: Option<String>,
     ) -> Self {
         Self {
             semantic_boosts: semantic_boosts.unwrap_or_default(),
@@ -276,6 +314,7 @@ impl PyDynamicContext {
             w_override,
             overlay_nodes_raw: overlay_nodes.unwrap_or_default(),
             overlay_edges_raw: overlay_edges.unwrap_or_default(),
+            overlay_cache_key,
         }
     }
 
@@ -291,7 +330,8 @@ impl PyDynamicContext {
 }
 
 impl PyDynamicContext {
-    fn to_rust(&self) -> DynamicContext {
+    /// Parse overlay raw dicts into Rust types.
+    fn parse_overlays(&self) -> (Vec<NodeData>, Vec<(String, String, EdgeData)>) {
         let overlay_nodes = self
             .overlay_nodes_raw
             .iter()
@@ -319,6 +359,12 @@ impl PyDynamicContext {
                 (from, to, edge)
             })
             .collect();
+
+        (overlay_nodes, overlay_edges)
+    }
+
+    fn to_rust(&self) -> DynamicContext {
+        let (overlay_nodes, overlay_edges) = self.parse_overlays();
 
         DynamicContext {
             semantic_boosts: self.semantic_boosts.clone(),
@@ -516,6 +562,7 @@ pub fn py_build_graph(nodes: &Bound<'_, PyList>, edges: &Bound<'_, PyList>) -> P
 
     Ok(PyOrpheusGraph {
         inner: Some(GraphInner::Owned(graph_inner)),
+        overlay_cache: HashMap::new(),
     })
 }
 
@@ -529,5 +576,6 @@ pub fn py_from_rkyv(data: &Bound<'_, PyBytes>) -> PyResult<PyOrpheusGraph> {
 
     Ok(PyOrpheusGraph {
         inner: Some(GraphInner::Archived(view)),
+        overlay_cache: HashMap::new(),
     })
 }

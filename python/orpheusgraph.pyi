@@ -45,6 +45,7 @@ class DynamicContext:
         w_override: float = 1.0,
         overlay_nodes: list[dict[str, str]] | None = None,
         overlay_edges: list[dict[str, str]] | None = None,
+        overlay_cache_key: str | None = None,
     ) -> None: ...
 
 class NodeResult:

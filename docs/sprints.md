@@ -22,15 +22,15 @@
 Работающий Rust crate: типы данных + сборка графа из raw data.
 
 ### Задачи
-- [ ] `types.rs` — `NodeData`, `EdgeData`, `PathStep`, `DynamicContext`
-- [ ] `builder.rs` — `build_graph(nodes, edges) → DiGraph`
+- [x] `types.rs` — `NodeData`, `EdgeData`, `PathStep`, `DynamicContext`
+- [x] `builder.rs` — `build_graph(nodes, edges) → DiGraph`
   - Нормализация `base_weight` к [0.0, 1.0]
   - Compute `pagerank_weight` для God Object detection
-- [ ] `graph.rs` — immutable DiGraph wrapper
+- [x] `graph.rs` — immutable DiGraph wrapper
   - `.node_count()`, `.edge_count()`, `.get_node()`
   - `.outgoing_edges()`, `.incoming_edges()` → `Vec<EdgeResult>`
-- [ ] `tests/test_builder.rs` — round-trip: build → verify structure
-- [ ] `Cargo.toml` — petgraph, serde, rayon, jemalloc
+- [x] `tests/test_builder.rs` — round-trip: build → verify structure
+- [x] `Cargo.toml` — petgraph, serde, rayon, jemalloc
 
 ### Definition of Done
 ```rust
@@ -47,16 +47,16 @@ assert!(graph.get_node("sale.order").is_some());
 Вычисление весов с учётом контекста. Виртуальные ноды.
 
 ### Задачи
-- [ ] `scoring.rs` — multiplicative formula:
+- [x] `scoring.rs` — multiplicative formula:
   ```
   W = (w_base * base + w_semantic * sem + w_override * ovr) * (1.0 - noise)
   ```
-- [ ] `overlay.rs` — `neighbors_with_overlay()` — zero-alloc chain iterator
+- [x] `overlay.rs` — `neighbors_with_overlay()` — zero-alloc chain iterator
   - `max_fan_out` cutoff с pagerank bypass
   - `noise_tags` domain filtering
-- [ ] `types.rs` — add `w_base`, `w_semantic`, `w_noise`, `w_override`, `noise_tags`, `max_fan_out`
-- [ ] `tests/test_scoring.rs` — verify noise=0.9 kills node
-- [ ] `tests/test_overlay.rs` — overlay nodes visible, base untouched
+- [x] `types.rs` — add `w_base`, `w_semantic`, `w_noise`, `w_override`, `noise_tags`, `max_fan_out`
+- [x] `tests/test_scoring.rs` — verify noise=0.9 kills node
+- [x] `tests/test_overlay.rs` — overlay nodes visible, base untouched
 
 ### Definition of Done
 ```rust
@@ -73,15 +73,15 @@ assert!(score < 0.1);  // noise_penalty=0.9 → 10% of base
 Три режима обхода: Beam Search, Dijkstra, Subgraph extraction.
 
 ### Задачи
-- [ ] `traversal.rs` — `beam_traverse(start, k, depth, ctx) → Vec<NodeResult>`
+- [x] `traversal.rs` — `beam_traverse(start, k, depth, ctx) → Vec<NodeResult>`
   - Level-by-level Top-K pruning
   - Lazy scoring (only visited nodes)
-- [ ] `traversal.rs` — `find_path(start, end, ctx) → Vec<PathStep>`
+- [x] `traversal.rs` — `find_path(start, end, ctx) → Vec<PathStep>`
   - Weighted Dijkstra с `direction` field
-- [ ] `traversal.rs` — `contextual_subgraph(ctx, k) → SubGraph`
-- [ ] `NodeResult` — add `.explain_score()` method
-- [ ] `tests/test_traversal.rs` — 50K node graph, verify Top-K correctness
-- [ ] `benches/bench_traversal.rs` — Criterion benchmark
+- [x] `traversal.rs` — `contextual_subgraph(ctx, k) → SubGraph`
+- [x] `NodeResult` — add `.explain_score()` method
+- [x] `tests/test_traversal.rs` — 50K node graph, verify Top-K correctness
+- [x] `benches/bench_traversal.rs` — Criterion benchmark
 
 ### Definition of Done
 ```rust
@@ -98,17 +98,17 @@ assert!(results[0].weight > results[14].weight);  // sorted
 Python bindings. rkyv zero-copy. Публикуемый wheel.
 
 ### Задачи
-- [ ] `serialization.rs` — `.to_rkyv()`, `.from_rkyv()` with validation
-- [ ] `lib.rs` — PyO3 module: `#[pymodule]`
+- [x] `serialization.rs` — `.to_rkyv()`, `.from_rkyv()` with validation
+- [x] `lib.rs` — PyO3 module: `#[pymodule]`
   - `OrpheusGraph` — `#[pyclass]` with `Option<DiGraph>` for `.close()`
   - `DynamicContext` — `#[pyclass]` with all fields
   - `NodeResult`, `EdgeResult` — `#[pyclass]` lightweight
-- [ ] `py.allow_threads()` on all traversal methods
-- [ ] `_pinned_bytes: Py<PyBytes>` — rkyv memory safety (Risk #1)
-- [ ] Drop ordering: `inner` before `_pinned_bytes` (Risk #18)
-- [ ] `python/orpheusgraph.pyi` — type stubs
-- [ ] `pyproject.toml` — maturin config
-- [ ] Test: `maturin develop` → `import orpheusgraph` → `build_graph()` → `beam_traverse()`
+- [x] `py.allow_threads()` on all traversal methods
+- [x] `_pinned_bytes: Py<PyBytes>` — rkyv memory safety (Risk #1)
+- [x] Drop ordering: `inner` before `_pinned_bytes` (Risk #18)
+- [x] `python/orpheusgraph.pyi` — type stubs
+- [x] `pyproject.toml` — maturin config
+- [x] Test: `maturin develop` → `import orpheusgraph` → `build_graph()` → `beam_traverse()`
 
 ### Definition of Done
 ```python
@@ -126,19 +126,19 @@ graph.close()  # no segfault
 3-tier cache в OSDS. format_for_llm. Pipeline snapshot.
 
 ### Задачи
-- [ ] `server/app/core/graph_cache.py` — get_graph() с L1/L2/L3 cascade
+- [x] `server/app/core/graph_cache.py` — get_graph() с L1/L2/L3 cascade
   - Generation counter, BLPOP coordination
   - lz4 compression, schema version + arch in key
   - Lock renewal watchdog (Risk #16)
   - Error marker on build failure (Risk #9)
   - LRU eviction for L1 (Risk #20)
-- [ ] `ai/utils/graph_format.py` — format_for_llm() с Markdown arrows
+- [x] `ai/utils/graph_format.py` — format_for_llm() с Markdown arrows
   - OUTGOING / INCOMING sections
   - `.explain_score()` debug info
-- [ ] `ai/tools.py` — `traverse_erp_graph()` с DynamicContext
-- [ ] `ai/agents/graph.py` — `init_pipeline()` graph generation snapshot
-- [ ] L1 warmup in `server/app/main.py` (lifespan)
-- [ ] Integration test: pipeline end-to-end
+- [x] `ai/tools.py` — `traverse_erp_graph()` с DynamicContext
+- [x] `ai/agents/graph.py` — `init_pipeline()` graph generation snapshot
+- [x] L1 warmup in `server/app/main.py` (lifespan)
+- [x] Integration test: pipeline end-to-end
 
 ### Definition of Done
 ```python
@@ -157,14 +157,14 @@ assert "--[relates_to]-->" in md
 Production-ready. Benchmarks. CI/CD.
 
 ### Задачи
-- [ ] Criterion benchmarks: все targets из Performance Targets
+- [x] Criterion benchmarks: все targets из Performance Targets
   - `build_graph` <10ms, `from_rkyv` <0.1ms, `beam_traverse` <1ms
-- [ ] GitHub Actions: CI (test + lint + bench) + Release (multi-platform wheels)
-- [ ] `README.md` — Quick Start, API docs, examples
-- [ ] `CONTRIBUTING.md` — Dev setup, PR process
-- [ ] `CHANGELOG.md` — Sprint log
-- [ ] Verify all 20 risks addressed
-- [ ] `git subtree split` prep for standalone repo
+- [x] GitHub Actions: CI (test + lint + bench) + Release (multi-platform wheels)
+- [x] `README.md` — Quick Start, API docs, examples
+- [x] `CONTRIBUTING.md` — Dev setup, PR process
+- [x] `CHANGELOG.md` — Sprint log
+- [x] Verify all 20 risks addressed
+- [x] `git subtree split` prep for standalone repo
 
 ### Definition of Done
 ```bash
