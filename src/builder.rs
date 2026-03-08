@@ -50,7 +50,7 @@ pub fn build_graph(
         .iter()
         .map(|n| n.base_weight)
         .fold(0.0_f32, f32::max);
-    let norm_divisor = if max_weight > 0.0 { max_weight } else { 1.0 };
+    let norm_divisor = if max_weight > f32::EPSILON { max_weight } else { 1.0 };
 
     for input in &nodes {
         let node_data = NodeData {
@@ -137,7 +137,7 @@ fn compute_pagerank(graph: &mut DiGraph<NodeData, EdgeData>, damping: f32, itera
 
     // Normalize to [0.0, 1.0]
     let max_score = scores.iter().copied().fold(0.0_f32, f32::max);
-    let norm = if max_score > 0.0 { max_score } else { 1.0 };
+    let norm = if max_score > f32::EPSILON { max_score } else { 1.0 };
 
     for node_idx in graph.node_indices() {
         graph[node_idx].pagerank_weight = scores[node_idx.index()] / norm;
