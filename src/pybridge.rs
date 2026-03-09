@@ -203,6 +203,35 @@ impl PyOrpheusGraph {
         })
     }
 
+    /// Multi-source heatmap intersection. GIL released during computation.
+    ///
+    /// Launches beam_traverse from each start node, accumulates a weighted
+    /// heatmap, then keeps only nodes hit by `threshold` or more beams.
+    /// Start nodes are always preserved.
+    #[pyo3(signature = (start_nodes, k, depth, ctx, threshold = None))]
+    fn multi_beam_intersection(
+        &mut self,
+        py: Python<'_>,
+        start_nodes: Vec<String>,
+        k: usize,
+        depth: usize,
+        ctx: &PyDynamicContext,
+        threshold: Option<usize>,
+    ) -> PyResult<PySubGraph> {
+        let rust_ctx = self.resolve_context(ctx);
+        let graph = self.require_inner()?;
+        let t = threshold.unwrap_or_else(|| start_nodes.len().saturating_sub(1).max(1));
+
+        let sg = py.allow_threads(|| {
+            traversal::multi_beam_intersection(graph, &rust_ctx, &start_nodes, k, depth, t)
+        });
+
+        Ok(PySubGraph {
+            nodes: sg.nodes.into_iter().map(PyNodeResult::from_node_result).collect(),
+            edges: sg.edges.into_iter().map(PyEdgeResult::from_edge_result).collect(),
+        })
+    }
+
     /// Serialize to rkyv bytes. Only works on Owned graphs.
     fn to_rkyv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let inner = self.inner.as_ref().ok_or_else(|| {

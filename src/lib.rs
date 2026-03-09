@@ -19,7 +19,7 @@ pub use builder::build_graph;
 pub use graph::OrpheusGraphInner;
 pub use overlay::{neighbors_with_overlay, resolve_overlay_node, NeighborEntry};
 pub use scoring::compute_score;
-pub use traversal::{beam_traverse, contextual_subgraph, find_path};
+pub use traversal::{beam_traverse, contextual_subgraph, find_path, multi_beam_intersection};
 pub use types::*;
 
 use pyo3::prelude::*;

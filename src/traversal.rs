@@ -283,6 +283,163 @@ pub fn contextual_subgraph(
     SubGraph { nodes, edges }
 }
 
+// ---------------------------------------------------------------------------
+// 4. Multi-Beam Intersection — Heatmap / Threshold
+// ---------------------------------------------------------------------------
+
+/// Multi-source heatmap intersection.
+///
+/// Launches an independent `beam_traverse` from each start node, then
+/// accumulates weighted scores into a shared heatmap. Only nodes whose
+/// **hit count ≥ threshold** (or that appear in `start_nodes`) survive.
+///
+/// Edges are reconstructed from the base graph + overlay, keeping only
+/// those whose both endpoints are in the filtered set.
+pub fn multi_beam_intersection(
+    graph: &dyn GraphAccessor,
+    ctx: &DynamicContext,
+    start_nodes: &[String],
+    k: usize,
+    depth: usize,
+    threshold: usize,
+) -> SubGraph {
+    use rayon::prelude::*;
+
+    // ── 1. Multi-beam launch ──────────────────────────────────────────
+    // Each beam returns Vec<NodeResult>. Collect them all.
+    let beam_results: Vec<Vec<NodeResult>> = if start_nodes.len() > 2 {
+        // Parallel: GraphAccessor is Send+Sync
+        start_nodes
+            .par_iter()
+            .map(|start| beam_traverse(graph, ctx, start, k, depth))
+            .collect()
+    } else {
+        start_nodes
+            .iter()
+            .map(|start| beam_traverse(graph, ctx, start, k, depth))
+            .collect()
+    };
+
+    // ── 2. Accumulate heatmap ─────────────────────────────────────────
+    // hit_count: how many beams visited this node
+    // weight_sum: sum of W_total across beams (Variant B — weighted)
+    let mut hit_count: HashMap<String, usize> = HashMap::new();
+    let mut weight_sum: HashMap<String, f32> = HashMap::new();
+    let mut best_result: HashMap<String, NodeResult> = HashMap::new();
+
+    for results in &beam_results {
+        // Track which nodes this particular beam visited (dedup per beam)
+        let mut seen_this_beam: HashSet<String> = HashSet::new();
+
+        for nr in results {
+            if seen_this_beam.insert(nr.name.clone()) {
+                *hit_count.entry(nr.name.clone()).or_insert(0) += 1;
+            }
+            *weight_sum.entry(nr.name.clone()).or_insert(0.0) += nr.weight;
+
+            // Keep the highest-scoring NodeResult for each node
+            let entry = best_result.entry(nr.name.clone());
+            entry
+                .and_modify(|existing| {
+                    if nr.weight > existing.weight {
+                        *existing = nr.clone();
+                    }
+                })
+                .or_insert_with(|| nr.clone());
+        }
+    }
+
+    // ── 3. Filter by threshold ────────────────────────────────────────
+    let start_set: HashSet<&str> = start_nodes.iter().map(|s| s.as_str()).collect();
+
+    let mut filtered_nodes: Vec<NodeResult> = Vec::new();
+    let mut filtered_set: HashSet<String> = HashSet::new();
+
+    // Always include start nodes (score them if they exist)
+    for start in start_nodes {
+        if filtered_set.insert(start.clone()) {
+            if let Some(nr) = best_result.remove(start) {
+                filtered_nodes.push(nr);
+            } else {
+                // Score the start node itself
+                let nr = if let Some(nv) = graph.get_node(start) {
+                    compute_score(&nv, ctx)
+                } else if let Some(ov) = resolve_overlay_node(start, ctx) {
+                    compute_score(&ov, ctx)
+                } else {
+                    continue;
+                };
+                filtered_nodes.push(nr);
+            }
+        }
+    }
+
+    // Include nodes above threshold
+    for (name, count) in &hit_count {
+        if *count >= threshold && !start_set.contains(name.as_str()) {
+            if let Some(nr) = best_result.remove(name) {
+                if filtered_set.insert(name.clone()) {
+                    filtered_nodes.push(nr);
+                }
+            }
+        }
+    }
+
+    // Sort by accumulated weight descending
+    filtered_nodes.sort_by(|a, b| {
+        let wa = weight_sum.get(&a.name).copied().unwrap_or(0.0);
+        let wb = weight_sum.get(&b.name).copied().unwrap_or(0.0);
+        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // ── 4. Edge reconstruction ────────────────────────────────────────
+    let mut edges: Vec<EdgeResult> = Vec::new();
+    let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
+
+    for node_name in &filtered_set {
+        // Base graph outgoing edges
+        for neighbor in graph.outgoing_neighbors(node_name) {
+            if filtered_set.contains(&neighbor.target_name) {
+                let key = (
+                    node_name.clone(),
+                    neighbor.target_name.clone(),
+                    neighbor.edge_kind.clone(),
+                );
+                if seen_edges.insert(key) {
+                    edges.push(EdgeResult {
+                        source: node_name.clone(),
+                        target: neighbor.target_name,
+                        kind: neighbor.edge_kind,
+                        field_name: neighbor.field_name,
+                        weight: neighbor.edge_weight,
+                    });
+                }
+            }
+        }
+
+        // Overlay edges
+        for (from, to, edge) in &ctx.overlay_edges {
+            if from == node_name && filtered_set.contains(to) {
+                let key = (from.clone(), to.clone(), edge.kind.clone());
+                if seen_edges.insert(key) {
+                    edges.push(EdgeResult {
+                        source: from.clone(),
+                        target: to.clone(),
+                        kind: edge.kind.clone(),
+                        field_name: edge.field_name.clone(),
+                        weight: edge.base_weight,
+                    });
+                }
+            }
+        }
+    }
+
+    SubGraph {
+        nodes: filtered_nodes,
+        edges,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +606,98 @@ mod tests {
         assert!(node_names.contains("C"), "B's neighbor C missing");
         assert!(node_names.contains("E"), "D's neighbor E missing");
         assert!(!sg.edges.is_empty());
+    }
+
+    // ── Multi-Beam Intersection Tests ────────────────────────────────
+
+    fn build_diamond_graph() -> OrpheusGraphInner {
+        // Diamond: A→B, A→C, B→D, C→D, D→E
+        let nodes = vec![
+            make_node("A", 0.7),
+            make_node("B", 0.8),
+            make_node("C", 0.6),
+            make_node("D", 0.9),
+            make_node("E", 0.5),
+        ];
+        let edges = vec![
+            make_edge("A", "B", "relates_to", Some("partner_id")),
+            make_edge("A", "C", "relates_to", Some("order_id")),
+            make_edge("B", "D", "relates_to", Some("move_id")),
+            make_edge("C", "D", "relates_to", Some("picking_id")),
+            make_edge("D", "E", "relates_to", Some("lot_id")),
+        ];
+        let (g, m) = build_graph(nodes, edges);
+        OrpheusGraphInner::new(g, m)
+    }
+
+    #[test]
+    fn test_multi_beam_basic() {
+        // Start from B and C; D is the shared intersection node
+        let graph = build_diamond_graph();
+        let ctx = DynamicContext::default();
+        let starts = vec!["B".to_string(), "C".to_string()];
+        let sg = multi_beam_intersection(&graph, &ctx, &starts, 5, 2, 2);
+
+        let node_names: HashSet<&str> = sg.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(node_names.contains("B"), "Start B missing");
+        assert!(node_names.contains("C"), "Start C missing");
+        assert!(node_names.contains("D"), "Shared node D missing from intersection");
+    }
+
+    #[test]
+    fn test_multi_beam_threshold_filters() {
+        // threshold=2: only nodes hit by BOTH beams survive
+        let graph = build_diamond_graph();
+        let ctx = DynamicContext::default();
+        let starts = vec!["B".to_string(), "C".to_string()];
+        let sg = multi_beam_intersection(&graph, &ctx, &starts, 5, 2, 2);
+
+        let node_names: HashSet<&str> = sg.nodes.iter().map(|n| n.name.as_str()).collect();
+        // E is only reachable from D which is hit by both, but E itself
+        // might only be hit by beams that traverse D→E.
+        // With threshold=2, E should appear only if reached by both beams.
+        // Both B→D→E and C→D→E exist, so E should be hit by both.
+        assert!(node_names.contains("D"), "D should be in intersection");
+        assert!(node_names.contains("E"), "E reachable from both beams via D");
+    }
+
+    #[test]
+    fn test_multi_beam_start_nodes_always_kept() {
+        let graph = build_chain_graph(); // A→B→C→D→E
+        let ctx = DynamicContext::default();
+        // Start from A and E — they share few nodes
+        let starts = vec!["A".to_string(), "E".to_string()];
+        let sg = multi_beam_intersection(&graph, &ctx, &starts, 5, 4, 2);
+
+        let node_names: HashSet<&str> = sg.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(node_names.contains("A"), "Start A always kept");
+        assert!(node_names.contains("E"), "Start E always kept");
+    }
+
+    #[test]
+    fn test_multi_beam_edge_reconstruction() {
+        let graph = build_diamond_graph();
+        let ctx = DynamicContext::default();
+        let starts = vec!["B".to_string(), "C".to_string()];
+        let sg = multi_beam_intersection(&graph, &ctx, &starts, 5, 2, 2);
+
+        let filtered_names: HashSet<&str> = sg.nodes.iter().map(|n| n.name.as_str()).collect();
+
+        // Every edge in the result must connect two filtered nodes
+        for edge in &sg.edges {
+            assert!(
+                filtered_names.contains(edge.source.as_str()),
+                "Edge source '{}' not in filtered set",
+                edge.source
+            );
+            assert!(
+                filtered_names.contains(edge.target.as_str()),
+                "Edge target '{}' not in filtered set",
+                edge.target
+            );
+        }
+
+        // At minimum we expect B→D and C→D edges
+        assert!(!sg.edges.is_empty(), "Should have reconstructed edges");
     }
 }
