@@ -20,15 +20,15 @@ graph TB
         Edges["outgoing/incoming_edges"]
     end
 
-    subgraph Python["Python Layer OSDS"]
+    subgraph Python["Python Layer (host application)"]
         Cache["graph_cache.py - 3-Tier"]
-        Tools["ai/tools.py"]
+        Tools["agent_tools.py"]
         Context["DynamicContext"]
         Format["format_for_llm - Markdown"]
     end
 
     subgraph LLM["LLM Pipeline"]
-        Agent["LangGraph Agent"]
+        Agent["RAG agent"]
         Prompt["Markdown context 2-3K tokens"]
     end
 

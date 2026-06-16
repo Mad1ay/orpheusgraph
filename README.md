@@ -1,7 +1,7 @@
 # orpheusgraph
 
 > Rust library with Python bindings for context-aware weighted graph traversal.
-> Open-source. Domain-agnostic. Built for RAG pipelines that need deterministic structure.
+> Source-available. Domain-agnostic. Built for RAG pipelines that need deterministic structure.
 
 ## What It Does
 
@@ -133,4 +133,13 @@ src/
 
 ## License
 
-MIT OR Apache-2.0
+`orpheusgraph` is **source-available** under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md):
+
+- ✅ **Free** for any **noncommercial** use — personal projects, research,
+  education, evaluation, and noncommercial organizations.
+- 💼 **Commercial use requires a commercial license.** If you use
+  `orpheusgraph` in a product, service, or for-profit operation, see
+  [COMMERCIAL.md](COMMERCIAL.md) or contact <kseniabezobiuk@gmail.com>.
+
+Contributions are accepted under the [Contributor License Agreement](CLA.md).

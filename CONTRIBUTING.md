@@ -1,5 +1,14 @@
 # Contributing to orpheusgraph
 
+## License of contributions
+
+`orpheusgraph` is dual-licensed: source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md) and available under separate
+[commercial licenses](COMMERCIAL.md). By opening a pull request you agree to the
+[Contributor License Agreement](CLA.md), which lets the maintainer include your
+contribution in both the noncommercial and commercial editions. Please read it
+before submitting.
+
 ## Prerequisites
 
 - **Rust**: stable toolchain (`rustup default stable`)
@@ -31,9 +40,8 @@ cargo clippy --all-targets -- -D warnings
 # Benchmarks (50K node graph)
 cargo bench
 
-# Python integration tests (requires maturin develop first)
-cd ../server
-pytest tests/test_graph_integration.py -v
+# Python smoke test (requires maturin develop first)
+python -c "import orpheusgraph; print('OK')"
 ```
 
 ## Code Style
