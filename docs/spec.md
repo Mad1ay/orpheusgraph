@@ -1,7 +1,7 @@
 # orpheusgraph — Knowledge Graph Traversal Engine
 
 > **Rust library with Python bindings for context-aware weighted graph traversal.**
-> Open-source. Domain-agnostic. Built for RAG pipelines that need deterministic structure, not probabilistic guessing.
+> Source-available. Domain-agnostic. Built for RAG pipelines that need deterministic structure, not probabilistic guessing.
 
 ## What It Does
 
@@ -267,7 +267,7 @@ orpheusgraph/
 │   └── test_overlay.rs     # Tenant isolation verification
 ├── benches/
 │   └── bench_traversal.rs  # Criterion benchmarks
-├── LICENSE                  # MIT or Apache-2.0
+├── LICENSE.md               # PolyForm Noncommercial 1.0.0
 └── README.md
 ```
 
@@ -466,12 +466,12 @@ RUN pip install /tmp/orpheusgraph-*.whl
 
 ---
 
-## OSDS Integration Example
+## Integration Example (reference)
 
-How the generic `orpheusgraph` maps to OSDS ERP domain:
+How the generic `orpheusgraph` maps to an ERP domain in a host application:
 
 ```python
-# server/app/core/graph_cache.py — 3-tier cache with generation counter
+# graph_cache.py — 3-tier cache with generation counter (reference)
 
 _L1_CACHE: dict[str, orpheusgraph.Graph] = {}  # in-process, per-worker
 _L1_GEN: dict[str, int] = {}             # tracks generation per key
@@ -535,7 +535,7 @@ async def invalidate(erp: str, ver: str):
 ```
 
 ```python
-# ai/tools.py
+# agent_tools.py (reference)
 
 @tool
 async def traverse_erp_graph(entity_name: str, version: str = "18.0") -> str:
@@ -559,7 +559,7 @@ async def traverse_erp_graph(entity_name: str, version: str = "18.0") -> str:
 ```
 
 ```python
-# ai/utils/graph_format.py — LLM-optimized Markdown output
+# graph_format.py — LLM-optimized Markdown output (reference)
 
 def format_for_llm(results: list, graph) -> str:
     lines = ["# GRAPH CONTEXT (Top-K relevant nodes)\n"]

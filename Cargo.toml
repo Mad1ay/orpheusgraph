@@ -3,8 +3,9 @@ name = "orpheusgraph"
 version = "0.1.0"
 edition = "2021"
 description = "Rust knowledge graph traversal engine with Python bindings"
-license = "MIT OR Apache-2.0"
+license-file = "LICENSE.md"
 repository = "https://github.com/Mad1ay/orpheusgraph"
+readme = "README.md"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

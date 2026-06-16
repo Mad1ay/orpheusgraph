@@ -31,18 +31,15 @@ All notable changes to orpheusgraph.
 - `.close()` + `Drop` trait for deterministic memory release
 - Python type stubs (`.pyi`)
 
-### Sprint 5 — Cache & OSDS Integration
-- 3-tier cache: L1 in-process → L2 Redis (lz4) → L3 PostgreSQL rebuild
+### Sprint 5 — Caching
+- 3-tier cache: L1 in-process → L2 Redis (lz4) → L3 source rebuild
 - Generation counter for L1 staleness detection across workers
 - BLPOP coordination (thundering herd protection)
 - Lock renewal watchdog (SIGKILL safety)
 - Error marker on build failure
-- Schema version + architecture in Redis key
+- Schema version in Redis key
 - LRU eviction (maxsize=3) for L1
-- `format_for_llm()` — Markdown output for LLM context
-- `traverse_erp_graph()` tool for LangGraph agents
-- `init_pipeline_graph()` — graph generation snapshot per pipeline
-- L1 warmup in server lifespan
+- `format_for_llm()` — Markdown rendering of a subgraph for LLM context
 
 ### Sprint 6 — Hardening
 - CI: `rust-check` job (clippy, cargo test, bench compile)
