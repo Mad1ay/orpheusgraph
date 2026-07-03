@@ -103,17 +103,33 @@ raw = (w_base × base_weight) + (w_semantic × semantic_boost) + (w_override × 
 W_total = raw × (1.0 - noise_penalty)
 ```
 
-## Performance Targets
+## Benchmarks
 
-| Operation | Target | Graph: 50K nodes |
-|---|---|---|
-| `build_graph` | <10ms | |
-| `to_rkyv` | <1ms | |
-| `from_rkyv` (zero-copy) | <0.1ms | |
-| `beam_traverse(k=5, d=3)` | <1ms | |
-| `find_path` | <0.5ms | |
-| `contextual_subgraph(k=30)` | <2ms | |
-| Memory (base graph) | ~15MB | |
+Measured with [criterion](https://github.com/bheisler/criterion.rs) on a synthetic graph of
+**50K nodes / ~150K edges** ([benches/bench_traversal.rs](benches/bench_traversal.rs)).
+Hardware: Intel Core i7-13650HX, 16 GB RAM, Windows 11, rustc 1.94, release build with LTO.
+
+**Hot path** — runs on every request:
+
+| Operation | Median time |
+|---|---|
+| `beam_traverse(k=5, depth=3)` | **6.8 µs** |
+| `contextual_subgraph(k=30)` | **47.6 µs** |
+| `find_path` (weighted Dijkstra) | 40.4 ms ¹ |
+
+**Cold path** — runs once per cache fill:
+
+| Operation | Median time |
+|---|---|
+| `build_graph` (incl. PageRank) | 48.1 ms |
+| `to_rkyv` | 28.0 ms |
+| `from_rkyv` (zero-copy view + name index) | 5.6 ms |
+
+¹ `find_path` currently keeps its Dijkstra frontier in string-keyed hash maps, and the
+benchmark topology (long-range shortcut edges) forces a wide frontier — worst case, not
+typical. Moving the frontier to node indices is on the roadmap.
+
+Reproduce with `cargo bench`.
 
 ## Architecture
 

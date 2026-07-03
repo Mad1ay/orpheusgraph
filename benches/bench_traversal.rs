@@ -4,12 +4,13 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 use orpheusgraph::builder::build_graph;
 use orpheusgraph::graph::OrpheusGraphInner;
+use orpheusgraph::serialization::{to_rkyv, ArchivedGraphView};
 use orpheusgraph::traversal::{beam_traverse, contextual_subgraph, find_path};
-use orpheusgraph::types::{DynamicContext, NodeInput};
+use orpheusgraph::types::{DynamicContext, EdgeInput, NodeInput};
 
-fn build_large_graph(n: usize) -> OrpheusGraphInner {
+fn build_inputs(n: usize) -> (Vec<NodeInput>, Vec<EdgeInput>) {
     let mut nodes: Vec<NodeInput> = Vec::with_capacity(n);
-    let mut edges: Vec<orpheusgraph::types::EdgeInput> = Vec::with_capacity(n * 3);
+    let mut edges: Vec<EdgeInput> = Vec::with_capacity(n * 3);
 
     for i in 0..n {
         nodes.push(NodeInput {
@@ -48,8 +49,41 @@ fn build_large_graph(n: usize) -> OrpheusGraphInner {
         }
     }
 
+    (nodes, edges)
+}
+
+fn build_large_graph(n: usize) -> OrpheusGraphInner {
+    let (nodes, edges) = build_inputs(n);
     let (g, m) = build_graph(nodes, edges);
     OrpheusGraphInner::new(g, m)
+}
+
+fn bench_build(c: &mut Criterion) {
+    c.bench_function("build_graph (50K nodes)", |b| {
+        b.iter_batched(
+            || build_inputs(50_000),
+            |(nodes, edges)| {
+                let (g, m) = build_graph(nodes, edges);
+                OrpheusGraphInner::new(g, m)
+            },
+            criterion::BatchSize::LargeInput,
+        )
+    });
+}
+
+fn bench_serialization(c: &mut Criterion) {
+    let graph = build_large_graph(50_000);
+
+    c.bench_function("to_rkyv (50K nodes)", |b| b.iter(|| to_rkyv(&graph)));
+
+    let bytes = to_rkyv(&graph);
+    c.bench_function("from_rkyv zero-copy view (50K nodes)", |b| {
+        b.iter_batched(
+            || bytes.clone(),
+            |data| ArchivedGraphView::from_bytes(data).unwrap(),
+            criterion::BatchSize::LargeInput,
+        )
+    });
 }
 
 fn bench_beam(c: &mut Criterion) {
@@ -83,5 +117,12 @@ fn bench_subgraph(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_beam, bench_find_path, bench_subgraph);
+criterion_group!(
+    benches,
+    bench_build,
+    bench_beam,
+    bench_find_path,
+    bench_subgraph,
+    bench_serialization
+);
 criterion_main!(benches);
