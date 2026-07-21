@@ -1,7 +1,24 @@
 # orpheusgraph
 
+[![CI](https://github.com/Mad1ay/orpheusgraph/actions/workflows/ci.yml/badge.svg)](https://github.com/Mad1ay/orpheusgraph/actions/workflows/ci.yml)
+![License: PolyForm NC 1.0.0](https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-blue)
+![Status: v0.1.0](https://img.shields.io/badge/status-v0.1.0%20(early)-orange)
+
 > Rust library with Python bindings for context-aware weighted graph traversal.
 > Source-available. Domain-agnostic. Built for RAG pipelines that need deterministic structure.
+
+**Status:** v0.1.0 — early and source-available; the API may still change.
+
+## Why
+
+Most RAG pipelines retrieve by vector similarity alone, which ignores how entities
+actually relate. orpheusgraph adds the missing structural half: it walks a weighted
+knowledge graph so retrieval follows real relationships, penalizes noisy low-signal
+nodes, and stays deterministic and sub-millisecond on the hot path. Unlike a general
+graph library (networkx), it is built for per-request scoring and multi-tenant isolation
+rather than one-off analysis; unlike a graph database (neo4j), it is an embeddable
+in-process library with no server to run — it sits inside your retrieval pipeline and
+returns the Top-K relevant nodes in microseconds.
 
 ## What It Does
 
@@ -61,6 +78,10 @@ graph2 = orpheusgraph.from_rkyv(data)
 # Cleanup
 graph.close()
 ```
+
+> The example uses ERP model names (`sale.order`, `res.partner`) for familiarity, but
+> nodes and edges are arbitrary — orpheusgraph treats them as opaque strings and is fully
+> domain-agnostic.
 
 ## API Reference
 
