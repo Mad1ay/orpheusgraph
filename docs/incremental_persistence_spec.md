@@ -200,10 +200,24 @@ state: ArcSwap<GraphState>
 
 ```
 graph_dir/
+  LOCK                   # flock'd for the writer's lifetime (see below)
   MANIFEST.json          # current state pointer (atomic rename to update)
   snapshot-{seq:020}.og  # rkyv bytes of SerializableGraph (existing format)
   wal.log                # ops after snapshot seq
 ```
+
+**Single-writer enforcement.** `open()` takes an exclusive `flock` on `LOCK`
+and holds it until `close()`/process death. A second writer opening the same
+dir fails fast with a clear error instead of silently interleaving WAL frames
+(guaranteed corruption). The lock is advisory-OS-level, so it also survives
+crashed processes (kernel releases flock on death — no stale-lockfile
+recovery dance).
+
+**Rename durability.** Every tmp+fsync+rename sequence (snapshot, MANIFEST)
+is followed by `fsync(graph_dir)` — on ext4 and friends the rename itself
+lives in the directory's page cache until the directory is fsynced; skipping
+this is the classic "MANIFEST points at a snapshot that vanished after power
+loss" bug.
 
 `MANIFEST.json`:
 
