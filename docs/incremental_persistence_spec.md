@@ -454,6 +454,24 @@ was the graph changed"), temporal validity answers *valid time* ("when was
 the fact true in the modeled world"). They are independent, compatible
 features.
 
+**Concurrent sources ≠ multi-writer.** "Two sources writing facts at the same
+time" decomposes into two problems, neither needing MVCC:
+
+- *Physical concurrency*: callers serialize on the writer mutex (§3.5) — with
+  µs-scale `apply()`, a queue of even thousands of batches/sec drains
+  instantly (the SQLite/Redis single-writer precedent). Multiple threads/tasks
+  may call `apply()` concurrently today; multiple *processes* route through
+  the graph-owning process (flock enforces this). True multi-writer MVCC only
+  pays off when writers read inside long transactions — not a fact-ingestion
+  workload.
+- *Semantic conflict* (source A: "owner is X", source B: "owner is Y"): MVCC
+  would not help — both commits succeed physically and last-write-wins by seq
+  order, same as here. The real fix is **provenance** (edge metadata: source,
+  confidence, observed_at — store both claims with attribution, never
+  silently overwrite) plus **temporal validity** (invalidate the older fact
+  via valid_to), with contradiction resolution as domain logic above the
+  store. This is why provenance/temporal rank high on the roadmap.
+
 **Explicitly rejected: interactive transactions.** Atomic multi-op batches +
 snapshot-isolated readers (ArcSwap) already cover the useful subset of ACID
 for this workload. Interactive `BEGIN → read → decide → write → COMMIT` with
