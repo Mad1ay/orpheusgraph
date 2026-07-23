@@ -326,6 +326,21 @@ Crash-safety by rename atomicity:
 Compaction runs on the writer; readers keep serving the old `GraphState`
 until step 6 swaps atomically. No stop-the-world.
 
+### 4.4b Snapshot layout: CSR adjacency (required for mmap traversal)
+
+**Motivating defect:** the current `ArchivedGraphView::outgoing_neighbors`
+finds neighbors by a linear scan over ALL edges (O(E) per expansion instead
+of O(degree)). Today this is masked because consumers traverse an owned
+petgraph (L1) and use the archived view only as transport; traversing
+directly over mmap on this layout would be orders slower than owned.
+
+Fix, baked into `format_version: 1` from day one: the snapshot stores edges
+**sorted by `from_idx` plus a per-node offset array (CSR)**, and a mirror
+index sorted by `to_idx` for incoming edges. Archived neighbor lookup becomes
+an O(degree) slice read, same asymptotics as petgraph — and the index lives
+inside the mmap'd file, so `open()` builds nothing beyond the name index.
+This also speeds up the existing non-mmap archived path.
+
 ### 4.5 mmap and larger-than-RAM
 
 Step 2 of recovery deliberately keeps the base as an **archived view over
@@ -342,6 +357,18 @@ mmap** rather than deserializing to owned structures. Consequences:
 - Platform note: file must not be truncated/replaced in place while mapped —
   guaranteed by the rename-only discipline above (the old mapping keeps the
   old inode alive until dropped).
+- **Performance knobs.** Warm mmap reads are page-cache reads — RAM speed;
+  only cold pages pay a fault (~µs on NVMe, once). `open()` options:
+  `prefault=True` (madvise WILLNEED — warm everything up front, matching
+  today's load-all behavior but without deserialization) and
+  `mode="mmap"|"owned"` — owned materializes a petgraph at open for
+  small graphs that want the exact current hot path, while keeping WAL
+  persistence; mmap is the default and the only option for
+  larger-than-RAM.
+- **Empty-delta fast path.** When the delta is empty (e.g. right after
+  compaction), `DeltaAccessor` must delegate straight to the base with zero
+  merge overhead — readers of a quiescent graph pay nothing for mutability
+  existing.
 
 ### 4.6 Python API
 
@@ -439,7 +466,10 @@ persistent store is additive.
   `seq`) under `cargo test` + a `loom`-lite smoke or `ThreadSanitizer` job.
 - **Bench additions**: `apply(batch of 100)`, `open()` warm (mmap) vs current
   `from_rkyv`, traversal overhead of DeltaAccessor vs plain accessor at delta
-  sizes 0 / 1% / 10% of base (target: ≤ 1.3× at 10%).
+  sizes 0 / 1% / 10% of base (targets: 0 measurable overhead at empty delta,
+  ≤ 1.3× at 10%), and `beam_traverse` over warm mmap (CSR layout) vs owned
+  petgraph (target: ≤ 1.5×; the current O(E) archived scan must show as fixed
+  here).
 
 ---
 
