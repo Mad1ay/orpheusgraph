@@ -157,6 +157,18 @@ Locked-down semantics (decided now, so they don't drift later):
 5. **Weight semantics unchanged:** delta nodes carry `base_weight` /
    `noise_penalty` exactly like build-time nodes; normalization is NOT applied
    to delta values (documented: caller provides values in [0,1]).
+6. **Optimistic CAS for read-modify-write.** `apply(ops, expected_seq=None)`:
+   when `expected_seq` is given, the writer — atomically with the apply, under
+   the same writer lock — rejects the batch with `ConflictError` if
+   `current_seq != expected_seq`. This closes the read→apply race for callers
+   whose writes depend on reads (two callers read seq=N, both compute, second
+   apply is based on a stale read — the writer mutex serializes applies but
+   not read→write windows). On conflict the caller re-reads and retries.
+   Granularity is deliberately whole-graph (any concurrent write conflicts):
+   false conflicts cost a µs-scale retry, which is fine at target write
+   rates; per-node versioning is the known next step if contention ever
+   demands it, and is out of scope v1. Blind ingestion (write does not depend
+   on a read) omits `expected_seq` and keeps last-write-wins semantics.
 
 ### 3.4 PageRank staleness
 
@@ -347,6 +359,12 @@ g.apply([
      "kind": "relates_to"},
 ])            # one WAL frame; all-or-nothing; raises on invalid op
 
+# Read-modify-write with a serializability guarantee (optimistic CAS, §3.3.6):
+seq = g.seq                                   # pin the state you read from
+node = g.get_node("account.A")                # ... read, decide ...
+g.apply(ops, expected_seq=seq)                # ConflictError if state moved →
+                                              # re-read, recompute, retry
+
 g.flush()     # fsync WAL (no-op under EveryBatch policy)
 g.compact()   # manual compaction; also happens automatically by threshold
 g.seq         # current state sequence number (replaces cache "generation")
@@ -474,9 +492,13 @@ time" decomposes into two problems, neither needing MVCC:
 
 **Explicitly rejected: interactive transactions.** Atomic multi-op batches +
 snapshot-isolated readers (ArcSwap) already cover the useful subset of ACID
-for this workload. Interactive `BEGIN → read → decide → write → COMMIT` with
-write-conflict detection only pays off with multiple writers reading inside
-transactions — that is ledger territory (a different system), and the added
-machinery would reduce reliability, not add it. Reliability strategy here is
+for this workload, and read-modify-write callers get a serializability
+guarantee via optimistic CAS (`expected_seq`, §3.3.6) — the Redis
+WATCH/MULTI / etcd-revision pattern — at the cost of a retry loop instead of
+MVCC machinery. What stays rejected is held-open interactive transactions
+(`BEGIN → read → decide → write → COMMIT` as a server-side session) with
+write-conflict detection at row granularity: that only pays off with many
+writers holding long transactions — ledger territory (a different system),
+and the added machinery would reduce reliability, not add it. Reliability strategy here is
 SQLite's: few hard invariants (batch atomicity, monotonic seq, rename+dir
 fsync, flock) beaten by a brutal test harness — not more mechanisms.
