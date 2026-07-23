@@ -235,10 +235,22 @@ payload := postcard(WalRecord { seq: u64, ops: Vec<Op> })
 - **Batch = atomic unit.** A schema diff arrives as a set of ops; framing the
   batch as one record makes replay all-or-nothing and matches §3.3 rule 4.
 - `crc32` covers `payload`. `seq` strictly increases by 1 per frame.
+- **Write vs fsync semantics.** Every `apply()` writes its frame through to the
+  OS (`write()`; any userspace buffer is flushed per batch — no frame ever
+  lives only in process memory). Consequently a *process* crash (kill -9,
+  panic, OOM) loses nothing under any policy — the OS page cache survives and
+  is written back by the kernel. Only a *machine* failure (power loss, kernel
+  panic) can lose the tail written after the last fsync.
 - fsync policy (config): `EveryBatch` | `EveryN(n)` | `OnFlush` (default).
-  Rationale: the primary workload is schema/knowledge sync, not payments —
-  losing the last un-flushed batch on crash means re-sync, not data loss.
-  Callers with stricter needs opt into `EveryBatch`.
+  Under `OnFlush`, fsync happens on explicit `flush()` and always on
+  `close()`; compaction durability is independent (tmp+fsync+rename, §4.4).
+  Reads never touch the WAL — the policy concerns mutations only.
+  Rationale for the default: the primary workload is schema/knowledge sync,
+  not payments — losing the post-flush tail to a power cut means re-sync, not
+  data loss. Callers with stricter needs opt into `EveryBatch` and pay fsync
+  latency per batch. A Redis-AOF-style `Interval(duration)` policy is a
+  possible later addition (needs a background thread; out of scope v1 —
+  flushing at job boundaries is the idiomatic embedded pattern).
 
 ### 4.3 Recovery (open)
 
@@ -384,9 +396,12 @@ persistent store is additive.
 - **Crash harness** (the load-bearing one): a child process applies batches
   in a loop with per-batch markers; the parent `kill -9`s it at random
   intervals, reopens the dir, and asserts: (a) open succeeds, (b) state equals
-  a prefix of applied batches, (c) at most the un-flushed tail is missing
-  under `OnFlush`, nothing missing under `EveryBatch`. Run ×100 in CI
-  (release build, tmpfs).
+  a prefix of applied batches, (c) **nothing is missing under any fsync
+  policy** — process death must not lose acknowledged batches (§4.2: frames
+  are written through to the OS per batch). Run ×100 in CI (release build,
+  tmpfs). Power-loss semantics (losing the OS page cache) are NOT covered by
+  kill -9; validating them needs `dm-flakey` or a VM harness — documented as
+  out of scope for v1, revisit if a durability-critical consumer appears.
 - **Concurrency**: N reader threads traversing in a loop while the writer
   applies + compacts; assert no torn reads (every traversal sees a valid
   `seq`) under `cargo test` + a `loom`-lite smoke or `ThreadSanitizer` job.
