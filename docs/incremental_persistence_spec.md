@@ -438,3 +438,27 @@ Out of scope, unlocked next (format headroom already reserved): temporal
 validity on edges (`valid_from`/`valid_to` + `as_of` in ctx), edge-level ACL
 tags filtered via ctx, SQLite-style cross-process readers (mmap snapshot +
 WAL tail follow), thin gRPC/MCP facade.
+
+**Cheap unlock — WAL retention (event-sourced history).** The WAL already IS
+a full event-sourced history of the graph; compaction merely destroys it by
+truncating. A `retain_wal: bool` config makes compaction rotate frames into
+`wal-archive/wal-{seq}.log` instead of deleting them, which enables — as pure
+readers of the existing format, no write-path changes:
+
+- `history(node_name)` — every op that ever touched a node (audit trail;
+  actor/reason can ride in batch-level metadata);
+- `open_at(seq)` — time travel: reconstruct the graph exactly as it was.
+
+Note the bi-temporal distinction: WAL retention answers *system time* ("when
+was the graph changed"), temporal validity answers *valid time* ("when was
+the fact true in the modeled world"). They are independent, compatible
+features.
+
+**Explicitly rejected: interactive transactions.** Atomic multi-op batches +
+snapshot-isolated readers (ArcSwap) already cover the useful subset of ACID
+for this workload. Interactive `BEGIN → read → decide → write → COMMIT` with
+write-conflict detection only pays off with multiple writers reading inside
+transactions — that is ledger territory (a different system), and the added
+machinery would reduce reliability, not add it. Reliability strategy here is
+SQLite's: few hard invariants (batch atomicity, monotonic seq, rename+dir
+fsync, flock) beaten by a brutal test harness — not more mechanisms.
