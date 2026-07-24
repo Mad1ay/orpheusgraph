@@ -27,10 +27,21 @@ pub fn beam_traverse(
     let mut visited: HashSet<String> = HashSet::new();
     visited.insert(start.to_string());
 
-    let mut all_results: Vec<NodeResult> = Vec::with_capacity(k * depth);
+    // `k * depth` is only a capacity hint; it can overflow or request an
+    // impossible allocation for hostile k/depth (Vec::with_capacity then
+    // aborts the process — uncatchable from Python). Results can never exceed
+    // the node count anyway, so cap the hint. Real work is bounded by the
+    // graph, not by k/depth.
+    let cap_hint = k.saturating_mul(depth).min(graph.node_count());
+    let mut all_results: Vec<NodeResult> = Vec::with_capacity(cap_hint);
     let mut frontier: Vec<String> = vec![start.to_string()];
 
     for _ in 0..depth {
+        // Nothing left to expand — stop early instead of spinning `depth`
+        // times over an empty frontier (hostile depth = wasted CPU otherwise).
+        if frontier.is_empty() {
+            break;
+        }
         let mut level_candidates: Vec<NodeResult> = Vec::new();
 
         for node_name in &frontier {
