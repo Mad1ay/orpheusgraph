@@ -133,30 +133,43 @@ fn compute_pagerank(graph: &mut DiGraph<NodeData, EdgeData>, damping: f32, itera
     let mut scores: Vec<f32> = vec![initial; n];
     let mut new_scores: Vec<f32> = vec![0.0; n];
 
+    // Out-degree is fixed across iterations — compute it once (the old code
+    // recounted it every iteration).
+    let out_degree: Vec<usize> = graph
+        .node_indices()
+        .map(|idx| {
+            graph
+                .neighbors_directed(idx, petgraph::Direction::Outgoing)
+                .count()
+        })
+        .collect();
+
+    let teleport = (1.0 - damping) / n_f32;
+
     for _ in 0..iterations {
-        // Reset
+        // Dangling mass is distributed UNIFORMLY, so it is the same scalar
+        // added to every node — compute it once as a sum instead of looping
+        // over all n nodes per dangling node (the old O(dangling*n) hot path).
+        // Each node's dangling contribution is damping * (Σ dangling scores)/n,
+        // identical to the old per-dangling accumulation.
+        let dangling_sum: f32 = (0..n)
+            .filter(|&i| out_degree[i] == 0)
+            .map(|i| scores[i])
+            .sum();
+        let base = teleport + damping * dangling_sum / n_f32;
         for s in new_scores.iter_mut() {
-            *s = (1.0 - damping) / n_f32;
+            *s = base;
         }
 
-        // Distribute scores through edges
+        // Distribute scores through edges (dangling nodes already handled above)
         for node_idx in graph.node_indices() {
-            let out_degree = graph
-                .neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-                .count();
-            if out_degree == 0 {
-                // Dangling node: distribute evenly to all nodes
-                let share = damping * scores[node_idx.index()] / n_f32;
-                for s in new_scores.iter_mut() {
-                    *s += share;
-                }
-            } else {
-                let share = damping * scores[node_idx.index()] / out_degree as f32;
-                for neighbor in
-                    graph.neighbors_directed(node_idx, petgraph::Direction::Outgoing)
-                {
-                    new_scores[neighbor.index()] += share;
-                }
+            let od = out_degree[node_idx.index()];
+            if od == 0 {
+                continue;
+            }
+            let share = damping * scores[node_idx.index()] / od as f32;
+            for neighbor in graph.neighbors_directed(node_idx, petgraph::Direction::Outgoing) {
+                new_scores[neighbor.index()] += share;
             }
         }
 
@@ -193,6 +206,79 @@ mod tests {
             kind: kind.to_string(),
             field_name: None,
             base_weight: 1.0,
+        }
+    }
+
+    // Leaf-heavy graph: `hubs` interconnected models + many dangling "field"
+    // nodes, each with one incoming edge from a hub. This is the schema shape
+    // where dangling-node PageRank redistribution is the hot path.
+    fn leaf_heavy(hubs: usize, leaves: usize) -> (Vec<NodeInput>, Vec<EdgeInput>) {
+        let mut nodes = Vec::with_capacity(hubs + leaves);
+        let mut edges = Vec::new();
+        for h in 0..hubs {
+            nodes.push(make_node(&format!("m{h}"), "model", 0.5));
+        }
+        for h in 0..hubs {
+            edges.push(make_edge(&format!("m{h}"), &format!("m{}", (h + 1) % hubs), "relates_to"));
+        }
+        for l in 0..leaves {
+            let name = format!("f{l}");
+            nodes.push(make_node(&name, "field", 0.1));
+            edges.push(make_edge(&format!("m{}", l % hubs), &name, "contains"));
+        }
+        (nodes, edges)
+    }
+
+    #[test]
+    #[ignore] // timing bench: cargo test --release pagerank_leaf_heavy -- --ignored --nocapture
+    fn bench_pagerank_leaf_heavy() {
+        use std::time::Instant;
+        let (nodes, edges) = leaf_heavy(200, 14_800);
+        // warm + measure a few builds
+        let mut best = std::f64::MAX;
+        for _ in 0..3 {
+            let (n2, e2) = (nodes.clone(), edges.clone());
+            let t = Instant::now();
+            let (g, _) = build_graph(n2, e2);
+            let dt = t.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(&g);
+            if dt < best {
+                best = dt;
+            }
+        }
+        println!(
+            "build_graph (200 hubs + 14800 dangling leaves): {best:.1} ms (best of 3)"
+        );
+    }
+
+    #[test]
+    fn test_pagerank_dangling_redistribution() {
+        // A,B -> H (a well-cited hub); L is a dangling leaf. The optimized
+        // scalar dangling handling must still: keep the hub highest-ranked,
+        // normalize to [0,1] with max == 1, and give every node positive rank
+        // (dangling mass is redistributed, not lost).
+        let nodes = vec![
+            make_node("A", "model", 0.5),
+            make_node("B", "model", 0.5),
+            make_node("H", "model", 0.5),
+            make_node("L", "field", 0.1),
+        ];
+        let edges = vec![
+            make_edge("A", "H", "relates_to"),
+            make_edge("B", "H", "relates_to"),
+            make_edge("H", "L", "contains"),
+        ];
+        let (graph, idx) = build_graph(nodes, edges);
+        let pr = |name: &str| graph[idx[name]].pagerank_weight;
+        // Normalization sets the max node to exactly 1.0.
+        assert!((pr("H").max(pr("A")).max(pr("B")).max(pr("L")) - 1.0).abs() < 1e-6);
+        // Nodes that receive edge mass (H from A,B; L as the sink H feeds)
+        // outrank the pure sources A,B which only get teleport + dangling mass.
+        assert!(pr("H") > pr("A") && pr("H") > pr("B"), "cited hub outranks its sources");
+        assert!(pr("L") > pr("A"), "sink accumulating the hub's mass outranks a bare source");
+        // Dangling mass + teleport is redistributed, never lost — all positive.
+        for n in ["A", "B", "H", "L"] {
+            assert!(pr(n) > 0.0, "{n} should get positive rank from teleport+dangling");
         }
     }
 
