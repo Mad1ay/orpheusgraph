@@ -118,8 +118,8 @@ Resolution rules:
 | Query | Rule |
 |---|---|
 | `get_node(name)` | in `added_nodes` → that (a *shadow* wins over base, see §3.3 rule 1); else tombstoned → `None`; else base node |
-| `outgoing_neighbors(n)` | base edges (kept even if `n` is a shadow), minus edges whose target is tombstoned, minus tombstoned edges; **then** delta edges from `n` (skipping tombstoned targets), in insertion order |
-| `incoming_neighbors(n)` | symmetric |
+| `outgoing_neighbors(n)` | **if `n` is tombstoned → empty** (a removed node exposes no edges in either direction); else: base edges, minus edges whose target is tombstoned, minus tombstoned edges; **then** delta edges from `n` (skipping tombstoned targets), in insertion order |
+| `incoming_neighbors(n)` | symmetric — **empty if `n` is tombstoned**, else base in-edges minus edges whose *source* is tombstoned, minus tombstoned edges, then delta in-edges |
 | `node_count()` | `base − |tombstones∩base| + |added_nodes keys ∉ base|` (maintained counters, O(1)). A shadow — an `added_nodes` key that IS in base — changes neither term. |
 | `edge_count()` | same approach |
 
@@ -160,8 +160,13 @@ Locked-down semantics (decided now, so they don't drift later):
    nodes on a metadata-only edit.
 2. **`RemoveNode` masks the node and all incident base edges.** Sets the
    tombstone **and removes any `added_nodes` shadow** for that name (upholding
-   the disjointness invariant). Incident *delta* edges are physically dropped
-   from `added_edges` indices (cheap — they are in the side indices).
+   the disjointness invariant). Incident *delta* edges are marked dead in place,
+   **not physically removed** from the `added_edges` Vec: `added_edges` entries
+   are append-only and carry a `dead: bool` flag, so the `u32` positions cached
+   in `out_index`/`in_index` stay valid (a `Vec::remove`/`swap_remove` would
+   shift other entries' positions and silently corrupt the side indices).
+   Dead entries are skipped on read and physically reclaimed only at compaction.
+   `RemoveEdge` on a delta edge sets the same `dead` flag.
 3. **State transitions are symmetric.** `UpsertNode` after `RemoveNode` clears
    the tombstone and re-shadows; `RemoveNode` after `UpsertNode` drops the
    shadow and tombstones. Same for edges. No name is ever both shadowed and
@@ -177,8 +182,15 @@ Locked-down semantics (decided now, so they don't drift later):
      tombstoned** is a hard error — never a silent skip (bans the
      `[RemoveNode(A), AddEdge(B→A)]` → hidden-edge outcome).
    - Op order within a batch is caller-significant and preserved in the WAL
-     frame, so replay folds the identical sequence and reaches the identical
-     accept/reject decision (no replay divergence).
+     frame. **Replay does NOT re-run validation.** A frame in the WAL was
+     already accepted at original `apply()` time; recovery replays its ops
+     directly (structural/crc checks only), applying them in order. This is
+     deliberate: validation *semantics* are not frozen by `format_version`
+     (only the op-tag enum is, §4.1), so a newer version that tightens a
+     validation rule must never reject a batch that a prior version legally
+     committed and made durable — re-validating on replay would brick a valid
+     store after an upgrade. Validity is decided once, at apply; durability is
+     permanent.
    - A batch that references the same name in incompatible ways
      (`[UpsertNode(A), RemoveNode(A)]`) is applied in order — final state is
      the last op — and is legal; the disjointness invariant holds because
@@ -289,7 +301,16 @@ payload := postcard(WalRecord { seq: u64, ops: Vec<Op> })
 
 - **Batch = atomic unit.** A schema diff arrives as a set of ops; framing the
   batch as one record makes replay all-or-nothing and matches §3.3 rule 4.
-- `crc32` covers `payload`. `seq` strictly increases by 1 per frame.
+- `crc32` covers **`len` concatenated with `payload`** (not payload alone): a
+  torn write in the 4-byte `len` prefix (a realistic power-loss artifact)
+  otherwise yields an arbitrary length up to 4 GiB. `seq` strictly increases
+  by 1 per frame.
+- **Never allocate from an unvalidated `len`.** Recovery reads `len`, checks
+  `len ≤ bytes_remaining_in_file` FIRST, then reads exactly that many bytes and
+  verifies the crc over `len‖payload`. A `len` larger than the remaining file
+  is treated as a torn tail (truncate, §4.3) — recovery must not
+  `Vec::with_capacity(len)` before the bounds check, or a torn `len` becomes
+  the same uncatchable allocation abort fixed in traversal.
 - **Write vs fsync semantics.** Every `apply()` writes its frame through to the
   OS (`write()`; any userspace buffer is flushed per batch — no frame ever
   lives only in process memory). Consequently a *process* crash (kill -9,
@@ -333,17 +354,31 @@ open(dir):
   2. load snapshot:
        mmap file → verify crc32 → rkyv::access (zero-copy ArchivedGraph)
        + build name→index side map (existing from_bytes path, ~5.6 ms @50K)
-  3. replay wal.log frames where frame.seq > snapshot_seq:
-       - crc mismatch or truncated frame → torn tail from a crash (guaranteed
-         to be the LAST frame by writer poisoning, §4.2): TRUNCATE wal at that
-         boundary, log a WARNING with dropped-frame count (never silent), stop
-         replay. This tail was, by construction, never acknowledged to a
-         caller (the failing append raised), so no acked data is lost.
-       - seq gap or seq ≤ snapshot_seq → corruption → hard error (do not guess)
-  4. if the WAL tail was truncated in step 3, mint a fresh random `epoch`
-     (see below) and rewrite MANIFEST with it
+  0. read a `clean_shutdown` flag from MANIFEST (set only by close(), cleared
+     on the first apply after open) — its absence means a crash/power-loss
+  1. read MANIFEST.json; verify format_version
+  2. load snapshot (as above)
+  3. scan wal.log frames in order:
+       - frame.seq ≤ snapshot_seq → **already folded into the snapshot; skip
+         it** (this is the *normal* leftover from a compaction that renamed the
+         MANIFEST before truncating the WAL — §4.4 crash window, expressly
+         recoverable). NOT an error.
+       - frame.seq == expected_next (== last_applied + 1, starting at
+         snapshot_seq+1) → replay its ops directly (no re-validation, §3.3
+         rule 4)
+       - crc mismatch or truncated/over-long frame → torn tail from a crash
+         (guaranteed to be the LAST surviving frame by writer poisoning, §4.2):
+         TRUNCATE wal at that boundary, log a WARNING with dropped-frame count,
+         stop replay
+       - a real seq GAP (expected_next < frame.seq, i.e. a frame is missing
+         before a later one) → corruption → hard error (do not guess)
+  4. mint a fresh random `epoch` and rewrite MANIFEST **if EITHER** the WAL tail
+     was truncated in step 3 **OR** `clean_shutdown` was absent in step 0
+     (a clean power-loss can drop whole un-fsynced frames that ended on a valid
+     boundary — no torn frame to detect — yet still forked the timeline; the
+     shutdown flag is what catches that case)
   5. publish GraphState { base: Archived(mmap), delta: replayed, seq: last,
-     epoch }
+     epoch }; clear the persisted `clean_shutdown` flag
   6. GC: delete snapshot-*.og not referenced by MANIFEST (orphans from
      interrupted compactions), log what was removed
 ```
@@ -352,8 +387,10 @@ open(dir):
 rewind means new applies re-issue seq numbers that previously named different
 states — an ABA trap for anyone persisting seq (external cache keys, derived
 artifact versions, `open_at(seq)` over retained WAL archives). Fix: MANIFEST
-carries a random `epoch` id, re-minted on every recovery that truncated the
-WAL tail (i.e. every time the timeline could have forked). The durable
+carries a random `epoch` id, re-minted on every recovery that could have
+forked the timeline — i.e. a truncated WAL tail **or** a missing
+`clean_shutdown` flag (step 0/4 above; the latter catches clean un-fsynced
+tail loss where no torn frame exists to detect). The durable
 identity of a state is the pair `(epoch, seq)`. In-process CAS
 (`expected_seq`, §3.3) stays raw-seq — it is only valid within one
 incarnation, and a reopen invalidates in-flight CAS tokens by definition.
@@ -372,16 +409,28 @@ Trigger: manual `compact()` or automatic when
 
 ```
 compact():
+  0. if the delta is empty AND the base is already an on-disk snapshot at the
+     current seq → NO-OP, return. (Prevents new_seq == old_seq path collision:
+     an empty-delta compaction would otherwise fold to the same seq, and step 3
+     would rename over the live snapshot while step 7 deletes it — bricking the
+     store. Compaction only runs when there is delta to fold.)
   1. materialize: iterate base+delta through DeltaAccessor →
      Vec<NodeInput>, Vec<EdgeInput>
   2. build_graph(...)            # recomputes normalization + PageRank (~48 ms)
-  3. to_rkyv → write snapshot-{new_seq}.og.tmp → fsync → rename → fsync(dir)
+  3. to_rkyv (CSR layout, §4.4b) → write snapshot-{new_seq}-{cid}.og.tmp
+     → fsync → rename → fsync(dir)
   4. write MANIFEST.json.tmp (pointing at new snapshot) → fsync → rename
      → fsync(dir)
   5. rotate WAL: truncate wal.log (frames ≤ new_seq are now in the snapshot)
   6. publish GraphState { base: new, delta: empty, seq: new_seq }
-  7. delete the previous snapshot-{old_seq}.og (see GC note below)
+  7. delete the previous snapshot (only if its path ≠ the new snapshot path —
+     defensive against any future same-seq case; see GC note below)
 ```
+
+The snapshot filename carries a monotonic **compaction id `cid`** in addition
+to `seq` (`snapshot-{seq}-{cid}.og`), so two snapshots never collide on a path
+even in the (now guarded) equal-seq case, and step 7's delete can always name
+a distinct file.
 
 Crash-safety by rename atomicity:
 
@@ -419,7 +468,19 @@ Fix, baked into `format_version: 1` from day one: the snapshot stores edges
 index sorted by `to_idx` for incoming edges. Archived neighbor lookup becomes
 an O(degree) slice read, same asymptotics as petgraph — and the index lives
 inside the mmap'd file, so `open()` builds nothing beyond the name index.
-This also speeds up the existing non-mmap archived path.
+
+**Compatibility — this is a NEW on-disk struct, and that is intentional.**
+The persistent-store snapshot is `SerializableGraphV1` (CSR: sorted edges +
+`node_offsets: Vec<u32>` + `in_mirror: Vec<u32>`), distinct from today's flat
+`SerializableGraph` (unsorted `Vec<SerializableEdge>`). The earlier claims
+that the snapshot is "the existing format", that "`ArchivedGraph` already
+exists — only new code is the mmap open path", and that "`to_rkyv`/`from_rkyv`
+remain untouched" apply **only to the legacy ephemeral Redis path** (which
+stays exactly as-is, tagged `format_version: 0`). The persistent store adds
+`to_rkyv_v1`/archived-CSR-accessor as genuinely new code; `open()`/`compact()`
+read and write V1. Both formats coexist behind the version tag; V0 is never
+mmap-traversed (it lacks the CSR index). This supersedes the "untouched /
+already exists" wording in §4.1, §4.5, §4.6.
 
 ### 4.5 mmap and larger-than-RAM
 
@@ -529,11 +590,20 @@ persistent store is additive.
    first traversal** — while the sibling `from_rkyv_rebuild` path
    (builder.rs) already guards the same indices. Any snapshot from a shared or
    remote store (Redis, the persistence dir on a network mount) is untrusted
-   input. **Required:** validate all edge endpoint indices against
-   `nodes.len()` at load under `validate="full"` (reject with an error, never
-   panic on query); `validate="none"` is permitted only for a file the process
-   itself wrote this run. This closes the audit's serialization.rs finding and
-   is a precondition for the `validate` modes in §4.5.
+   input. **Required under `validate="full"` (reject with an error, never panic
+   on query):**
+   - every edge `from_idx`/`to_idx` < `nodes.len()`;
+   - **the CSR arrays introduced by §4.4b** — `node_offsets` must be
+     monotonic non-decreasing with `node_offsets[nodes.len()] == edges.len()`
+     and every entry ≤ `edges.len()`; the `in_mirror` array must be a
+     permutation of `0..edges.len()` (each entry < `edges.len()`). These are
+     consumed as slice bounds during neighbor lookup, so a snapshot with valid
+     endpoints but a corrupt/non-monotonic offset array (or an out-of-range
+     mirror entry) would otherwise slice out of bounds and panic — the same
+     class of bug as the endpoint check, one layer down.
+   `validate="none"` is permitted only for a file the process itself wrote this
+   run. This closes the audit's serialization.rs finding and is a precondition
+   for the `validate` modes in §4.5.
 2. **Idempotency** — WAL replay after any crash re-applies whole batches;
    upsert + tombstone semantics make re-application of the same batch a no-op.
    Torn tail is truncated once, with a warning; a second open is a no-op.
