@@ -18,12 +18,14 @@ rayon = "1.8"
 pyo3 = { version = "0.23", features = ["extension-module"] }
 rkyv = { version = "0.8", features = ["bytecheck"] }
 bytecheck = "0.8"
+indexmap = "2"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.5"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
 
 [[bench]]
 name = "bench_traversal"

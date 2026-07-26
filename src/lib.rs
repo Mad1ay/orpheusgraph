@@ -6,6 +6,7 @@
 
 pub mod accessor;
 pub mod builder;
+pub mod delta;
 pub mod graph;
 pub mod overlay;
 pub mod pybridge;
@@ -16,6 +17,7 @@ pub mod types;
 
 // Re-exports for convenient access
 pub use builder::build_graph;
+pub use delta::{DeltaAccessor, DeltaError, GraphDelta, Op};
 pub use graph::OrpheusGraphInner;
 pub use overlay::{neighbors_with_overlay, resolve_overlay_node, NeighborEntry};
 pub use scoring::compute_score;
