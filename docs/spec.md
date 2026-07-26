@@ -772,13 +772,16 @@ key = f"graph:{GRAPH_SCHEMA_VERSION}:{platform.machine()}:{erp}:{ver}"
 
 `max_fan_out` can break the only path between nodes. **Fix**: `pagerank_weight: f32` in `NodeData` (static, computed at build). High-pagerank God Objects pass through cutoff even without semantic boost.
 
-### 14. Heavy Overlay Cache
+### 14. Heavy Overlay Cache — REMOVED
 
-2000+ custom fields = FFI overhead per call. **Fix**: cache overlay Rust-side per `project_id`:
-```python
-ctx = DynamicContext(overlay_cache_key=f"project:{project_id}")
-# Rust: if overlay_cache_key matches previous call → reuse, skip FFI transfer
-```
+An earlier `overlay_cache_key` cached parsed overlays Rust-side per project.
+It was **removed** (audit): keyed only by the string, it served stale/
+cross-tenant overlays, and its interior mutation forced the traversal methods
+to take `&mut self`, which raised `Already borrowed` on concurrent readers.
+Overlays are now parsed fresh per call (cheap) and the methods are `&self`
+(lock-free multi-reader). If per-call overlay parse ever shows up in a
+profile, the right fix is a content-addressed (hash-keyed) cache, not a
+user-supplied key.
 
 ### 15. Partial Invalidation (Future)
 

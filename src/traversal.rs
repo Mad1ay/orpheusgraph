@@ -310,6 +310,18 @@ pub fn contextual_subgraph(
     // total_cmp + name tiebreak → total deterministic order (NaN-safe).
     nodes.sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
 
+    // Drop dangling edges whose endpoint was never materialized as a node
+    // (e.g. an overlay edge to a nonexistent target), then sort for a
+    // deterministic edge order — mirrors the guard multi_beam_intersection has.
+    let present: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    edges.retain(|e| present.contains(e.source.as_str()) && present.contains(e.target.as_str()));
+    edges.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+
     SubGraph { nodes, edges }
 }
 
@@ -465,6 +477,15 @@ pub fn multi_beam_intersection(
         }
     }
 
+    // Edge reconstruction iterates `filtered_set` (a HashSet, random order),
+    // so sort for a deterministic edge order — nodes are already deterministic.
+    edges.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+
     SubGraph {
         nodes: filtered_nodes,
         edges,
@@ -609,13 +630,16 @@ mod tests {
 
     #[test]
     fn test_beam_deterministic_with_nan() {
-        // NaN weights make partial_cmp non-total; total_cmp keeps a stable,
-        // deterministic order so repeated runs return the identical sequence.
+        // A NaN weight makes partial_cmp non-total; total_cmp keeps a stable
+        // deterministic order. build_graph sanitizes non-finite base_weight, so
+        // the NaN must be injected via a route that ISN'T sanitized — a NaN
+        // `semantic_boost` from the caller, which reaches compute_score and
+        // produces a NaN node weight that actually hits the beam sort.
         let nodes = vec![
             make_node("A", 0.5),
-            make_node("B", f32::NAN),
+            make_node("B", 0.6),
             make_node("C", 0.8),
-            make_node("D", f32::NAN),
+            make_node("D", 0.4),
             make_node("E", 0.3),
         ];
         let edges = vec![
@@ -626,12 +650,22 @@ mod tests {
         ];
         let (g, m) = build_graph(nodes, edges);
         let graph = OrpheusGraphInner::new(g, m);
-        let ctx = DynamicContext::default();
+        let mut ctx = DynamicContext::default();
+        // NaN boosts on two nodes → their computed weight is NaN at the sort.
+        ctx.semantic_boosts.insert("B".to_string(), f32::NAN);
+        ctx.semantic_boosts.insert("D".to_string(), f32::NAN);
 
         let baseline: Vec<String> = beam_traverse(&graph, &ctx, "A", 5, 1)
             .iter()
             .map(|r| r.name.clone())
             .collect();
+        // Sanity: a NaN weight really did reach the results (else test is vacuous).
+        assert!(
+            beam_traverse(&graph, &ctx, "A", 5, 1)
+                .iter()
+                .any(|r| r.weight.is_nan()),
+            "expected a NaN-weighted node to reach the beam sort"
+        );
         for _ in 0..25 {
             let run: Vec<String> = beam_traverse(&graph, &ctx, "A", 5, 1)
                 .iter()

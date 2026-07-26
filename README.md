@@ -115,7 +115,6 @@ Ephemeral per-request context. Never stored. All parameters optional:
 | `w_override` | `1.0` | weight override coefficient |
 | `overlay_nodes` | `[]` | virtual tenant-specific nodes |
 | `overlay_edges` | `[]` | virtual tenant-specific edges |
-| `overlay_cache_key` | `None` | cache key for overlay data (per project) |
 
 ### Scoring Formula
 

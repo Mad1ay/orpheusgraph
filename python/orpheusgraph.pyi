@@ -19,6 +19,14 @@ class OrpheusGraph:
     def contextual_subgraph(
         self, ctx: DynamicContext, k: int
     ) -> SubGraph: ...
+    def multi_beam_intersection(
+        self,
+        start_nodes: list[str],
+        k: int,
+        depth: int,
+        ctx: DynamicContext,
+        threshold: int | None = None,
+    ) -> SubGraph: ...
     def to_rkyv(self) -> bytes: ...
     def close(self) -> None: ...
 
@@ -45,8 +53,10 @@ class DynamicContext:
         w_override: float = 1.0,
         overlay_nodes: list[dict[str, str]] | None = None,
         overlay_edges: list[dict[str, str]] | None = None,
-        overlay_cache_key: str | None = None,
     ) -> None: ...
+    def add_boost(self, name: str, value: float) -> None: ...
+    def add_override(self, name: str, value: float) -> None: ...
+    def add_noise_tag(self, tag: str) -> None: ...
 
 class NodeResult:
     name: str

@@ -62,8 +62,10 @@ pub fn build_graph(
 
     // Sanitize weights before normalization: a single non-finite base_weight
     // would otherwise make the fold-max non-finite and divide every node to
-    // zero/NaN. Non-finite base_weight -> 0.0, non-finite noise_penalty -> 0.0.
-    let sanitize = |w: f32| if w.is_finite() { w } else { 0.0 };
+    // zero/NaN. Non-finite -> 0.0, and negative finite -> 0.0 so a negative
+    // base_weight can't produce a normalized value outside the documented
+    // [0,1] range (which would invert ranking via a negative base_component).
+    let sanitize = |w: f32| if w.is_finite() { w.max(0.0) } else { 0.0 };
 
     // Find max (sanitized) base_weight for normalization.
     let max_weight = deduped
