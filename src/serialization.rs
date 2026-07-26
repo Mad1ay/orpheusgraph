@@ -109,6 +109,23 @@ impl ArchivedGraphView {
         // Validate the archived bytes
         let archived = rkyv::access::<ArchivedSerializableGraph, rkyv::rancor::Error>(&data)
             .map_err(|e| format!("rkyv validation failed: {e}"))?;
+
+        // rkyv structural validation does NOT check referential integrity of edge
+        // indices. An untrusted/corrupt snapshot can hold from_idx/to_idx >= nodes.len(),
+        // which would later panic when a traversal indexes nodes[to_idx] directly.
+        // Reject such snapshots here so loading is total and never panics on read.
+        let node_count = archived.nodes.len();
+        for (i, e) in archived.edges.iter().enumerate() {
+            let from_idx: u32 = e.from_idx.into();
+            let to_idx: u32 = e.to_idx.into();
+            if from_idx as usize >= node_count || to_idx as usize >= node_count {
+                return Err(format!(
+                    "corrupt snapshot: edge {i} references out-of-bounds node index \
+                     (from_idx={from_idx}, to_idx={to_idx}, node_count={node_count})"
+                ));
+            }
+        }
+
         let ptr = archived as *const ArchivedSerializableGraph;
 
         // Build name index
@@ -275,6 +292,43 @@ mod tests {
         let neighbors = view.outgoing_neighbors("A");
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].target_name, "B");
+    }
+
+    #[test]
+    fn test_from_bytes_rejects_oob_edge_index() {
+        // Build a snapshot by hand with a single node but an edge pointing at
+        // node index 5, which does not exist. rkyv structural validation passes,
+        // so from_bytes must catch the dangling reference itself.
+        let sg = SerializableGraph {
+            nodes: vec![NodeData {
+                name: "A".into(),
+                kind: "model".into(),
+                metadata: HashMap::new(),
+                base_weight: 0.5,
+                noise_penalty: 0.1,
+                pagerank_weight: 0.0,
+            }],
+            edges: vec![SerializableEdge {
+                from_idx: 0,
+                to_idx: 5, // out of bounds: only index 0 exists
+                kind: "relates_to".into(),
+                field_name: None,
+                base_weight: 1.0,
+            }],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&sg)
+            .expect("serialization failed")
+            .to_vec();
+
+        let result = ArchivedGraphView::from_bytes(bytes);
+        let err = match result {
+            Ok(_) => panic!("expected out-of-bounds edge index to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("out-of-bounds"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]

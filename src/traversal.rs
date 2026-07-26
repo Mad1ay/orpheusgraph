@@ -42,7 +42,10 @@ pub fn beam_traverse(
         if frontier.is_empty() {
             break;
         }
-        let mut level_candidates: Vec<NodeResult> = Vec::new();
+        // Dedup candidates within a level by node name as they are collected:
+        // a node reachable from two frontier nodes must yield a single entry
+        // (keep the highest score), otherwise duplicates survive truncate(k).
+        let mut level_map: HashMap<String, NodeResult> = HashMap::new();
 
         for node_name in &frontier {
             let neighbors = neighbors_with_overlay(graph, ctx, node_name);
@@ -61,12 +64,24 @@ pub fn beam_traverse(
                     continue;
                 };
 
-                level_candidates.push(result);
+                level_map
+                    .entry(neighbor.name.clone())
+                    .and_modify(|existing| {
+                        if result.weight > existing.weight {
+                            *existing = result.clone();
+                        }
+                    })
+                    .or_insert(result);
             }
         }
 
-        // Sort by weight descending, take Top-K
-        level_candidates.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(Ordering::Equal));
+        let mut level_candidates: Vec<NodeResult> = level_map.into_values().collect();
+
+        // Sort by weight descending, take Top-K. `total_cmp` gives a total
+        // order even with NaN weights; the name tiebreak makes Top-K
+        // deterministic despite the non-deterministic HashMap iteration order.
+        level_candidates
+            .sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
         level_candidates.truncate(k);
 
         // Build next frontier from Top-K, mark visited
@@ -80,8 +95,9 @@ pub fn beam_traverse(
         all_results.extend(level_candidates);
     }
 
-    // Final sort: all results by weight descending
-    all_results.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(Ordering::Equal));
+    // Final sort: all results by weight descending, name tiebreak for a
+    // total deterministic order (total_cmp is NaN-safe).
+    all_results.sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
     all_results
 }
 
@@ -111,10 +127,8 @@ impl PartialOrd for DijkstraEntry {
 
 impl Ord for DijkstraEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .cost
-            .partial_cmp(&self.cost)
-            .unwrap_or(Ordering::Equal)
+        // total_cmp is NaN-safe → a total order, so the heap stays deterministic.
+        other.cost.total_cmp(&self.cost)
     }
 }
 
@@ -242,8 +256,12 @@ pub fn contextual_subgraph(
     ctx: &DynamicContext,
     k: usize,
 ) -> SubGraph {
+    // Seed order must be deterministic: HashMap iteration order + a stable
+    // sort on tied boosts would otherwise pick different seeds across runs.
+    // Sort by (boost desc, name asc) so ties break by name (total_cmp is
+    // NaN-safe).
     let mut boost_entries: Vec<(&String, &f32)> = ctx.semantic_boosts.iter().collect();
-    boost_entries.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(Ordering::Equal));
+    boost_entries.sort_by(|a, b| b.1.total_cmp(a.1).then_with(|| a.0.cmp(b.0)));
     let seeds: Vec<&str> = boost_entries.iter().take(k).map(|(name, _)| name.as_str()).collect();
 
     let mut node_set: HashSet<String> = HashSet::new();
@@ -289,7 +307,8 @@ pub fn contextual_subgraph(
         }
     }
 
-    nodes.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(Ordering::Equal));
+    // total_cmp + name tiebreak → total deterministic order (NaN-safe).
+    nodes.sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
 
     SubGraph { nodes, edges }
 }
@@ -396,11 +415,12 @@ pub fn multi_beam_intersection(
         }
     }
 
-    // Sort by accumulated weight descending
+    // Sort by accumulated weight descending. total_cmp is NaN-safe and the
+    // name tiebreak makes the order total and deterministic.
     filtered_nodes.sort_by(|a, b| {
         let wa = weight_sum.get(&a.name).copied().unwrap_or(0.0);
         let wb = weight_sum.get(&b.name).copied().unwrap_or(0.0);
-        wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+        wb.total_cmp(&wa).then_with(|| a.name.cmp(&b.name))
     });
 
     // ── 4. Edge reconstruction ────────────────────────────────────────
@@ -535,6 +555,115 @@ mod tests {
         let results = beam_traverse(&graph, &ctx, "A", 5, 4);
         let names: HashSet<&str> = results.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names.len(), results.len());
+    }
+
+    #[test]
+    fn test_beam_no_duplicate_diamond() {
+        // A→B, A→C, B→D, C→D: D is reachable from both B and C on the same
+        // level. Without per-level dedup it would be pushed twice and survive
+        // truncate(k). Beam from A, depth 2 must yield exactly one D.
+        let graph = build_diamond_graph();
+        let ctx = DynamicContext::default();
+        let results = beam_traverse(&graph, &ctx, "A", 5, 2);
+
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        let unique: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "Duplicate node in beam: {names:?}");
+        let d_count = names.iter().filter(|n| **n == "D").count();
+        assert_eq!(d_count, 1, "D must appear exactly once: {names:?}");
+    }
+
+    #[test]
+    fn test_beam_deterministic_with_ties() {
+        // All-equal weights → sort ties resolved by name, not by the
+        // non-deterministic HashMap iteration order. Repeated runs identical.
+        let nodes = vec![
+            make_node("A", 0.5),
+            make_node("B", 0.5),
+            make_node("C", 0.5),
+            make_node("D", 0.5),
+            make_node("E", 0.5),
+        ];
+        let edges = vec![
+            make_edge("A", "B", "relates_to", None),
+            make_edge("A", "C", "relates_to", None),
+            make_edge("A", "D", "relates_to", None),
+            make_edge("A", "E", "relates_to", None),
+        ];
+        let (g, m) = build_graph(nodes, edges);
+        let graph = OrpheusGraphInner::new(g, m);
+        let ctx = DynamicContext::default();
+
+        let baseline: Vec<String> = beam_traverse(&graph, &ctx, "A", 2, 1)
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        for _ in 0..25 {
+            let run: Vec<String> = beam_traverse(&graph, &ctx, "A", 2, 1)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect();
+            assert_eq!(run, baseline, "Beam Top-K nondeterministic across runs");
+        }
+    }
+
+    #[test]
+    fn test_beam_deterministic_with_nan() {
+        // NaN weights make partial_cmp non-total; total_cmp keeps a stable,
+        // deterministic order so repeated runs return the identical sequence.
+        let nodes = vec![
+            make_node("A", 0.5),
+            make_node("B", f32::NAN),
+            make_node("C", 0.8),
+            make_node("D", f32::NAN),
+            make_node("E", 0.3),
+        ];
+        let edges = vec![
+            make_edge("A", "B", "relates_to", None),
+            make_edge("A", "C", "relates_to", None),
+            make_edge("A", "D", "relates_to", None),
+            make_edge("A", "E", "relates_to", None),
+        ];
+        let (g, m) = build_graph(nodes, edges);
+        let graph = OrpheusGraphInner::new(g, m);
+        let ctx = DynamicContext::default();
+
+        let baseline: Vec<String> = beam_traverse(&graph, &ctx, "A", 5, 1)
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        for _ in 0..25 {
+            let run: Vec<String> = beam_traverse(&graph, &ctx, "A", 5, 1)
+                .iter()
+                .map(|r| r.name.clone())
+                .collect();
+            assert_eq!(run, baseline, "Beam order nondeterministic with NaN weights");
+        }
+    }
+
+    #[test]
+    fn test_contextual_subgraph_deterministic_tied_boosts() {
+        // Tied boosts must break by name, not HashMap iteration order.
+        let graph = build_chain_graph();
+        let mut ctx = DynamicContext::default();
+        ctx.semantic_boosts.insert("B".to_string(), 1.0);
+        ctx.semantic_boosts.insert("C".to_string(), 1.0);
+        ctx.semantic_boosts.insert("D".to_string(), 1.0);
+        ctx.semantic_boosts.insert("E".to_string(), 1.0);
+
+        let baseline: Vec<String> = contextual_subgraph(&graph, &ctx, 2)
+            .nodes
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        for _ in 0..25 {
+            let run: Vec<String> = contextual_subgraph(&graph, &ctx, 2)
+                .nodes
+                .iter()
+                .map(|n| n.name.clone())
+                .collect();
+            assert_eq!(run, baseline, "Seed selection nondeterministic on tied boosts");
+        }
     }
 
     #[test]

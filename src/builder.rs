@@ -45,20 +45,46 @@ pub fn build_graph(
     let mut index_map: HashMap<String, NodeIndex> = HashMap::with_capacity(nodes.len());
 
     // --- Phase 1: Insert nodes ---
-    // Find max base_weight for normalization
-    let max_weight = nodes
-        .iter()
-        .map(|n| n.base_weight)
-        .fold(0.0_f32, f32::max);
-    let norm_divisor = if max_weight > f32::EPSILON { max_weight } else { 1.0 };
-
+    // Dedup inputs by name (last-wins, matching upsert semantics) so a repeated
+    // name produces exactly one node instead of an unreachable orphan whose
+    // presence would skew normalization and PageRank.
+    let mut deduped: Vec<&NodeInput> = Vec::with_capacity(nodes.len());
+    let mut name_pos: HashMap<&str, usize> = HashMap::with_capacity(nodes.len());
     for input in &nodes {
+        match name_pos.get(input.name.as_str()) {
+            Some(&pos) => deduped[pos] = input, // last occurrence wins
+            None => {
+                name_pos.insert(input.name.as_str(), deduped.len());
+                deduped.push(input);
+            }
+        }
+    }
+
+    // Sanitize weights before normalization: a single non-finite base_weight
+    // would otherwise make the fold-max non-finite and divide every node to
+    // zero/NaN. Non-finite base_weight -> 0.0, non-finite noise_penalty -> 0.0.
+    let sanitize = |w: f32| if w.is_finite() { w } else { 0.0 };
+
+    // Find max (sanitized) base_weight for normalization.
+    let max_weight = deduped
+        .iter()
+        .map(|n| sanitize(n.base_weight))
+        .fold(0.0_f32, f32::max);
+    // Skip normalization on a non-finite or non-positive max rather than
+    // poisoning every node.
+    let norm_divisor = if max_weight.is_finite() && max_weight > f32::EPSILON {
+        max_weight
+    } else {
+        1.0
+    };
+
+    for input in &deduped {
         let node_data = NodeData {
             name: input.name.clone(),
             kind: input.kind.clone(),
             metadata: input.metadata.clone(),
-            base_weight: input.base_weight / norm_divisor,
-            noise_penalty: input.noise_penalty.clamp(0.0, 1.0),
+            base_weight: sanitize(input.base_weight) / norm_divisor,
+            noise_penalty: sanitize(input.noise_penalty).clamp(0.0, 1.0),
             pagerank_weight: 0.0, // computed in phase 3
         };
         let idx = graph.add_node(node_data);
@@ -240,6 +266,48 @@ mod tests {
         let edges = vec![make_edge("a", "nonexistent", "relates_to")];
         let (graph, _) = build_graph(nodes, edges);
         assert_eq!(graph.edge_count(), 0); // edge skipped
+    }
+
+    #[test]
+    fn test_non_finite_base_weight_does_not_poison_others() {
+        // A single +inf base_weight must not collapse normalization for the
+        // rest of the nodes.
+        let nodes = vec![
+            make_node("a", "model", 100.0),
+            make_node("bad", "model", f32::INFINITY),
+            make_node("c", "model", 200.0),
+        ];
+        let (graph, index_map) = build_graph(nodes, vec![]);
+
+        let a = &graph[index_map["a"]];
+        let bad = &graph[index_map["bad"]];
+        let c = &graph[index_map["c"]];
+
+        // +inf is sanitized to 0.0, so max finite weight (200.0) drives norm.
+        assert!(a.base_weight.is_finite());
+        assert!(bad.base_weight.is_finite());
+        assert!(c.base_weight.is_finite());
+        assert!((a.base_weight - 0.5).abs() < 0.001);
+        assert!((bad.base_weight - 0.0).abs() < 0.001);
+        assert!((c.base_weight - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_duplicate_names_deduped() {
+        // Duplicate node names collapse to a single node (last-wins), so no
+        // orphan is left behind.
+        let nodes = vec![
+            make_node("dup", "model", 100.0),
+            make_node("other", "model", 50.0),
+            make_node("dup", "model", 300.0), // overrides the first "dup"
+        ];
+        let (graph, index_map) = build_graph(nodes, vec![]);
+
+        // Exactly one node per distinct name.
+        assert_eq!(graph.node_count(), 2);
+        assert_eq!(index_map.len(), 2);
+        // Last write wins: dup's base_weight came from 300.0 (the max), so 1.0.
+        assert!((graph[index_map["dup"]].base_weight - 1.0).abs() < 0.001);
     }
 
     #[test]

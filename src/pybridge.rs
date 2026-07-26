@@ -41,8 +41,6 @@ impl GraphInner {
 #[pyclass(name = "OrpheusGraph")]
 pub struct PyOrpheusGraph {
     inner: Option<GraphInner>,
-    /// Risk #14: cache parsed overlay data per project_id to avoid FFI overhead.
-    overlay_cache: HashMap<String, (Vec<NodeData>, Vec<(String, String, EdgeData)>)>,
 }
 
 impl Drop for PyOrpheusGraph {
@@ -63,23 +61,15 @@ impl PyOrpheusGraph {
             })
     }
 
-    /// Risk #14: resolve DynamicContext with overlay caching.
-    /// If overlay_cache_key is set, reuse cached parsed overlay data.
-    fn resolve_context(&mut self, ctx: &PyDynamicContext) -> DynamicContext {
-        let (overlay_nodes, overlay_edges) = match &ctx.overlay_cache_key {
-            Some(key) if !ctx.overlay_nodes_raw.is_empty() || !ctx.overlay_edges_raw.is_empty() => {
-                if let Some(cached) = self.overlay_cache.get(key) {
-                    cached.clone()
-                } else {
-                    let parsed = ctx.parse_overlays();
-                    self.overlay_cache.insert(key.clone(), parsed.clone());
-                    parsed
-                }
-            }
-            _ => ctx.parse_overlays(),
-        };
+    /// Resolve a PyDynamicContext into a fresh Rust DynamicContext.
+    ///
+    /// Overlays are parsed on every call (cheap) — deliberately no caching, so
+    /// this stays `&self` and multiple readers can run concurrently under a
+    /// shared borrow while the GIL is released.
+    fn resolve_context(&self, ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
+        let (overlay_nodes, overlay_edges) = ctx.parse_overlays()?;
 
-        DynamicContext {
+        Ok(DynamicContext {
             semantic_boosts: ctx.semantic_boosts.clone(),
             weight_overrides: ctx.weight_overrides.clone(),
             noise_tags: ctx.noise_tags.clone(),
@@ -90,7 +80,7 @@ impl PyOrpheusGraph {
             w_override: ctx.w_override,
             overlay_nodes,
             overlay_edges,
-        }
+        })
     }
 }
 
@@ -145,14 +135,14 @@ impl PyOrpheusGraph {
 
     /// Top-K pruned BFS. GIL released during traversal.
     fn beam_traverse(
-        &mut self,
+        &self,
         py: Python<'_>,
         start: &str,
         k: usize,
         depth: usize,
         ctx: &PyDynamicContext,
     ) -> PyResult<Vec<PyNodeResult>> {
-        let rust_ctx = self.resolve_context(ctx);
+        let rust_ctx = self.resolve_context(ctx)?;
         let graph = self.require_inner()?;
         let start_owned = start.to_string();
 
@@ -165,13 +155,13 @@ impl PyOrpheusGraph {
 
     /// Weighted Dijkstra. GIL released during traversal.
     fn find_path(
-        &mut self,
+        &self,
         py: Python<'_>,
         start: &str,
         end: &str,
         ctx: &PyDynamicContext,
     ) -> PyResult<Option<Vec<PyPathStep>>> {
-        let rust_ctx = self.resolve_context(ctx);
+        let rust_ctx = self.resolve_context(ctx)?;
         let graph = self.require_inner()?;
         let start_owned = start.to_string();
         let end_owned = end.to_string();
@@ -185,12 +175,12 @@ impl PyOrpheusGraph {
 
     /// Contextual subgraph extraction. GIL released.
     fn contextual_subgraph(
-        &mut self,
+        &self,
         py: Python<'_>,
         ctx: &PyDynamicContext,
         k: usize,
     ) -> PyResult<PySubGraph> {
-        let rust_ctx = self.resolve_context(ctx);
+        let rust_ctx = self.resolve_context(ctx)?;
         let graph = self.require_inner()?;
 
         let sg = py.allow_threads(|| {
@@ -210,7 +200,7 @@ impl PyOrpheusGraph {
     /// Start nodes are always preserved.
     #[pyo3(signature = (start_nodes, k, depth, ctx, threshold = None))]
     fn multi_beam_intersection(
-        &mut self,
+        &self,
         py: Python<'_>,
         start_nodes: Vec<String>,
         k: usize,
@@ -218,9 +208,15 @@ impl PyOrpheusGraph {
         ctx: &PyDynamicContext,
         threshold: Option<usize>,
     ) -> PyResult<PySubGraph> {
-        let rust_ctx = self.resolve_context(ctx);
+        let rust_ctx = self.resolve_context(ctx)?;
         let graph = self.require_inner()?;
-        let t = threshold.unwrap_or_else(|| start_nodes.len().saturating_sub(1).max(1));
+        // Default to a true intersection: a node must be hit by >= 2 beams
+        // (min(len, max(2, len-1))). The old len-1 default degraded to a union
+        // for 2 seeds (threshold 1).
+        let t = threshold.unwrap_or_else(|| {
+            let len = start_nodes.len();
+            len.min(len.saturating_sub(1).max(2))
+        });
 
         let sg = py.allow_threads(|| {
             traversal::multi_beam_intersection(graph, &rust_ctx, &start_nodes, k, depth, t)
@@ -296,10 +292,6 @@ pub struct PyDynamicContext {
     pub overlay_nodes_raw: Vec<HashMap<String, String>>,
     /// Virtual overlay edges: [{"from": ..., "to": ..., "kind": ...}].
     pub overlay_edges_raw: Vec<HashMap<String, String>>,
-    /// Risk #14: cache key for overlay data per project.
-    /// If set & matches previous call, reuse cached parsed overlay.
-    #[pyo3(get, set)]
-    pub overlay_cache_key: Option<String>,
 }
 
 #[pymethods]
@@ -315,8 +307,7 @@ impl PyDynamicContext {
         w_noise = 1.0,
         w_override = 1.0,
         overlay_nodes = None,
-        overlay_edges = None,
-        overlay_cache_key = None
+        overlay_edges = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -330,7 +321,6 @@ impl PyDynamicContext {
         w_override: f32,
         overlay_nodes: Option<Vec<HashMap<String, String>>>,
         overlay_edges: Option<Vec<HashMap<String, String>>>,
-        overlay_cache_key: Option<String>,
     ) -> Self {
         Self {
             semantic_boosts: semantic_boosts.unwrap_or_default(),
@@ -343,8 +333,25 @@ impl PyDynamicContext {
             w_override,
             overlay_nodes_raw: overlay_nodes.unwrap_or_default(),
             overlay_edges_raw: overlay_edges.unwrap_or_default(),
-            overlay_cache_key,
         }
+    }
+
+    /// Insert/update a semantic boost. The `semantic_boosts` getter returns a
+    /// copy, so mutating that copy in-place is a no-op — use this instead.
+    fn add_boost(&mut self, name: String, val: f32) {
+        self.semantic_boosts.insert(name, val);
+    }
+
+    /// Insert/update a weight override. See `add_boost` for why the getter copy
+    /// cannot be mutated in place.
+    fn add_override(&mut self, name: String, val: f32) {
+        self.weight_overrides.insert(name, val);
+    }
+
+    /// Add a noise tag. The `noise_tags` getter returns a copy, so mutating that
+    /// copy in-place is a no-op — use this instead.
+    fn add_noise_tag(&mut self, tag: String) {
+        self.noise_tags.insert(tag);
     }
 
     fn __repr__(&self) -> String {
@@ -360,36 +367,76 @@ impl PyDynamicContext {
 
 impl PyDynamicContext {
     /// Parse overlay raw dicts into Rust types.
-    fn parse_overlays(&self) -> (Vec<NodeData>, Vec<(String, String, EdgeData)>) {
-        let overlay_nodes = self
-            .overlay_nodes_raw
-            .iter()
-            .map(|m| NodeData {
-                name: m.get("name").cloned().unwrap_or_default(),
+    ///
+    /// Required fields are hard errors — a missing/typo'd key must never be
+    /// silently defaulted, as that would inject phantom ''-named nodes or
+    /// mis-weighted edges into the traversal.
+    fn parse_overlays(&self) -> PyResult<(Vec<NodeData>, Vec<(String, String, EdgeData)>)> {
+        let mut overlay_nodes = Vec::with_capacity(self.overlay_nodes_raw.len());
+        for m in &self.overlay_nodes_raw {
+            let name = m.get("name").cloned().unwrap_or_default();
+            if name.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "overlay node is missing required non-empty 'name'",
+                ));
+            }
+            overlay_nodes.push(NodeData {
                 kind: m.get("kind").cloned().unwrap_or_default(),
                 metadata: HashMap::new(),
-                base_weight: m.get("base_weight").and_then(|v| v.parse().ok()).unwrap_or(0.5),
-                noise_penalty: m.get("noise_penalty").and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                base_weight: parse_overlay_f32(m, "base_weight", 0.5, &name)?,
+                noise_penalty: parse_overlay_f32(m, "noise_penalty", 0.0, &name)?,
                 pagerank_weight: 0.0,
-            })
-            .collect();
+                name,
+            });
+        }
 
-        let overlay_edges = self
-            .overlay_edges_raw
-            .iter()
-            .map(|m| {
-                let from = m.get("from").cloned().unwrap_or_default();
-                let to = m.get("to").cloned().unwrap_or_default();
-                let edge = EdgeData {
-                    kind: m.get("kind").cloned().unwrap_or_else(|| "relates_to".to_string()),
-                    field_name: m.get("field").cloned(),
-                    base_weight: m.get("base_weight").and_then(|v| v.parse().ok()).unwrap_or(1.0),
-                };
-                (from, to, edge)
-            })
-            .collect();
+        let mut overlay_edges = Vec::with_capacity(self.overlay_edges_raw.len());
+        for m in &self.overlay_edges_raw {
+            let from = require_overlay_field(m, "from", "edge")?;
+            let to = require_overlay_field(m, "to", "edge")?;
+            let kind = require_overlay_field(m, "kind", "edge")?;
+            let base_weight = parse_overlay_f32(m, "base_weight", 1.0, &format!("{from}->{to}"))?;
+            let edge = EdgeData {
+                kind,
+                field_name: m.get("field").cloned(),
+                base_weight,
+            };
+            overlay_edges.push((from, to, edge));
+        }
 
-        (overlay_nodes, overlay_edges)
+        Ok((overlay_nodes, overlay_edges))
+    }
+}
+
+/// Extract a required non-empty overlay field or raise a PyErr.
+fn require_overlay_field(
+    m: &HashMap<String, String>,
+    field: &str,
+    what: &str,
+) -> PyResult<String> {
+    match m.get(field) {
+        Some(v) if !v.is_empty() => Ok(v.clone()),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "overlay {what} is missing required non-empty '{field}'"
+        ))),
+    }
+}
+
+/// Parse an optional numeric overlay field; a present-but-invalid value is a
+/// hard error rather than a silent default.
+fn parse_overlay_f32(
+    m: &HashMap<String, String>,
+    field: &str,
+    default: f32,
+    ctx: &str,
+) -> PyResult<f32> {
+    match m.get(field) {
+        Some(v) => v.parse::<f32>().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "overlay '{ctx}' has invalid '{field}': {v:?}"
+            ))
+        }),
+        None => Ok(default),
     }
 }
 
@@ -574,7 +621,6 @@ pub fn py_build_graph(nodes: &Bound<'_, PyList>, edges: &Bound<'_, PyList>) -> P
 
     Ok(PyOrpheusGraph {
         inner: Some(GraphInner::Owned(graph_inner)),
-        overlay_cache: HashMap::new(),
     })
 }
 
@@ -588,6 +634,5 @@ pub fn py_from_rkyv(data: &Bound<'_, PyBytes>) -> PyResult<PyOrpheusGraph> {
 
     Ok(PyOrpheusGraph {
         inner: Some(GraphInner::Archived(view)),
-        overlay_cache: HashMap::new(),
     })
 }
