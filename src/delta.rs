@@ -202,6 +202,28 @@ impl GraphDelta {
         Ok(())
     }
 
+    /// Replay already-committed ops WITHOUT re-validation (spec §3.3 rule 4).
+    ///
+    /// Recovery replays WAL frames that were validated and made durable at their
+    /// original `apply()`; re-running PASS-1 validation on replay would (a) after
+    /// 2b compaction validate a frame against a different accumulated state than
+    /// at apply time, and (b) let a newer version's tightened rule reject a batch
+    /// a prior version legally committed — bricking a valid store. Validity is
+    /// decided once, at apply; durability is permanent. This runs only the
+    /// infallible PASS-2 mutators.
+    pub fn replay(&mut self, base: &dyn GraphAccessor, ops: Vec<Op>) {
+        for op in ops {
+            match op {
+                Op::UpsertNode(nd) => self.upsert_node(base, nd),
+                Op::RemoveNode { name } => self.remove_node(base, &name),
+                Op::AddEdge { from, to, edge } => self.add_edge(from, to, edge),
+                Op::RemoveEdge { from, to, kind } => self.remove_edge(base, from, to, kind),
+            }
+        }
+        #[cfg(debug_assertions)]
+        self.debug_check_invariants(base);
+    }
+
     /// Simulated presence of `x` given `scratch` + current delta + base.
     fn is_present(
         &self,

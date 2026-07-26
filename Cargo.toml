@@ -20,12 +20,30 @@ rkyv = { version = "0.8", features = ["bytecheck"] }
 bytecheck = "0.8"
 indexmap = "2"
 
+# ---- persistence (Phase 2a) ----
+# Lock-free single-writer/multi-reader GraphState publisher (§3.5): load_full()
+# hands readers a consistent immutable (base,delta,seq) with no reader-side lock.
+arc-swap = "1"
+# Frame crc over len‖payload and snapshot crc32 (§4.1/§4.2). SIMD, tiny, no_std.
+crc32fast = "1"
+# WAL payload encoder (spec-mandated): serde-based (no new derives), varint-compact,
+# self-delimiting, stable append-only format. to_stdvec needs the "use-std" feature.
+postcard = { version = "1", features = ["use-std"] }
+# Advisory exclusive flock on LOCK for cross-process single-writer (§4.1); the
+# kernel releases it on crash, so there is no stale-lock dance.
+fs2 = "0.4"
+# 16 random bytes for the u128 epoch on create + every timeline-forking recovery (§4.3).
+getrandom = "0.2"
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.5"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+# On-disk temp dirs for the persistence tests (already a proptest transitive dep;
+# declared explicitly here since the persist tests depend on it directly).
+tempfile = "3"
 
 [[bench]]
 name = "bench_traversal"
