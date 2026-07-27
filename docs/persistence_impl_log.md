@@ -373,6 +373,35 @@ kill -9 harness still passes ×100/policy after the high-water change (process d
 data below the high-water). **Engine is now P0/P1-clean across three per-phase passes + one
 whole-engine pass.**
 
+### Audit #5 (deeper edges + regression check on the #4 fixes)
+
+5 finders (recent-fix-regressions / arithmetic-limits / rare-interleavings / recovery-corruption
+-deep / delta-property-deep), adversarially verified: **0 P0, 2 P1, 1 new P2** — and both P1s
+were **regressions introduced by the audit-#4 `high_seq` fix** (a good catch on the fix itself).
+All fixed (`554792a`):
+
+- **P1 × 2 — `high_seq` over-reported durability under OnFlush → false brick.** high_seq was
+  set from the in-memory `seq`, but an OnFlush append is only write-through (not fsync'd), so
+  `seq` isn't durable. A crash-recovery reopen (which replays page-cache frames) and a
+  poisoned/flush-failed `close()` both durably recorded `high_seq = seq`; a subsequent
+  *legitimate* power-loss of the un-fsync'd tail then tripped the `last_applied < high_seq`
+  guard and permanently bricked an otherwise-recoverable store. **Fix:** `Writer.durable_seq` —
+  the highest seq actually on stable storage, advanced ONLY by a real fsync (`append` now
+  reports whether it fsync'd; flush/clean-close/compaction advance it; recovery sets it to the
+  on-disk high_seq and no longer promotes to `last_applied`). `high_seq` is written from
+  `durable_seq` everywhere, so it never covers un-fsync'd frames. Two regression tests pin both
+  directions (un-fsync'd tail loss reopens gracefully; genuinely-durable loss is still Corrupt).
+- **P2 — MANIFEST had no integrity checksum.** A bit-rotted `snapshot_seq`/`high_seq` (the
+  snapshot bytes have a crc; the MANIFEST didn't) would silently skip WAL frames. Added a crc32
+  over the integrity-critical fields, stamped on write, verified on read. Regression test added.
+
+Refuted: 2 (arithmetic-limits and a rare-interleaving claim didn't survive verification). The
+durable_seq change passed the kill -9 harness ×100/policy unchanged. **132 lib + crash harness +
+7 integration green.**
+
+Lesson logged: the audit-#4 high_seq fix conflated "acked" (in-memory) with "durable"
+(fsync'd) — the exact distinction OnFlush is built around. `durable_seq` makes it explicit.
+
 **Deferred (out of the implemented scope, spec §4.6 / future):**
 - **Python API** (`open`/`apply`/`flush`/`compact` PyO3 bindings for `PersistentGraph`) — the
   store is Rust-native today; wiring it into `pybridge` + Orpheus is a distinct Phase 3.
