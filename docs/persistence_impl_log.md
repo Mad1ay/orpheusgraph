@@ -349,6 +349,30 @@ and durability proven by a real `kill -9` harness.
 **Commits:** `fd098f3` (Phase 1) · `d76f67f` (Phase 2a) · `5a8b974` (Phase 2b) · `4c09dec`
 (clippy). Branch `feat/persistence`, not yet merged/pushed — awaits review.
 
+### Full-engine re-audit (all phases composed)
+
+A fresh clean-slate audit of the whole engine (6 finders across delta / WAL+recovery /
+concurrency+CAS / compaction+GC / mmap+CSR+validate / cross-phase-API, adversarially verified):
+**0 P0, 0 P1, 3 P2** (4 raw, 1 refuted) — no critical/high defect survived cross-phase review.
+All 3 P2s fixed (`61aea32`):
+
+- **Determinism (cross-phase):** compaction re-ran `build_graph`, whose base_weight
+  max-normalization isn't idempotent — a delta `RemoveNode` of the max-weight node rescaled
+  every survivor's `base_weight` at an **unchanged seq**, changing beam/find_path scores
+  (violates "same (seq, ctx) → same output"). Fix: `build_graph_prenormalized` (skips
+  base_weight normalization; inputs already in [0,1]) used by compaction. Regression test added.
+- **Durability:** a WAL truncated/suffix-lost on a frame boundary (external FS fault) was
+  silently accepted as a shorter clean log — seq regressed, no epoch re-mint, acked batches
+  gone — while `rm wal.log` was correctly `Corrupt`. Fix: a durable `high_seq` high-water in the
+  MANIFEST (create/close/compaction/recovery); recovery hard-errors `Corrupt` when
+  `last_applied < high_seq`. `#[serde(default)]` for safe degradation. Regression test added.
+- **Efficiency:** auto-compaction left `delta_ops` above threshold on failure → a full rebuild
+  on every subsequent apply (compaction storm). Fix: reset `delta_ops` on failure.
+
+kill -9 harness still passes ×100/policy after the high-water change (process death never loses
+data below the high-water). **Engine is now P0/P1-clean across three per-phase passes + one
+whole-engine pass.**
+
 **Deferred (out of the implemented scope, spec §4.6 / future):**
 - **Python API** (`open`/`apply`/`flush`/`compact` PyO3 bindings for `PersistentGraph`) — the
   store is Rust-native today; wiring it into `pybridge` + Orpheus is a distinct Phase 3.
