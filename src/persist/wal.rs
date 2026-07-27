@@ -211,7 +211,10 @@ impl WalWriter {
     /// `(epoch, seq)` to reconcile. Making `apply`-Err strictly equal
     /// not-durable would need a per-frame commit/torn-write marker — deferred
     /// (logged in docs/persistence_impl_log.md and the spec durability section).
-    pub fn append(&mut self, frame: &[u8]) -> Result<(), PersistError> {
+    /// Returns `true` iff this call fsync'd the log (so the caller can advance
+    /// its durable-seq high-water only when the frame is actually on stable
+    /// storage — critical: under `OnFlush` a write-through append is NOT durable).
+    pub fn append(&mut self, frame: &[u8]) -> Result<bool, PersistError> {
         #[cfg(test)]
         if self.fail_next {
             // Injected BEFORE any write: nothing hits disk, len unchanged.
@@ -229,17 +232,23 @@ impl WalWriter {
         }
         self.len += frame.len() as u64;
 
-        match self.policy {
-            FsyncPolicy::EveryBatch => self.fsync_now()?,
+        let fsynced = match self.policy {
+            FsyncPolicy::EveryBatch => {
+                self.fsync_now()?;
+                true
+            }
             FsyncPolicy::EveryN(n) => {
                 self.since_fsync += 1;
                 if self.since_fsync >= n.max(1) {
                     self.fsync_now()?;
+                    true
+                } else {
+                    false
                 }
             }
-            FsyncPolicy::OnFlush => {}
-        }
-        Ok(())
+            FsyncPolicy::OnFlush => false,
+        };
+        Ok(fsynced)
     }
 
     /// Force the WAL to durable storage now (the durability point under

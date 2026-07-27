@@ -53,6 +53,11 @@ pub struct Manifest {
     pub clean_shutdown: bool,
     /// Provenance stamp, e.g. "orpheusgraph 0.1.0".
     pub created_by: String,
+    /// crc32 over the integrity-critical fields (set by `write_manifest_atomic`,
+    /// verified by `read_manifest`). `#[serde(default)]` = 0 for a MANIFEST
+    /// written before this field; a 0 checksum skips verification.
+    #[serde(default)]
+    pub checksum: u32,
 }
 
 /// Mint a fresh 128-bit epoch from 16 CSPRNG bytes (§4.3).
@@ -66,17 +71,51 @@ pub fn mint_epoch() -> Result<u128, PersistError> {
     Ok(u128::from_le_bytes(buf))
 }
 
+/// crc32 over the integrity-critical MANIFEST fields (everything that steers
+/// recovery), computed with `checksum` itself excluded. Guards against bit-rot
+/// of e.g. `snapshot_seq`/`high_seq` to a valid-but-wrong value that would
+/// silently skip WAL frames — the snapshot bytes have their own crc, the
+/// MANIFEST did not. `created_by` is provenance and excluded.
+fn manifest_checksum(m: &Manifest) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(&m.format_version.to_le_bytes());
+    h.update(m.snapshot_file.as_bytes());
+    h.update(&m.snapshot_seq.to_le_bytes());
+    h.update(&m.snapshot_crc32.to_le_bytes());
+    h.update(&m.compaction_id.to_le_bytes());
+    h.update(&m.epoch.to_le_bytes());
+    h.update(&m.high_seq.to_le_bytes());
+    h.update(&[m.clean_shutdown as u8]);
+    h.finalize()
+}
+
 /// Read and parse `MANIFEST.json`. A parse error is `Corrupt` (not a torn tail).
+/// If a `checksum` is present (non-zero), it is verified — a mismatch is
+/// `Corrupt` rather than a silently-trusted bit-rotted pointer. A `0` checksum
+/// (a MANIFEST written before the field existed) skips verification.
 pub fn read_manifest(path: &Path) -> Result<Manifest, PersistError> {
     let bytes = std::fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| PersistError::Corrupt(format!("MANIFEST parse failed: {e}")))
+    let m: Manifest = serde_json::from_slice(&bytes)
+        .map_err(|e| PersistError::Corrupt(format!("MANIFEST parse failed: {e}")))?;
+    if m.checksum != 0 {
+        let expect = manifest_checksum(&m);
+        if m.checksum != expect {
+            return Err(PersistError::Corrupt(format!(
+                "MANIFEST checksum mismatch: stored {:#010x}, computed {:#010x} (bit-rot?)",
+                m.checksum, expect
+            )));
+        }
+    }
+    Ok(m)
 }
 
 /// Atomically (re)write `MANIFEST.json`: tmp -> fsync -> rename -> fsync(dir).
 /// The directory fsync is mandatory so the rename survives power loss (§4.1).
+/// Stamps the integrity `checksum` before serializing.
 pub fn write_manifest_atomic(dir: &Path, manifest: &Manifest) -> Result<(), PersistError> {
-    let json = serde_json::to_vec_pretty(manifest)
+    let mut m = manifest.clone();
+    m.checksum = manifest_checksum(&m);
+    let json = serde_json::to_vec_pretty(&m)
         .map_err(|e| PersistError::Corrupt(format!("MANIFEST serialize failed: {e}")))?;
     write_file_atomic(dir, "MANIFEST.json", &json)
 }

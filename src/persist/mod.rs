@@ -128,8 +128,16 @@ pub struct GraphState {
 /// Everything mutated only under the writer `Mutex`.
 struct Writer {
     wal: WalWriter,
-    /// Durable commit counter — mirror of the last WAL frame's seq (§4.2).
+    /// Commit counter — mirror of the last appended WAL frame's seq. Advanced
+    /// after every accepted append, even under `OnFlush` where the frame is only
+    /// write-through (not yet fsync'd) (§4.2).
     seq: u64,
+    /// Highest seq that is actually on STABLE STORAGE — advanced only by a
+    /// successful fsync (EveryBatch/EveryN append, flush, or a compaction that
+    /// folds it into the durable snapshot). `high_seq` in the MANIFEST is set
+    /// from THIS, never from `seq`, so it never over-reports durability and a
+    /// legitimate loss of the un-fsync'd tail cannot false-brick the store.
+    durable_seq: u64,
     /// Current incarnation id (§4.3).
     epoch: u128,
     /// Base graph, shared with the published `GraphState` via the same `Arc`.
@@ -169,12 +177,15 @@ impl Writer {
             snapshot_crc32: self.snapshot_crc32,
             compaction_id: self.compaction_id,
             epoch: self.epoch,
-            // The current in-memory seq is durable (it mirrors the last appended
-            // frame): record it as the high-water so a later WAL suffix-loss is
-            // detected as Corrupt on reopen.
-            high_seq: self.seq,
+            // Record the DURABLE high-water (fsync'd), never the in-memory seq:
+            // under OnFlush a poisoned/flush-failed close has un-fsync'd frames
+            // whose loss on power-off is contractual, so high_seq must not cover
+            // them (else reopen would false-brick). The clean close path flushes
+            // first (durable_seq == seq), so it still records the full seq.
+            high_seq: self.durable_seq,
             clean_shutdown,
             created_by: CREATED_BY.to_string(),
+            checksum: 0,
         }
     }
 }
@@ -332,6 +343,7 @@ impl PersistentGraph {
             high_seq: 0, // fresh store: nothing acked yet
             clean_shutdown: false,
             created_by: CREATED_BY.to_string(),
+            checksum: 0,
         };
         write_manifest_atomic(&dir, &manifest)?;
 
@@ -352,6 +364,7 @@ impl PersistentGraph {
         let writer = Mutex::new(Writer {
             wal,
             seq: 0,
+            durable_seq: 0, // fresh store: empty WAL fsync'd, nothing acked yet
             epoch,
             base,
             delta,
@@ -541,11 +554,16 @@ impl PersistentGraph {
             snapshot_crc32: manifest.snapshot_crc32,
             compaction_id: manifest.compaction_id,
             epoch,
-            // Post-recovery durable high-water = what we actually recovered. Never
-            // lower it (max guards a torn-tail case where last_applied dipped).
-            high_seq: last_applied.max(manifest.high_seq),
+            // Do NOT promote high_seq to last_applied: under OnFlush the replayed
+            // frames survived the crash in the page cache but were never fsync'd,
+            // so they are NOT durable — a later power-loss legitimately drops
+            // them. Promoting here would then false-brick the store on reopen
+            // (audit P1). Keep the last genuinely-durable high-water; new durable
+            // data re-advances it via the next flush/close/compaction.
+            high_seq: manifest.high_seq,
             clean_shutdown: false,
             created_by: manifest.created_by.clone(),
+            checksum: 0,
         };
         write_manifest_atomic(&dir, &out_manifest)?;
 
@@ -563,6 +581,10 @@ impl PersistentGraph {
         let writer = Mutex::new(Writer {
             wal,
             seq: last_applied,
+            // The genuinely-durable high-water is the on-disk MANIFEST's high_seq
+            // (recovery under OnFlush does not newly fsync the replayed frames).
+            // Never set this to last_applied — that would over-report durability.
+            durable_seq: manifest.high_seq,
             epoch,
             base: base.clone(),
             delta: delta.clone(),
@@ -627,10 +649,19 @@ impl PersistentGraph {
             ops,
         };
         let frame = wal::encode_frame(&rec)?;
-        w.wal.append(&frame)?; // fsync per policy happens inside append (step 6)
+        let fsynced = w.wal.append(&frame)?; // fsync per policy happens inside append
 
         // 7. Advance in-memory ONLY after a durable append.
         w.seq = new_seq;
+        // Advance the durable high-water ONLY when the append actually fsync'd
+        // (EveryBatch always; EveryN on a boundary). Under OnFlush the frame is
+        // only write-through — durable_seq stays until flush()/close/compaction.
+        // high_seq is derived from durable_seq, so it never over-reports what is
+        // on stable storage (else a legitimate power-loss of the un-fsync'd tail
+        // would falsely brick the store).
+        if fsynced {
+            w.durable_seq = new_seq;
+        }
         let op_count = rec.ops.len();
         w.delta_ops += op_count;
         let new_delta = Arc::new(d);
@@ -744,6 +775,7 @@ impl PersistentGraph {
             high_seq: fold_seq,
             clean_shutdown: false,
             created_by: CREATED_BY.to_string(),
+            checksum: 0,
         };
         write_manifest_atomic(&self.dir, &new_manifest)?;
 
@@ -759,6 +791,9 @@ impl PersistentGraph {
         w.snapshot_crc32 = new_crc;
         w.format_version = 1;
         w.compaction_id = new_cid;
+        // fold_seq is now durable IN THE SNAPSHOT (fsync'd + renamed above), so
+        // the durable high-water advances to it even under OnFlush.
+        w.durable_seq = w.durable_seq.max(fold_seq);
 
         // 6. Rotate the WAL: all frames <= fold_seq are now folded. A crash
         //    between step 5 and here leaves stale frames <= snapshot_seq that the
@@ -854,7 +889,10 @@ impl PersistentGraph {
         if w.wal.poisoned {
             return Err(PersistError::Poisoned);
         }
-        w.wal.flush()
+        w.wal.flush()?;
+        // Everything appended so far is now on stable storage.
+        w.durable_seq = w.seq;
+        Ok(())
     }
 
     /// Cleanly close: fsync the WAL, then mark `clean_shutdown=true` in the
@@ -876,7 +914,13 @@ impl PersistentGraph {
                 // Best-effort durability of everything acknowledged so far. A
                 // flush failure here poisons and is surfaced below.
                 match w.wal.flush() {
-                    Ok(()) => (w.build_manifest(true), false),
+                    Ok(()) => {
+                        // All appended frames are now durable.
+                        w.durable_seq = w.seq;
+                        (w.build_manifest(true), false)
+                    }
+                    // Flush failed: durable_seq stays at the last successful
+                    // fsync, so build_manifest(false) records only durable data.
                     Err(_) => (w.build_manifest(false), true),
                 }
             }
@@ -1591,6 +1635,81 @@ mod tests {
         }
     }
 
+    fn truncate_wal(dir: &Path) {
+        let f = std::fs::OpenOptions::new().write(true).open(dir.join("wal.log")).unwrap();
+        f.set_len(0).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn manifest_field_bitrot_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        pg.apply(vec![upsert("a", "m")], None).unwrap();
+        pg.close().unwrap();
+        // Bit-rot snapshot_seq in the MANIFEST to a valid-but-wrong value (would
+        // otherwise silently skip WAL frames). The checksum must catch it.
+        let mpath = dir.path().join("MANIFEST.json");
+        let text = std::fs::read_to_string(&mpath).unwrap();
+        let tampered = text.replace("\"snapshot_seq\": 0", "\"snapshot_seq\": 999");
+        assert_ne!(tampered, text, "expected to find snapshot_seq to tamper");
+        std::fs::write(&mpath, tampered).unwrap();
+        match PersistentGraph::open(dir.path(), false) {
+            Err(PersistError::Corrupt(m)) if m.contains("checksum") => {}
+            other => panic!("expected MANIFEST checksum Corrupt, got {other:?}"),
+        }
+    }
+
+    // The mirror of the test above (audit P1 regressions): under OnFlush, frames
+    // that were only WRITE-THROUGH (never fsync'd) are not durable, so losing
+    // them on power-off is contractual — reopen must NOT hard-error. high_seq
+    // must never cover un-fsync'd frames.
+
+    #[test]
+    fn onflush_crash_recover_then_powerloss_reopens_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            // OnFlush (default): applies are write-through only, never fsync'd.
+            pg.apply(vec![upsert("a", "m")], None).unwrap();
+            pg.apply(vec![upsert("b", "m")], None).unwrap();
+            pg.apply(vec![upsert("c", "m")], None).unwrap();
+            assert_eq!(pg.seq(), 3);
+            drop(pg); // kill -9 model: no close; page-cache WAL survives
+        }
+        {
+            // Crash-recovery reopen. Must NOT durably promote high_seq to 3.
+            let pg = PersistentGraph::open(dir.path(), false).unwrap();
+            assert_eq!(pg.seq(), 3);
+            drop(pg); // second crash, still no flush/close
+        }
+        // Power loss drops the never-fsync'd WAL tail (reverts to durable = empty).
+        truncate_wal(dir.path());
+        // Must reopen at the last DURABLE seq (0), not Corrupt-brick.
+        let pg = PersistentGraph::open(dir.path(), false)
+            .expect("OnFlush power-loss after a crash-recovery reopen must open, not brick");
+        assert_eq!(pg.seq(), 0);
+    }
+
+    #[test]
+    fn onflush_poisoned_close_then_powerloss_reopens_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        pg.apply(vec![upsert("a", "m")], None).unwrap();
+        pg.apply(vec![upsert("b", "m")], None).unwrap();
+        assert_eq!(pg.seq(), 2);
+        // Poison the writer on the next append; seq stays 2, nothing was flushed.
+        pg.arm_append_failure();
+        assert!(pg.apply(vec![upsert("c", "m")], None).is_err());
+        // Poisoned close must record high_seq = durable_seq (0, nothing fsync'd),
+        // NOT seq=2 — else the following power loss would false-brick.
+        assert!(matches!(pg.close(), Err(PersistError::Poisoned)));
+        truncate_wal(dir.path());
+        let pg2 = PersistentGraph::open(dir.path(), false)
+            .expect("power loss after a poisoned OnFlush close must open, not brick");
+        assert_eq!(pg2.seq(), 0);
+    }
+
     // ---- empty-delta compaction is a no-op -----------------------------
 
     #[test]
@@ -1856,6 +1975,7 @@ mod tests {
             high_seq: 0,
             clean_shutdown: true,
             created_by: "test-v0".into(),
+            checksum: 0,
         };
         write_manifest_atomic(dir.path(), &m).unwrap();
 
