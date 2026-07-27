@@ -37,6 +37,10 @@ fn marker_op(n: u64) -> Op {
 fn child_loop(dir: &Path, policy: FsyncPolicy) -> ! {
     let pg = PersistentGraph::open(dir, false).expect("child: open store");
     pg.set_fsync_policy(policy);
+    // Force frequent compaction so the parent's SIGKILLs (1-40ms apart) land
+    // inside compact_locked's non-atomic on-disk sequence (snapshot write,
+    // MANIFEST rename, WAL truncate, re-mmap) — the riskiest Phase 2b path.
+    pg.set_auto_compact_threshold(Some(8));
     let mut acked = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -175,6 +179,23 @@ fn kill9_crash_harness() {
         assert!(
             last_seq > 0,
             "[{policy_name}] no progress was ever made — child never applied a batch"
+        );
+        // Prove compaction actually ran (and survived the kills): create() writes
+        // cid=0 (snapshot-...-0000000000.og); every compaction increments the cid,
+        // so a live/orphan snapshot with cid != 0 means compact_locked ran at
+        // least once across the crash-interrupted incarnations.
+        let compacted = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .any(|n| {
+                n.starts_with("snapshot-")
+                    && n.ends_with(".og")
+                    && !n.contains("-0000000000.og")
+            });
+        assert!(
+            compacted,
+            "[{policy_name}] no compacted snapshot (cid>0) found — compaction never fired under crashes"
         );
     }
 }

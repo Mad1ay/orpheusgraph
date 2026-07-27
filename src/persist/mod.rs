@@ -1,4 +1,4 @@
-//! # Persistent graph store (Phase 2a)
+//! # Persistent graph store (Phase 2a + 2b)
 //!
 //! Wraps an immutable base graph + a mutable [`GraphDelta`] behind a
 //! crash-safe, single-writer / lock-free-multi-reader store:
@@ -17,11 +17,18 @@
 //!   replays the WAL, truncates a torn tail, and re-mints the epoch on any
 //!   timeline fork (§4.3). No recovery path panics on disk bytes.
 //!
-//! ## Scope (2a)
-//! Base is always [`BaseGraph::Owned`] loaded via `from_rkyv_rebuild` (flat
-//! `format_version` 0). CSR V1, mmap bases, compaction, open-time GC and
-//! validate-modes are Phase 2b and are deliberately absent. There is no Python
-//! API here — Rust-native surface + Rust tests only.
+//! ## Phase 2b (this module + [`snapshot`])
+//! `create()` now writes the **V1 CSR** snapshot (`format_version` 1); `open()`
+//! reads BOTH V0 (flat, always materialized [`BaseGraph::Owned`], never
+//! mmap-traversed) and V1 (mmap-traversed [`BaseGraph::Archived`], honoring
+//! [`BaseMode`]/[`Validate`]/`prefault`). Added: crash-safe [`compact`] +
+//! auto-compaction (fold the delta into a fresh base), a two-tier snapshot GC
+//! (inline post-compaction delete + open-time orphan sweep), and the §5.1
+//! trust-boundary validation of untrusted snapshots. The CSR format, the
+//! mmap-backed [`ArchivedCsrView`] and the validate modes live in [`snapshot`].
+//! There is no Python API here — Rust-native surface + Rust tests only.
+//!
+//! [`compact`]: PersistentGraph::compact
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -30,22 +37,25 @@ use arc_swap::ArcSwap;
 
 use crate::accessor::GraphAccessor;
 use crate::builder::build_graph;
-use crate::delta::{GraphDelta, Op};
+use crate::delta::{materialize, GraphDelta, Op};
 use crate::graph::OrpheusGraphInner;
-use crate::serialization::{from_rkyv_rebuild, to_rkyv};
+use crate::serialization::from_rkyv_rebuild;
 
 mod error;
 mod lock;
 mod manifest;
+mod snapshot;
 mod wal;
 
 pub use error::PersistError;
+pub use snapshot::{ArchivedCsrView, Validate};
 
 use lock::DirLock;
 use manifest::{
     fsync_dir, mint_epoch, read_manifest, write_file_atomic, write_manifest_atomic, Manifest,
     CREATED_BY, FORMAT_VERSION,
 };
+use snapshot::{open_snapshot, to_rkyv_v1};
 use wal::{read_and_scan, WalRecord, WalWriter};
 
 /// When the WAL is forced to durable storage.
@@ -66,11 +76,31 @@ impl Default for FsyncPolicy {
     }
 }
 
-/// The base half of a [`GraphState`]. An enum for 2b headroom
-/// (`Archived(Mmap)`), but only `Owned` is constructed in 2a.
+/// Which representation the snapshot base is loaded as.
+///
+/// `Mmap` is the default and the only option for larger-than-RAM bases (the OS
+/// pages the CSR file lazily). `Owned` materializes a petgraph at open —
+/// exactly the 2a hot path, and the mandatory choice for network /
+/// larger-than-RAM-under-pressure callers who must read + validate up front
+/// rather than risk a lazy-fault SIGBUS (§4.5). A V0 store is ALWAYS loaded as
+/// `Owned` regardless of this setting (it has no CSR to mmap-traverse).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseMode {
+    Owned,
+    Mmap,
+}
+
+impl Default for BaseMode {
+    fn default() -> Self {
+        BaseMode::Mmap
+    }
+}
+
+/// The base half of a [`GraphState`]. `Owned` is a materialized petgraph;
+/// `Archived` is a zero-copy CSR view over a memory-mapped V1 snapshot (§4.4b).
 pub enum BaseGraph {
     Owned(OrpheusGraphInner),
-    // Archived(Mmap) — Phase 2b.
+    Archived(ArchivedCsrView),
 }
 
 impl BaseGraph {
@@ -78,6 +108,16 @@ impl BaseGraph {
     pub fn as_accessor(&self) -> &dyn GraphAccessor {
         match self {
             BaseGraph::Owned(g) => g,
+            BaseGraph::Archived(v) => v,
+        }
+    }
+
+    /// Enumerate every node name in the base — the input `materialize` (and thus
+    /// compaction) needs since [`GraphAccessor`] exposes no name iterator.
+    fn node_names(&self) -> Vec<String> {
+        match self {
+            BaseGraph::Owned(g) => g.index_map().keys().cloned().collect(),
+            BaseGraph::Archived(v) => v.node_names(),
         }
     }
 }
@@ -98,24 +138,43 @@ struct Writer {
     seq: u64,
     /// Current incarnation id (§4.3).
     epoch: u128,
-    /// 2a: owned base, shared with the published `GraphState` via the same `Arc`.
+    /// Base graph, shared with the published `GraphState` via the same `Arc`.
     base: Arc<BaseGraph>,
     /// Current live delta (also in the published `GraphState`).
     delta: Arc<GraphDelta>,
-    /// Seq folded into `base` on disk (0 in 2a; no compaction).
+    /// Seq folded into `base` on disk. Advanced by compaction (§4.4).
     snapshot_seq: u64,
     /// Snapshot filename/crc, retained so MANIFEST rewrites are faithful.
     snapshot_file: String,
     snapshot_crc32: u32,
+    /// On-disk snapshot encoding version of the CURRENT `snapshot_file`. Tracked
+    /// per-writer (not the FORMAT_VERSION constant) so a V0 store rewritten by
+    /// close()/open() keeps `format_version=0` until it is actually compacted to
+    /// V1 — otherwise the next open would mmap-CSR a flat V0 file. Compaction
+    /// sets it to 1.
+    format_version: u32,
+    /// Monotonic compaction id; the current snapshot's cid (§4.4b).
+    compaction_id: u64,
+    /// Ops applied since the last compaction — the auto-compaction trigger.
+    delta_ops: usize,
+    /// Overrides the computed auto-compaction threshold when set (runtime knob,
+    /// not persisted). Lets a test force frequent compaction so a kill -9 harness
+    /// can land inside `compact_locked`'s non-atomic on-disk sequence.
+    auto_compact_override: Option<usize>,
+    /// How the base is (re)loaded — honored by post-compaction republish (§4.4).
+    mode: BaseMode,
+    prefault: bool,
+    validate: Validate,
 }
 
 impl Writer {
     fn build_manifest(&self, clean_shutdown: bool) -> Manifest {
         Manifest {
-            format_version: FORMAT_VERSION,
+            format_version: self.format_version,
             snapshot_file: self.snapshot_file.clone(),
             snapshot_seq: self.snapshot_seq,
             snapshot_crc32: self.snapshot_crc32,
+            compaction_id: self.compaction_id,
             epoch: self.epoch,
             clean_shutdown,
             created_by: CREATED_BY.to_string(),
@@ -152,8 +211,82 @@ fn empty_inner() -> OrpheusGraphInner {
     OrpheusGraphInner::new(g, idx)
 }
 
+/// Auto-compaction trigger: fold once the delta exceeds `max(1000, N/10)` ops,
+/// where `N` is the base node count. The floor keeps small graphs from
+/// compacting on every handful of ops; the proportional term keeps a large
+/// graph's delta from growing unbounded relative to its base (§4.4b).
+fn auto_compact_threshold(base_node_count: usize) -> usize {
+    1000.max(base_node_count / 10)
+}
+
+/// V0 flat-snapshot filename (legacy; still matched by the GC prefix/suffix
+/// rule). Only the V0 back-compat test writes one now; V1 uses
+/// [`snapshot_v1_name`].
+#[cfg(test)]
 fn snapshot_name(seq: u64) -> String {
     format!("snapshot-{seq:020}.og")
+}
+
+/// V1 CSR snapshot filename. The monotonic `cid` makes successive filenames
+/// distinct even when `seq` is unchanged (compaction folds AT the current seq),
+/// so the post-compaction GC can always name a file distinct from the live one.
+fn snapshot_v1_name(seq: u64, cid: u64) -> String {
+    format!("snapshot-{seq:020}-{cid:010}.og")
+}
+
+/// Delete a superseded snapshot file, tolerating the Windows "mapped file is
+/// busy" sharing violation. On Linux, `unlink` of a still-mmap'd file is safe —
+/// the inode/pages stay alive for existing readers until they drop the mapping
+/// (same argument as the rename discipline). On Windows a delete of a mapped
+/// file fails; we swallow that error and DEFER the reclaim to the next
+/// open()-time GC sweep (which runs before the file is re-mapped). Every removal
+/// (and every deferral) is logged.
+fn remove_snapshot_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => eprintln!("orpheusgraph: GC removed snapshot {}", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            // On Windows a mapped-file delete is a sharing violation; defer.
+            eprintln!(
+                "orpheusgraph: GC could not remove {} ({e}); deferring to next open sweep",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Open-time GC backstop (§4.3 step 6 / §4.4b): remove every `snapshot-*.og`
+/// whose basename is not the live `keep` file. Catches crash orphans (e.g. a
+/// snapshot written but never referenced because the process died before the
+/// MANIFEST rename) and any Windows-deferred deletes. NEVER removes `keep`, and
+/// never touches `.tmp` files (there is no concurrent writer — this runs under
+/// the writer path, single-writer). Best-effort: a `read_dir` error is logged,
+/// not fatal.
+fn gc_orphan_snapshots(dir: &Path, keep: &str) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!("orpheusgraph: GC read_dir failed on {}: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == keep {
+            continue;
+        }
+        // Orphan snapshots from an interrupted compaction, AND stray
+        // tmp files a real kill -9 can leave mid tmp+fsync+rename (a
+        // `.og.tmp` that never got renamed, or a `MANIFEST.json.tmp`).
+        // None are ever the live file (that's `keep` / MANIFEST.json).
+        let is_orphan_snapshot =
+            name.starts_with("snapshot-") && (name.ends_with(".og") || name.ends_with(".og.tmp"));
+        let is_stray_tmp = name == "MANIFEST.json.tmp";
+        if is_orphan_snapshot || is_stray_tmp {
+            remove_snapshot_file(&entry.path());
+        }
+    }
 }
 
 impl PersistentGraph {
@@ -176,10 +309,11 @@ impl PersistentGraph {
             )));
         }
 
-        // Snapshot (flat rkyv V0), crc-guarded, atomically written.
-        let bytes = to_rkyv(&base_graph);
+        // Snapshot (V1 CSR going forward), crc-guarded, atomically written.
+        let bytes = to_rkyv_v1(&base_graph);
         let snapshot_crc32 = crc32fast::hash(&bytes);
-        let snapshot_file = snapshot_name(0);
+        let compaction_id = 0u64;
+        let snapshot_file = snapshot_v1_name(0, compaction_id);
         write_file_atomic(&dir, &snapshot_file, &bytes)?;
 
         // Empty WAL, durably created.
@@ -196,6 +330,7 @@ impl PersistentGraph {
             snapshot_file: snapshot_file.clone(),
             snapshot_seq: 0,
             snapshot_crc32,
+            compaction_id,
             epoch,
             clean_shutdown: false,
             created_by: CREATED_BY.to_string(),
@@ -225,6 +360,13 @@ impl PersistentGraph {
             snapshot_seq: 0,
             snapshot_file,
             snapshot_crc32,
+            format_version: FORMAT_VERSION,
+            compaction_id,
+            delta_ops: 0,
+            auto_compact_override: None,
+            mode: BaseMode::default(),
+            prefault: false,
+            validate: Validate::default(),
         });
 
         Ok(Self {
@@ -238,7 +380,23 @@ impl PersistentGraph {
     /// Open the store at `dir`, running full §4.3 recovery. If there is no
     /// MANIFEST: `create=true` initializes an empty store at seq 0 with a fresh
     /// epoch; `create=false` returns [`PersistError::NotFound`].
+    ///
+    /// Defaults to `mode=Mmap`, `validate=Full`, `prefault=false`. Use
+    /// [`open_with`](Self::open_with) to override.
     pub fn open(dir: impl AsRef<Path>, create: bool) -> Result<Self, PersistError> {
+        Self::open_with(dir, create, BaseMode::default(), Validate::default(), false)
+    }
+
+    /// [`open`](Self::open) with explicit base [`BaseMode`], [`Validate`] mode
+    /// and `prefault` (madvise WILLNEED). A V0 store is always loaded as `Owned`
+    /// regardless of `mode`; `validate`/`prefault` apply only to the V1 CSR path.
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        create: bool,
+        mode: BaseMode,
+        validate: Validate,
+        prefault: bool,
+    ) -> Result<Self, PersistError> {
         let dir = dir.as_ref().to_path_buf();
         let manifest_path = dir.join("MANIFEST.json");
 
@@ -261,20 +419,40 @@ impl PersistentGraph {
             });
         }
         let clean_shutdown = manifest.clean_shutdown;
-
-        // 2. Load + integrity-check the snapshot.
-        let snap_path = dir.join(&manifest.snapshot_file);
-        let snap_bytes = std::fs::read(&snap_path)?;
-        let computed = crc32fast::hash(&snap_bytes);
-        if computed != manifest.snapshot_crc32 {
-            return Err(PersistError::Corrupt(format!(
-                "snapshot crc mismatch: computed {computed}, manifest {}",
-                manifest.snapshot_crc32
-            )));
-        }
-        let inner = from_rkyv_rebuild(&snap_bytes).map_err(PersistError::Corrupt)?;
-        let base = Arc::new(BaseGraph::Owned(inner));
         let snapshot_seq = manifest.snapshot_seq;
+
+        // 2. Load + integrity-check the snapshot, branching on format_version.
+        //    V0 (flat) is ALWAYS materialized as Owned and NEVER mmap-traversed
+        //    (it has no CSR); V1 honors mode/validate/prefault via open_snapshot,
+        //    whose full/crc modes do the crc check internally.
+        let snap_path = dir.join(&manifest.snapshot_file);
+        let base = match manifest.format_version {
+            0 => {
+                let snap_bytes = std::fs::read(&snap_path)?;
+                let computed = crc32fast::hash(&snap_bytes);
+                if computed != manifest.snapshot_crc32 {
+                    return Err(PersistError::Corrupt(format!(
+                        "snapshot crc mismatch: computed {computed}, manifest {}",
+                        manifest.snapshot_crc32
+                    )));
+                }
+                let inner = from_rkyv_rebuild(&snap_bytes).map_err(PersistError::Corrupt)?;
+                Arc::new(BaseGraph::Owned(inner))
+            }
+            1 => Arc::new(open_snapshot(
+                &snap_path,
+                mode,
+                validate,
+                prefault,
+                manifest.snapshot_crc32,
+            )?),
+            v => {
+                return Err(PersistError::UnsupportedVersion {
+                    found: v,
+                    max: FORMAT_VERSION,
+                })
+            }
+        };
 
         // 3. Scan + fold the WAL. A MANIFEST is present, so wal.log MUST exist —
         // do NOT create(true) here (that would silently treat a missing WAL as
@@ -340,17 +518,29 @@ impl PersistentGraph {
         };
 
         // 6. Persist clean_shutdown=false for this (now open) incarnation. This
-        //    also lands the possibly re-minted epoch from step 5.
+        //    also lands the possibly re-minted epoch from step 5. format_version
+        //    and compaction_id are PRESERVED from the on-disk manifest — writing
+        //    the FORMAT_VERSION constant here would mislabel a still-flat V0
+        //    snapshot as V1 and brick the next open.
         let out_manifest = Manifest {
-            format_version: FORMAT_VERSION,
+            format_version: manifest.format_version,
             snapshot_file: manifest.snapshot_file.clone(),
             snapshot_seq,
             snapshot_crc32: manifest.snapshot_crc32,
+            compaction_id: manifest.compaction_id,
             epoch,
             clean_shutdown: false,
             created_by: manifest.created_by.clone(),
         };
         write_manifest_atomic(&dir, &out_manifest)?;
+
+        // 6b. Open-time GC backstop (§4.3 step 6 / §4.4b): reclaim crash-orphan
+        //     snapshots (and any Windows-deferred deletes) left by a compaction
+        //     that died between writing a new snapshot and renaming the MANIFEST.
+        //     Runs under the writer lock, before priming; never touches the live
+        //     file. For V1 mmap the live file is already mapped in `base` — on
+        //     Linux unlinking OTHER snapshots is safe.
+        gc_orphan_snapshots(&dir, &manifest.snapshot_file);
 
         // 7. Prime the writer at end-of-valid-WAL.
         let wal = WalWriter::new(wal_file, FsyncPolicy::default(), scan.valid_end);
@@ -364,6 +554,13 @@ impl PersistentGraph {
             snapshot_seq,
             snapshot_file: manifest.snapshot_file.clone(),
             snapshot_crc32: manifest.snapshot_crc32,
+            format_version: manifest.format_version,
+            compaction_id: manifest.compaction_id,
+            delta_ops: 0,
+            auto_compact_override: None,
+            mode,
+            prefault,
+            validate,
         });
 
         // 8. Publish.
@@ -420,6 +617,8 @@ impl PersistentGraph {
 
         // 7. Advance in-memory ONLY after a durable append.
         w.seq = new_seq;
+        let op_count = rec.ops.len();
+        w.delta_ops += op_count;
         let new_delta = Arc::new(d);
         w.delta = new_delta.clone();
 
@@ -433,7 +632,156 @@ impl PersistentGraph {
             epoch,
         }));
 
+        // 9. Auto-compaction (§4.4b): once the delta has accumulated more than
+        //    max(1000, base_node_count/10) ops, fold it into a fresh base under
+        //    the held writer lock. compact_locked is a no-op if the delta is
+        //    already empty, and resets delta_ops. This keeps a run-for-months
+        //    process's delta bounded and its neighbor lookups on CSR asymptotics.
+        //
+        //    CALLER CONTRACT: this batch is ALREADY durably committed (the WAL
+        //    append above was the commit point) and published. A compaction that
+        //    fails now must NOT turn this successful apply into an `Err` — a
+        //    caller must never see Err for a committed batch and retry it into a
+        //    duplicate. So auto-compaction is best-effort: on error we log and
+        //    still return Ok(new_seq). If the failure poisoned the writer, the
+        //    NEXT apply surfaces `Poisoned`; the on-disk state stays recoverable
+        //    (frames <= snapshot_seq are skipped, or the un-renamed MANIFEST
+        //    keeps the pre-compaction snapshot live). Explicit `compact()` DOES
+        //    propagate errors — only this auto path swallows them.
+        let threshold = w
+            .auto_compact_override
+            .unwrap_or_else(|| auto_compact_threshold(w.base.as_accessor().node_count()));
+        if w.delta_ops > threshold {
+            if let Err(e) = self.compact_locked(&mut w) {
+                eprintln!("orpheusgraph: auto-compaction failed (batch {new_seq} still committed): {e}");
+            }
+        }
+
         Ok(new_seq)
+    }
+
+    /// Fold the live delta into a fresh base snapshot, then empty the delta.
+    /// Takes the writer lock; a no-op if the delta is already empty (§4.4b).
+    pub fn compact(&self) -> Result<(), PersistError> {
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if w.wal.poisoned {
+            return Err(PersistError::Poisoned);
+        }
+        self.compact_locked(&mut w)
+    }
+
+    /// The real compaction steps, reusing an already-held writer lock (so the
+    /// end-of-`apply` auto-trigger has no re-entrancy). Crash-safe: the new
+    /// snapshot is written tmp+fsync+rename+fsync(dir), the MANIFEST rename is
+    /// the commit point, and only then is the WAL truncated. Folds AT the current
+    /// seq (does not mint a new one); durable identity (epoch, seq) is preserved.
+    fn compact_locked(&self, w: &mut Writer) -> Result<(), PersistError> {
+        // Empty-delta NO-OP guard: nothing to fold => no new snapshot, no delete,
+        // seq/snapshot_seq untouched. Required so `compact()` on a quiescent store
+        // is free and does not churn the on-disk file (§4.4b test).
+        if w.delta.is_empty() {
+            w.delta_ops = 0;
+            return Ok(());
+        }
+
+        // 1. Materialize (base ∘ delta) and rebuild a fresh owned graph. This
+        //    recomputes PageRank via build_graph (materialize is the §4.4 step-1
+        //    primitive); the folded graph is the logical (base+delta) view.
+        let base_node_names = w.base.node_names();
+        let (nodes, edges) = materialize(w.base.as_accessor(), &base_node_names, &w.delta);
+        let (g, idx) = build_graph(nodes, edges);
+        let folded = OrpheusGraphInner::new(g, idx);
+
+        // 2. Serialize V1 CSR + crc.
+        let bytes = to_rkyv_v1(&folded);
+        let new_crc = crc32fast::hash(&bytes);
+
+        // 3. New filename: fold AT the current seq, monotonic cid guarantees a
+        //    filename distinct from the live one (empty-delta guard already made
+        //    the new_seq==old_seq collision impossible for a real fold).
+        let fold_seq = w.seq;
+        let new_cid = w.compaction_id + 1;
+        let old_snapshot_file = w.snapshot_file.clone();
+        let new_snapshot_file = snapshot_v1_name(fold_seq, new_cid);
+
+        // 4. Write the new snapshot durably (tmp+fsync+rename+fsync(dir)).
+        write_file_atomic(&self.dir, &new_snapshot_file, &bytes)?;
+
+        // 5. Commit point: rename the MANIFEST to point at the new V1 snapshot.
+        let new_manifest = Manifest {
+            format_version: 1,
+            snapshot_file: new_snapshot_file.clone(),
+            snapshot_seq: fold_seq,
+            snapshot_crc32: new_crc,
+            compaction_id: new_cid,
+            epoch: w.epoch,
+            clean_shutdown: false,
+            created_by: CREATED_BY.to_string(),
+        };
+        write_manifest_atomic(&self.dir, &new_manifest)?;
+
+        // 5b. The MANIFEST above is the durable commit. Advance the in-memory
+        //     snapshot pointer NOW, before the WAL-truncate/re-mmap steps that
+        //     can still fail: any later failure (poison) must leave the Writer's
+        //     snapshot_* fields consistent with the just-committed MANIFEST, so
+        //     a subsequent poisoned close() rebuilds the CORRECT pointer instead
+        //     of rolling back to the pre-compaction snapshot and losing the
+        //     folded WAL (audit P1).
+        w.snapshot_seq = fold_seq;
+        w.snapshot_file = new_snapshot_file.clone();
+        w.snapshot_crc32 = new_crc;
+        w.format_version = 1;
+        w.compaction_id = new_cid;
+
+        // 6. Rotate the WAL: all frames <= fold_seq are now folded. A crash
+        //    between step 5 and here leaves stale frames <= snapshot_seq that the
+        //    next open() skips (already folded); the next compaction re-truncates.
+        w.wal.truncate()?;
+
+        // 7. Republish the folded base honoring the OPEN mode. mode=Owned keeps
+        //    the just-built inner (no mmap round-trip); mode=Mmap drops it and
+        //    re-mmaps the freshly-written file with validate=None (sound — this
+        //    process wrote it this run) so a months-long larger-than-RAM process
+        //    actually stays on mmap. V0-opened stores upgrade to V1 mmap here.
+        let new_base = match w.mode {
+            BaseMode::Owned => Arc::new(BaseGraph::Owned(folded)),
+            BaseMode::Mmap => {
+                drop(folded);
+                let bg = open_snapshot(
+                    &self.dir.join(&new_snapshot_file),
+                    BaseMode::Mmap,
+                    Validate::None,
+                    w.prefault,
+                    new_crc,
+                )?;
+                Arc::new(bg)
+            }
+        };
+        let new_delta = Arc::new(GraphDelta::new());
+
+        w.base = new_base.clone();
+        w.delta = new_delta.clone();
+        w.delta_ops = 0;
+        // snapshot_seq/file/crc/format_version/compaction_id were advanced at
+        // step 5b (right after the durable MANIFEST commit).
+
+        // Publish the compacted state (same seq/epoch).
+        self.state.store(Arc::new(GraphState {
+            base: new_base,
+            delta: new_delta,
+            seq: w.seq,
+            epoch: w.epoch,
+        }));
+
+        // 8. INLINE GC (§4.4b): reclaim the immediately-superseded snapshot,
+        //    guarded on distinct paths (the cid always differs; defensive). On
+        //    Linux unlinking a still-mmap'd old file is safe (existing readers
+        //    keep their mapping); on Windows remove_snapshot_file defers.
+        if old_snapshot_file != new_snapshot_file {
+            remove_snapshot_file(&self.dir.join(&old_snapshot_file));
+        }
+
+        Ok(())
     }
 
     /// Lock-free reader load: a consistent, immutable `(base, delta, seq, epoch)`.
@@ -461,6 +809,15 @@ impl PersistentGraph {
     pub fn set_fsync_policy(&self, policy: FsyncPolicy) {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         w.wal.set_policy(policy);
+    }
+
+    /// Override the auto-compaction threshold (runtime knob; not persisted).
+    /// Primarily for tests/harnesses that need compaction to fire frequently so
+    /// a crash can land inside the compaction sequence. `None` restores the
+    /// computed `max(1000, base_nodes/10)`.
+    pub fn set_auto_compact_threshold(&self, threshold: Option<usize>) {
+        let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        w.auto_compact_override = threshold;
     }
 
     /// Force the WAL to durable storage. Under `OnFlush` this is the durability
@@ -513,6 +870,53 @@ impl PersistentGraph {
     fn arm_append_failure(&self) {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         w.wal.arm_fail();
+    }
+
+    /// Fold the current (base ∘ delta) exactly as `compact_locked` steps 1-3
+    /// would, returning `(bytes, crc, new_file, fold_seq, new_cid)` WITHOUT
+    /// writing anything. Lets a test replay the on-disk half of a compaction up
+    /// to an arbitrary crash point (before/after the MANIFEST rename) and verify
+    /// recovery. Test-only seam.
+    #[cfg(test)]
+    fn test_fold_bytes(&self) -> (Vec<u8>, u32, String, u64, u64) {
+        let w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let base_node_names = w.base.node_names();
+        let (nodes, edges) = materialize(w.base.as_accessor(), &base_node_names, &w.delta);
+        let (g, idx) = build_graph(nodes, edges);
+        let folded = OrpheusGraphInner::new(g, idx);
+        let bytes = to_rkyv_v1(&folded);
+        let crc = crc32fast::hash(&bytes);
+        let new_cid = w.compaction_id + 1;
+        let file = snapshot_v1_name(w.seq, new_cid);
+        (bytes, crc, file, w.seq, new_cid)
+    }
+
+    /// Current snapshot filename (test assertions on GC / on-disk layout).
+    #[cfg(test)]
+    fn snapshot_file_name(&self) -> String {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot_file
+            .clone()
+    }
+
+    /// Current delta_ops counter (auto-compaction assertions).
+    #[cfg(test)]
+    fn delta_ops(&self) -> usize {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .delta_ops
+    }
+
+    /// Seq folded into the on-disk base (compaction assertions).
+    #[cfg(test)]
+    fn snapshot_seq(&self) -> u64 {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .snapshot_seq
     }
 }
 
@@ -993,5 +1397,467 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(pg.seq(), BATCHES);
+    }
+
+    // =======================================================================
+    // Phase 2b: CSR snapshot, compaction, mmap, GC, auto-compaction, back-compat
+    // =======================================================================
+
+    use crate::serialization::to_rkyv;
+
+    /// All-node outgoing+incoming neighbor sets (sorted) for a whole accessor.
+    /// The oracle for "logical graph unchanged" across compaction / mmap.
+    fn full_topology(acc: &dyn GraphAccessor, names: &[String]) -> Vec<(String, bool, Vec<(String, String)>)> {
+        let mut out = Vec::new();
+        for n in names {
+            out.push((n.clone(), true, out_pairs(acc, n)));
+            let mut inc: Vec<(String, String)> = acc
+                .incoming_neighbors(n)
+                .into_iter()
+                .map(|nb| (nb.target_name, nb.edge_kind))
+                .collect();
+            inc.sort();
+            out.push((n.clone(), false, inc));
+        }
+        out.sort();
+        out
+    }
+
+    /// Recompute the logical (base+delta) graph independently via
+    /// materialize->build_graph and return its topology over `names`.
+    fn recompute_topology(pg: &PersistentGraph, names: &[String]) -> Vec<(String, bool, Vec<(String, String)>)> {
+        let s = pg.snapshot();
+        let base_names = s.base.node_names();
+        let (nodes, edges) = materialize(s.base.as_accessor(), &base_names, s.delta.as_ref());
+        let (g, idx) = build_graph(nodes, edges);
+        let recomputed = OrpheusGraphInner::new(g, idx);
+        full_topology(&recomputed, names)
+    }
+
+    fn live_node_names(pg: &PersistentGraph) -> Vec<String> {
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        // Enumerate base names + any delta-added names via a materialize pass.
+        let base_names = s.base.node_names();
+        let (nodes, _edges) = materialize(s.base.as_accessor(), &base_names, s.delta.as_ref());
+        let mut names: Vec<String> = nodes.into_iter().map(|n| n.name).collect();
+        names.sort();
+        names.dedup();
+        // Guard: every listed name is actually live in the merged view.
+        names.retain(|n| acc.get_node(n).is_some());
+        names
+    }
+
+    // ---- compact folds delta and empties it ----------------------------
+
+    #[test]
+    fn compact_folds_delta_and_empties_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(
+            dir.path(),
+            base_inner(vec![("root", "m")], vec![]),
+        )
+        .unwrap();
+
+        for i in 0..20 {
+            pg.apply(
+                vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")],
+                None,
+            )
+            .unwrap();
+        }
+        let seq_before = pg.seq();
+        let names = live_node_names(&pg);
+        let want = recompute_topology(&pg, &names);
+        let wal_before = wal_len(dir.path());
+
+        pg.compact().unwrap();
+
+        // Delta empty, snapshot advanced to seq, seq unchanged.
+        {
+            let s = pg.snapshot();
+            assert!(s.delta.is_empty(), "delta not empty after compaction");
+        }
+        assert_eq!(pg.snapshot_seq(), seq_before);
+        // WAL was actually rotated: it shrank to (near) empty. Without this,
+        // removing the compact-time `wal.truncate()` would leave every test
+        // green (recovery unconditionally skips frames <= snapshot_seq) while
+        // the WAL grew unbounded across compactions — a mutation-adequacy hole.
+        let wal_after = wal_len(dir.path());
+        assert!(
+            wal_after < wal_before && wal_after == 0,
+            "compaction must truncate the WAL: {wal_before} -> {wal_after}"
+        );
+        assert_eq!(pg.seq(), seq_before, "compaction must not mint a new seq");
+
+        // Traversal identical to the independent recompute.
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert_eq!(full_topology(&acc, &names), want);
+
+        // Reopen: state survives, still folded.
+        drop(pg);
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), seq_before);
+        let s2 = pg2.snapshot();
+        let acc2 = DeltaAccessor::new(s2.base.as_accessor(), s2.delta.as_ref());
+        assert_eq!(full_topology(&acc2, &names), want);
+    }
+
+    // ---- empty-delta compaction is a no-op -----------------------------
+
+    #[test]
+    fn empty_delta_compaction_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("a", "m")], vec![])).unwrap();
+        // Quiescent store: delta already empty.
+        let file_before = pg.snapshot_file_name();
+        let listing_before: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        pg.compact().unwrap();
+        pg.compact().unwrap(); // twice in a row
+
+        assert_eq!(pg.snapshot_file_name(), file_before, "no new snapshot file");
+        assert_eq!(pg.snapshot_seq(), 0);
+        assert_eq!(pg.seq(), 0);
+        let listing_after: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let mut a = listing_before.clone();
+        let mut b = listing_after.clone();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "no files created/removed by no-op compaction");
+        // Live snapshot file still present.
+        assert!(dir.path().join(&file_before).exists());
+    }
+
+    // ---- crash between MANIFEST rename and WAL truncate -----------------
+
+    #[test]
+    fn crash_after_manifest_before_wal_truncate_recovers_folded() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        for i in 0..8 {
+            pg.apply(vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")], None).unwrap();
+        }
+        let seq = pg.seq();
+        let names = live_node_names(&pg);
+        let want = recompute_topology(&pg, &names);
+
+        // Replay the on-disk half of a compaction up to (and including) the
+        // MANIFEST rename, but DO NOT truncate the WAL — simulating a crash in
+        // that window. The WAL keeps frames 1..=seq (all <= new snapshot_seq).
+        let (bytes, crc, file, fold_seq, cid) = pg.test_fold_bytes();
+        write_file_atomic(dir.path(), &file, &bytes).unwrap();
+        let mut m = read_manifest(&dir.path().join("MANIFEST.json")).unwrap();
+        m.format_version = 1;
+        m.snapshot_file = file.clone();
+        m.snapshot_seq = fold_seq;
+        m.snapshot_crc32 = crc;
+        m.compaction_id = cid;
+        write_manifest_atomic(dir.path(), &m).unwrap();
+        drop(pg); // "crash": no truncate, no clean close
+
+        // Reopen: frames <= snapshot_seq are skipped (already folded), state is
+        // the folded graph, no data loss, no error.
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), seq);
+        let s = pg2.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert_eq!(full_topology(&acc, &names), want);
+    }
+
+    // ---- crash between snapshot rename and MANIFEST rename (orphan) -----
+
+    #[test]
+    fn crash_after_snapshot_before_manifest_gc_removes_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        for i in 0..6 {
+            pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
+        }
+        let seq = pg.seq();
+        let names = live_node_names(&pg);
+        let want = recompute_topology(&pg, &names);
+        let live_file = pg.snapshot_file_name();
+
+        // Write ONLY the new snapshot; DO NOT update the MANIFEST — a crash
+        // before the commit point. The new file is an orphan.
+        let (bytes, _crc, orphan_file, _fs, _cid) = pg.test_fold_bytes();
+        write_file_atomic(dir.path(), &orphan_file, &bytes).unwrap();
+        drop(pg);
+        assert!(dir.path().join(&orphan_file).exists());
+        assert_ne!(orphan_file, live_file);
+
+        // Reopen: old MANIFEST still live -> WAL replays -> state == pre-compaction;
+        // GC removes the orphan.
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), seq);
+        let s = pg2.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert_eq!(full_topology(&acc, &names), want);
+        assert!(!dir.path().join(&orphan_file).exists(), "orphan not GC'd");
+        assert!(dir.path().join(&live_file).exists(), "live file wrongly removed");
+    }
+
+    // ---- mmap open == owned open ---------------------------------------
+
+    #[test]
+    fn mmap_open_equals_owned_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            for i in 0..10 {
+                pg.apply(vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")], None).unwrap();
+            }
+            // Compact so the base carries all the data (delta empty) -> the CSR
+            // is what both opens traverse.
+            pg.compact().unwrap();
+            pg.close().unwrap();
+        }
+
+        let mmap = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false).unwrap();
+        let names = live_node_names(&mmap);
+        let t_mmap = {
+            let s = mmap.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            let t = full_topology(&acc, &names);
+            let nc = acc.node_count();
+            (t, nc)
+        };
+        drop(mmap);
+
+        let owned = PersistentGraph::open_with(dir.path(), false, BaseMode::Owned, Validate::Full, false).unwrap();
+        let t_owned = {
+            let s = owned.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            (full_topology(&acc, &names), acc.node_count())
+        };
+        assert_eq!(t_mmap, t_owned);
+    }
+
+    // ---- prefault open --------------------------------------------------
+
+    #[test]
+    fn prefault_open_is_transparent() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            for i in 0..5 {
+                pg.apply(vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")], None).unwrap();
+            }
+            pg.compact().unwrap();
+            pg.close().unwrap();
+        }
+        let plain = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false).unwrap();
+        let names = live_node_names(&plain);
+        let want = {
+            let s = plain.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            full_topology(&acc, &names)
+        };
+        drop(plain);
+
+        let pf = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, true).unwrap();
+        let s = pf.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert_eq!(full_topology(&acc, &names), want);
+    }
+
+    // ---- GC removes orphan snapshots at open ---------------------------
+
+    #[test]
+    fn open_time_gc_removes_orphan_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("a", "m")], vec![])).unwrap();
+        let live = pg.snapshot_file_name();
+        pg.close().unwrap();
+
+        // Drop a stray snapshot-*.og not named by the MANIFEST.
+        let orphan = dir.path().join("snapshot-00000000000000000009-0000000007.og");
+        std::fs::write(&orphan, b"garbage-orphan").unwrap();
+        assert!(orphan.exists());
+
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert!(!orphan.exists(), "open-time GC did not remove the orphan");
+        assert!(dir.path().join(&live).exists(), "live snapshot wrongly removed");
+        drop(pg2);
+    }
+
+    // ---- auto-compaction fires at threshold ----------------------------
+
+    #[test]
+    fn auto_compaction_fires_and_bounds_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty base => threshold = max(1000, 0) = 1000 ops.
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![], vec![])).unwrap();
+        assert_eq!(pg.snapshot_seq(), 0);
+
+        // Apply > 1000 ops WITHOUT any manual compact(). Each batch is 1 op.
+        let n_batches = 1100u64;
+        for i in 0..n_batches {
+            pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
+        }
+
+        // A compaction must have fired: snapshot_seq advanced past 0, delta_ops
+        // reset below threshold, delta empty at the fold point.
+        assert!(pg.snapshot_seq() > 0, "auto-compaction never advanced snapshot_seq");
+        assert!(pg.delta_ops() <= auto_compact_threshold(pg.snapshot().base.as_accessor().node_count()),
+            "delta_ops not bounded by threshold after auto-compaction");
+        assert_eq!(pg.seq(), n_batches, "seq preserved across auto-compaction");
+
+        // Everything still present.
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert!(acc.get_node("n0").is_some());
+        assert!(acc.get_node(&format!("n{}", n_batches - 1)).is_some());
+    }
+
+    // ---- post-compaction inline delete (Linux) -------------------------
+
+    #[test]
+    fn post_compaction_old_snapshot_deleted_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let first_file = pg.snapshot_file_name();
+        for i in 0..12 {
+            pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
+        }
+        pg.compact().unwrap();
+        let new_file = pg.snapshot_file_name();
+        assert_ne!(new_file, first_file);
+        assert!(!dir.path().join(&first_file).exists(), "old snapshot not deleted inline");
+        assert!(dir.path().join(&new_file).exists(), "new snapshot missing");
+
+        // New base is traversable.
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert!(acc.get_node("n0").is_some());
+        assert!(acc.get_node("n11").is_some());
+    }
+
+    // ---- format_version 0 back-compat ----------------------------------
+
+    #[test]
+    fn v0_store_opens_owned_never_mmap() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hand-build a V0 store: flat rkyv snapshot + format_version 0 MANIFEST +
+        // empty WAL. This mirrors the retired 2a create() path.
+        let base = base_inner(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
+        let bytes = to_rkyv(&base);
+        let crc = crc32fast::hash(&bytes);
+        let file = snapshot_name(0);
+        write_file_atomic(dir.path(), &file, &bytes).unwrap();
+        {
+            let f = std::fs::File::create(dir.path().join("wal.log")).unwrap();
+            f.sync_all().unwrap();
+        }
+        let m = Manifest {
+            format_version: 0,
+            snapshot_file: file.clone(),
+            snapshot_seq: 0,
+            snapshot_crc32: crc,
+            compaction_id: 0,
+            epoch: 123456789,
+            clean_shutdown: true,
+            created_by: "test-v0".into(),
+        };
+        write_manifest_atomic(dir.path(), &m).unwrap();
+
+        // Even with mode=Mmap requested, a V0 store must load as Owned.
+        let pg = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false).unwrap();
+        {
+            let s = pg.snapshot();
+            assert!(matches!(s.base.as_ref(), BaseGraph::Owned(_)), "V0 must be Owned, never mmap");
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            assert_eq!(out_pairs(&acc, "a"), vec![("b".into(), "rel".into())]);
+        }
+
+        // Applying + compacting upgrades it to V1 (migration path).
+        pg.apply(vec![upsert("c", "m"), addedge("b", "c", "rel")], None).unwrap();
+        pg.compact().unwrap();
+        {
+            let s = pg.snapshot();
+            assert!(matches!(s.base.as_ref(), BaseGraph::Archived(_)), "post-compaction base should be V1 mmap");
+        }
+        drop(pg);
+        // Reopen reads the now-V1 manifest and mmaps.
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        let s = pg2.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert!(acc.get_node("c").is_some());
+    }
+
+    // ---- property: compaction preserves the logical graph --------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn prop_compaction_preserves_logical_graph(
+            cmds in prop::collection::vec(0u8..4, 1..40usize),
+            compact_at in 0usize..40usize,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            // Track live node names to only ever AddEdge between existing nodes.
+            let mut live: Vec<String> = vec!["root".into()];
+            let mut counter = 0usize;
+
+            for (i, c) in cmds.iter().enumerate() {
+                match c {
+                    0 | 1 => {
+                        // UpsertNode a fresh node + connect it (keeps the graph linked).
+                        let name = format!("p{counter}");
+                        counter += 1;
+                        let anchor = live[counter % live.len().max(1)].clone();
+                        pg.apply(vec![upsert(&name, "m"), addedge(&anchor, &name, "rel")], None).unwrap();
+                        live.push(name);
+                    }
+                    2 => {
+                        // AddEdge between two existing live nodes.
+                        if live.len() >= 2 {
+                            let a = live[i % live.len()].clone();
+                            let b = live[(i * 7 + 1) % live.len()].clone();
+                            pg.apply(vec![addedge(&a, &b, "x")], None).unwrap();
+                        }
+                    }
+                    _ => {
+                        // RemoveNode a non-root live node (idempotent-safe).
+                        if live.len() > 1 {
+                            let idx = 1 + (i % (live.len() - 1));
+                            let victim = live.remove(idx);
+                            pg.apply(vec![Op::RemoveNode { name: victim }], None).unwrap();
+                        }
+                    }
+                }
+                if i == compact_at {
+                    let names = live_node_names(&pg);
+                    let before = recompute_topology(&pg, &names);
+                    pg.compact().unwrap();
+                    let after = {
+                        let s = pg.snapshot();
+                        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+                        full_topology(&acc, &names)
+                    };
+                    prop_assert_eq!(before, after);
+                }
+            }
+
+            // Final: traverse(base+delta) == recompute(materialize) after everything.
+            let names = live_node_names(&pg);
+            let want = recompute_topology(&pg, &names);
+            let s = pg.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            prop_assert_eq!(full_topology(&acc, &names), want);
+        }
     }
 }

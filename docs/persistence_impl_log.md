@@ -230,4 +230,98 @@ fixed.** 103 lib + 1 crash-harness + 7 integration tests green (crash harness de
 
 ## Phase 2b — CSR V1 snapshot + compaction + mmap + GC + validate
 
-_(next)_
+**Scope:** spec §4.4/§4.4b/§4.5/§5.1. The on-disk snapshot format V1 (CSR), compaction,
+mmap-backed base, open-time + inline GC, and `validate` modes. This is the phase that makes
+the base larger-than-RAM-capable and gives archived neighbor lookup petgraph asymptotics.
+
+**Files:** created `src/persist/snapshot.rs`; modified `persist/{mod,manifest,wal}.rs`,
+`lib.rs`, `Cargo.toml`. **Dep:** `memmap2`. Legacy flat `serialization.rs` (V0) untouched.
+
+### Decisions (with justification)
+
+- **CSR V1 in a NEW `snapshot.rs`, not `serialization.rs`** — keeps V0 (the ephemeral/Redis
+  flat path, `format_version 0`, never mmap-traversed) cleanly separated from V1 (mmap CSR),
+  and colocates the unsafe mmap view + `validate` + §5.1 sweep in one auditable place.
+  `SerializableGraphV1{nodes, edges: CsrEdge, node_offsets, in_offsets, in_mirror}`.
+- **`in_offsets` added alongside `in_mirror`** (plan named only the mirror): true O(degree)
+  *incoming* needs a `to_idx`-keyed offset array — `in_mirror` alone would force a scan.
+  Outgoing is O(degree) via `node_offsets[idx..idx+1]`; this fixes the §4.4b motivating defect
+  (V0's `ArchivedGraphView` did an O(E) filter scan per expansion).
+- **`FORMAT_VERSION` 0→1**; the gate still rejects `> 1`, so `open()` reads BOTH. `create()`
+  writes V1. `open()` branches: V0 → `from_rkyv_rebuild` → `BaseGraph::Owned` (never mmap'd —
+  it lacks the CSR index); V1 → `open_snapshot(mode, validate, prefault)`. Added
+  `Writer.format_version` (correctness fix beyond the plan) so `close()`/`open()` never rewrite
+  a V0 store's MANIFEST with `format_version=1`.
+- **mmap soundness** (`ArchivedCsrView`): read-only `memmap2::Mmap` owned by the struct + a
+  `*const ArchivedSerializableGraphV1` derived once from the validated archive. Sound because
+  the mapped region's virtual address is independent of where the small `Mmap` handle sits, so
+  the pointer survives moves (a *stronger* guarantee than the existing `Vec<u8>`-backed view);
+  no `&mut`/interior mutability → `Send`+`Sync` are data-race-free reads. SIGBUS precondition:
+  mmap only on local block storage; network / larger-than-RAM-under-pressure callers pass
+  `mode=Owned` (read+validate up front, no lazy faulting).
+- **`validate` stratified `Full | Crc | None`** with a strict trust contract. **Full**
+  (default, mandatory for untrusted snapshots): crc32 + rkyv structural + the **§5.1 sweep
+  extended to the CSR arrays** — edge endpoints in range; `node_offsets`/`in_offsets`
+  monotonic, in-range, correct `== edges.len()` sentinel, and group-consistent; `in_mirror` a
+  true permutation of `0..E` (seen-bitset, no dup/OOB) — all returning `Err`, never panicking.
+  **None** is O(1) `access_unchecked`, permitted only for a file this process just wrote.
+- **Compaction folds at the current seq** (no new seq) with an **empty-delta NO-OP guard** and
+  a **monotonic `cid`** in the filename (`snapshot-{seq:020}-{cid:010}.og`, `cid` in MANIFEST)
+  so an equal-seq compaction can never rename over / delete the live snapshot (the brick the
+  audit flagged). Order: `to_rkyv_v1` → tmp+fsync+rename+fsync(dir) → MANIFEST tmp+fsync+rename
+  +fsync(dir) → WAL truncate (new `WalWriter::truncate`, fsync'd) → publish → delete-old (only
+  if `old_path != new_path`). Post-compaction republish honors the open mode (Owned keeps the
+  just-built inner; Mmap re-mmaps the fresh file with `Validate::None` — self-written, sound).
+- **Auto-compaction** `delta_ops > max(1000, base_nodes/10)`, checked at the end of `apply()`
+  under the held writer lock via `compact_locked` (no re-entrancy); bounds the delta, resets
+  the counter, never fires on an empty delta.
+- **Two-tier GC**: inline post-compaction delete (primary reclaim for the open-once-run-for-
+  months workload) + an open-time `read_dir` sweep of unreferenced `snapshot-*.og` (backstop
+  for orphans from a crash between publish and delete). Linux `unlink`-safe under a live mmap;
+  Windows caveat documented.
+- **`open()` kept `(dir, create)`** delegating to a new `open_with(dir, create, mode, validate,
+  prefault)` (defaults `mode=Mmap`, `validate=Full`, `prefault=false`).
+
+### Build/test outcome
+
+Compiles clean first try (memmap2 + unsafe CSR view). **128 lib tests** (+24 Phase 2b) + crash
+harness + 7 integration green.
+
+### Adversarial verification
+
+3-agent adversarial pass (unsafe/mmap+hostile / compaction-crash / conformance+tests). First
+run's agents all hit a session limit (false "clean"); re-run after reset gave real results:
+
+- **unsafe mmap + `ArchivedCsrView` + `validate_v1`: CLEAN** — soundness confirmed (immutable
+  mmap, stable `*const` across moves, no interior mutability); an empirical adversarial probe
+  (added, run green, reverted) confirmed `validate="full"` rejects every hostile CSR corruption
+  (OOB endpoints, non-monotonic offsets, non-permutation `in_mirror`) with `Err`, never a panic.
+
+Found **2 P1 + 2 P2 — all fixed:**
+
+- **P1 `close()` after a post-commit compaction failure rolled the MANIFEST back** to stale
+  in-memory `snapshot_*` fields, losing every WAL batch the compaction had already durably
+  folded (§7 violation). **Fix:** `compact_locked` now advances the in-memory snapshot pointer
+  (`snapshot_seq/file/crc/format_version/compaction_id`) **immediately after the MANIFEST
+  rename** (the durable commit), before the WAL-truncate/re-mmap steps that can still fail — so
+  a later poison leaves the `Writer` consistent with the committed MANIFEST and a poisoned
+  `close()` rebuilds the correct pointer, never rolling back.
+- **P1 the `kill -9` harness never exercised compaction** (threshold 1000 unreachable in a
+  1–40 ms child life). **Fix:** added `pub fn set_auto_compact_threshold(Option<usize>)` (a
+  runtime knob, mirroring `set_fsync_policy`); the crash child sets it to 8, so compaction fires
+  every ~8 committed batches and the parent's SIGKILLs land inside `compact_locked`'s non-atomic
+  sequence (snapshot write, MANIFEST rename, WAL truncate, re-mmap). The parent also asserts a
+  compacted snapshot (`cid > 0`) exists. **Passes ×100/policy (200 kill -9 cycles) with
+  compaction firing throughout** — proving compaction crash-safety, not just the logical windows.
+- **P2 leftover `.og.tmp` never GC'd** (open-time sweep only matched `.og`). **Fix:** GC now
+  also unlinks stray `snapshot-*.og.tmp` and a stale `MANIFEST.json.tmp` (single-writer under
+  the lock, never the live file).
+- **P2 no test proved the real `compact_locked` truncated the WAL** (removing `wal.truncate()`
+  left every test green — recovery skips folded frames anyway). **Fix:** `compact_folds_delta`
+  now captures `wal_len` before/after and asserts it shrinks to 0.
+
+**Outcome: Phase 2b verified — unsafe/mmap sound, hostile snapshots rejected without panic,
+compaction crash-safe under a real kill -9 harness that now exercises it.** 127 lib + crash
+harness + 7 integration tests green.
+
+**Committed:** `feat/persistence` — Phase 2b complete. **All planned phases (1, 2a, 2b) done.**

@@ -34,6 +34,16 @@ postcard = { version = "1", features = ["use-std"] }
 fs2 = "0.4"
 # 16 random bytes for the u128 epoch on create + every timeline-forking recovery (§4.3).
 getrandom = "0.2"
+# ---- persistence (Phase 2b) ----
+# The V1 CSR snapshot base is mapped read-only for zero-copy larger-than-RAM
+# traversal (OS paging keeps only the hot neighborhood resident) and for warm
+# start without deserialization. memmap2 is the de-facto safe Mmap wrapper, works
+# on Linux and Windows (needed for the GC/SIGBUS platform notes), and exposes
+# `advise(Advice::WillNeed)` for the `prefault` madvise knob (§4.5). Its Mmap
+# keeps the mapped region at an address independent of the handle's location,
+# which is what makes the self-referential ArchivedCsrView pointer move-safe.
+# Persist-only; cross-platform, so kept unconditional (not target-gated).
+memmap2 = "0.9"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 jemallocator = "0.5"

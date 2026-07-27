@@ -251,6 +251,36 @@ impl WalWriter {
         self.fsync_now()
     }
 
+    /// Truncate the WAL to empty for the compaction WAL-rotate step (§4.4).
+    /// All frames `<= snapshot_seq` have been folded into the new base, so the
+    /// log is reset: `set_len(0)` + seek to 0 + reset `len` + fsync. The next
+    /// `append` lands at offset 0. Any failure poisons the writer.
+    ///
+    /// Ordering: this runs AFTER the new MANIFEST is durably renamed (the
+    /// compaction commit point). A crash between the MANIFEST rename and this
+    /// truncate leaves stale frames `<= snapshot_seq` in the log; recovery skips
+    /// them (they are already folded) and the next compaction re-truncates.
+    pub fn truncate(&mut self) -> Result<(), PersistError> {
+        if self.poisoned {
+            return Err(PersistError::Poisoned);
+        }
+        if let Err(e) = self.file.set_len(0) {
+            self.poisoned = true;
+            return Err(PersistError::Io(e));
+        }
+        if let Err(e) = self.file.seek(SeekFrom::Start(0)) {
+            self.poisoned = true;
+            return Err(PersistError::Io(e));
+        }
+        self.len = 0;
+        self.since_fsync = 0;
+        if let Err(e) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(PersistError::Io(e));
+        }
+        Ok(())
+    }
+
     fn fsync_now(&mut self) -> Result<(), PersistError> {
         if let Err(e) = self.file.sync_all() {
             self.poisoned = true;

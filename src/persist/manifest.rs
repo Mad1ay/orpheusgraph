@@ -8,9 +8,12 @@ use std::path::Path;
 
 use crate::persist::error::PersistError;
 
-/// Highest on-disk `format_version` this build understands. Phase 2a is the
-/// flat rkyv format (`0`); anything greater is rejected as `UnsupportedVersion`.
-pub const FORMAT_VERSION: u32 = 0;
+/// Highest on-disk `format_version` this build understands. `0` is the flat
+/// rkyv format (Phase 2a, ephemeral/Redis path); `1` is the CSR mmap snapshot
+/// (Phase 2b). The gate rejects anything `> FORMAT_VERSION`, so this build reads
+/// BOTH 0 and 1. `create()` writes 1 going forward; V0 stores still open (as
+/// owned, never mmap-traversed).
+pub const FORMAT_VERSION: u32 = 1;
 
 /// `created_by` stamp written into every MANIFEST.
 pub const CREATED_BY: &str = concat!("orpheusgraph ", env!("CARGO_PKG_VERSION"));
@@ -19,14 +22,21 @@ pub const CREATED_BY: &str = concat!("orpheusgraph ", env!("CARGO_PKG_VERSION"))
 /// forward-tolerant; the `format_version` gate rejects unknown layouts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
-    /// On-disk snapshot encoding version (0 in 2a: flat rkyv). Gate rejects `>`.
+    /// On-disk snapshot encoding version (0: flat rkyv; 1: CSR mmap). Gate rejects `>`.
     pub format_version: u32,
-    /// Snapshot filename, `snapshot-{seq:020}.og`.
+    /// Snapshot filename: `snapshot-{seq:020}.og` (V0) or
+    /// `snapshot-{seq:020}-{cid:010}.og` (V1, cid = compaction id).
     pub snapshot_file: String,
     /// Seq folded into the snapshot; WAL frames `<=` this are already durable.
     pub snapshot_seq: u64,
     /// crc32 of the snapshot file bytes (integrity check on load).
     pub snapshot_crc32: u32,
+    /// Monotonic compaction id (§4.4b). Bumped on every compaction so successive
+    /// snapshot filenames are always distinct even when the fold seq is unchanged;
+    /// persisted so it stays monotonic across reopens. `#[serde(default)]` so a
+    /// pre-2b (V0) MANIFEST without the field reads as 0.
+    #[serde(default)]
+    pub compaction_id: u64,
     /// Incarnation id — 16 random bytes, re-minted on any timeline fork (§4.3).
     pub epoch: u128,
     /// `true` only after a successful `close()`; absence/false => crash.
