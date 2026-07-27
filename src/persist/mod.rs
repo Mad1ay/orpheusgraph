@@ -9,7 +9,7 @@
 //!   locking; a concurrent `apply` publishing a new state never mutates the one
 //!   a reader holds (§3.5).
 //! * **Writers** serialize through a single `Mutex<Writer>`. `apply()` validates
-//!   + CAS-checks BEFORE any WAL write, appends (the commit point), fsyncs per
+//!   and CAS-checks BEFORE any WAL write, appends (the commit point), fsyncs per
 //!   policy, then advances in-memory seq/delta and publishes — so a crash
 //!   between append and publish loses nothing (§4.2).
 //! * **Durability**: a write-ahead log (crc-framed, poison-guarded) plus a
@@ -60,9 +60,11 @@ use wal::{read_and_scan, WalRecord, WalWriter};
 
 /// When the WAL is forced to durable storage.
 #[derive(Clone, Copy, Debug)]
+#[derive(Default)]
 pub enum FsyncPolicy {
     /// fsync only on explicit `flush()`/`close()` (default). Write-through means
     /// process death still loses nothing; only power loss needs the flush.
+    #[default]
     OnFlush,
     /// fsync after every committed batch (strongest per-batch durability).
     EveryBatch,
@@ -70,11 +72,6 @@ pub enum FsyncPolicy {
     EveryN(u32),
 }
 
-impl Default for FsyncPolicy {
-    fn default() -> Self {
-        FsyncPolicy::OnFlush
-    }
-}
 
 /// Which representation the snapshot base is loaded as.
 ///
@@ -85,16 +82,13 @@ impl Default for FsyncPolicy {
 /// rather than risk a lazy-fault SIGBUS (§4.5). A V0 store is ALWAYS loaded as
 /// `Owned` regardless of this setting (it has no CSR to mmap-traverse).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum BaseMode {
     Owned,
+    #[default]
     Mmap,
 }
 
-impl Default for BaseMode {
-    fn default() -> Self {
-        BaseMode::Mmap
-    }
-}
 
 /// The base half of a [`GraphState`]. `Owned` is a materialized petgraph;
 /// `Archived` is a zero-copy CSR view over a memory-mapped V1 snapshot (§4.4b).
@@ -164,7 +158,6 @@ struct Writer {
     /// How the base is (re)loaded — honored by post-compaction republish (§4.4).
     mode: BaseMode,
     prefault: bool,
-    validate: Validate,
 }
 
 impl Writer {
@@ -366,7 +359,6 @@ impl PersistentGraph {
             auto_compact_override: None,
             mode: BaseMode::default(),
             prefault: false,
-            validate: Validate::default(),
         });
 
         Ok(Self {
@@ -560,7 +552,6 @@ impl PersistentGraph {
             auto_compact_override: None,
             mode,
             prefault,
-            validate,
         });
 
         // 8. Publish.

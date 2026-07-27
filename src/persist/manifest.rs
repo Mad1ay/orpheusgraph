@@ -49,8 +49,7 @@ pub struct Manifest {
 pub fn mint_epoch() -> Result<u128, PersistError> {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).map_err(|e| {
-        PersistError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        PersistError::Io(std::io::Error::other(
             format!("getrandom failed while minting epoch: {e}"),
         ))
     })?;

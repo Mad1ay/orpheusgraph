@@ -203,9 +203,11 @@ pub fn from_rkyv_rebuild_v1(data: &[u8]) -> Result<OrpheusGraphInner, String> {
 /// How much a snapshot is checked at open. See module docs for the trust
 /// contract. Defaults to [`Validate::Full`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum Validate {
     /// crc32 + rkyv structural (`bytecheck`) + the `O(N+E)` §5.1 semantic sweep.
     /// MANDATORY for any untrusted / shared / remote snapshot.
+    #[default]
     Full,
     /// crc32 + rkyv structural only; SKIP the semantic sweep. For a file THIS
     /// process wrote but whose RAM copy it no longer trusts bit-for-bit — a
@@ -218,11 +220,6 @@ pub enum Validate {
     None,
 }
 
-impl Default for Validate {
-    fn default() -> Self {
-        Validate::Full
-    }
-}
 
 /// Validate V1 bytes per `mode`. Never panics — every failure is a typed
 /// [`PersistError`]. `expected_crc` is the crc recorded in the MANIFEST.

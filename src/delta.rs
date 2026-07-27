@@ -333,8 +333,7 @@ impl GraphDelta {
         // when base+delta both carry the triple).
         let positions: Vec<u32> = self
             .out_index
-            .get(&from)
-            .map(|v| v.clone())
+            .get(&from).cloned()
             .unwrap_or_default();
         for p in positions {
             let e = &mut self.added_edges[p as usize];
