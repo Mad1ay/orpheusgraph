@@ -325,3 +325,35 @@ compaction crash-safe under a real kill -9 harness that now exercises it.** 127 
 harness + 7 integration tests green.
 
 **Committed:** `feat/persistence` — Phase 2b complete. **All planned phases (1, 2a, 2b) done.**
+
+---
+
+## Final gate & status
+
+- **Build:** clean (`cargo build --release`, PyO3 forward-compat flag).
+- **Tests:** 127 lib + 1 crash harness + 7 integration green; crash harness runs
+  ×100/policy (200 kill -9 cycles, both fsync policies, compaction firing every ~8 batches)
+  via `OG_CRASH_ITERS=100`, default 24 in `cargo test`.
+- **Clippy:** all persistence code (`delta`/`persist`/`snapshot`) clean; one pre-existing
+  `pybridge` complex-type warning is out of scope.
+- **Determinism preserved** (delta insertion order, CSR built deterministically); **no
+  `unwrap`/`panic` on any recovery/archived-query path over untrusted bytes.**
+
+**Delivered (spec §3 + §4):** the full embedded persistent-store engine — mutable delta
+overlay, durable WAL + crash recovery, optimistic CAS, epoch/clean_shutdown timeline-fork
+detection, CSR V1 mmap snapshot (larger-than-RAM-capable, O(degree) archived lookup),
+compaction with auto-threshold, two-tier GC, and `validate` trust modes — each phase
+adversarially verified (spec-conformance + 7 failure-modes + crash focus) with findings fixed,
+and durability proven by a real `kill -9` harness.
+
+**Commits:** `fd098f3` (Phase 1) · `d76f67f` (Phase 2a) · `5a8b974` (Phase 2b) · `4c09dec`
+(clippy). Branch `feat/persistence`, not yet merged/pushed — awaits review.
+
+**Deferred (out of the implemented scope, spec §4.6 / future):**
+- **Python API** (`open`/`apply`/`flush`/`compact` PyO3 bindings for `PersistentGraph`) — the
+  store is Rust-native today; wiring it into `pybridge` + Orpheus is a distinct Phase 3.
+- **Temporal validity + edge-level ACL** (format headroom reserved; roadmap).
+- **fsync-failure per-frame commit marker** (documented limitation: `apply`-Err ≠ strictly
+  not-durable under an fsync error; reconcile via `(epoch, seq)` on reopen).
+- **Power-loss harness** (`dm-flakey`/VM) — the `kill -9` harness proves process-death
+  durability; power-loss (page-cache loss) is the spec's separately-scoped case.
