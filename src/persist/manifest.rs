@@ -39,6 +39,16 @@ pub struct Manifest {
     pub compaction_id: u64,
     /// Incarnation id — 16 random bytes, re-minted on any timeline fork (§4.3).
     pub epoch: u128,
+    /// Highest seq durably acked as of the last MANIFEST write (close/compaction/
+    /// recovery). A LOWER bound on what recovery must find in the WAL: if replay
+    /// yields `last_applied < high_seq`, acked data was externally lost (a
+    /// truncated/suffix-lost WAL) and open() hard-errors `Corrupt` rather than
+    /// silently regressing seq (§7 "never auto-heal by discarding data"). Updated
+    /// only at close/compaction/recovery, so it lags live applies by design — the
+    /// un-fsynced tail beyond it is the accepted power-loss window. `#[serde(default)]`
+    /// so a MANIFEST written before this field reads as 0 (check never fires).
+    #[serde(default)]
+    pub high_seq: u64,
     /// `true` only after a successful `close()`; absence/false => crash.
     pub clean_shutdown: bool,
     /// Provenance stamp, e.g. "orpheusgraph 0.1.0".

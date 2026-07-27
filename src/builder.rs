@@ -41,6 +41,31 @@ pub fn build_graph(
     nodes: Vec<NodeInput>,
     edges: Vec<EdgeInput>,
 ) -> (DiGraph<NodeData, EdgeData>, HashMap<String, NodeIndex>) {
+    build_graph_inner(nodes, edges, true)
+}
+
+/// Like [`build_graph`] but WITHOUT re-normalizing `base_weight` — the caller
+/// guarantees inputs are already in `[0, 1]`.
+///
+/// Used by compaction: the base's weights were normalized once at the original
+/// build and delta weights are supplied in `[0, 1]`, so re-normalizing (divide
+/// by the surviving max) would silently rescale surviving nodes whenever the
+/// prior max node was removed — changing scoring output at an IDENTICAL seq and
+/// breaking the "same (state seq, ctx) -> same output" guarantee. Non-finite /
+/// negative inputs are still sanitized to keep the `[0, 1]` invariant; PageRank
+/// is still recomputed (documented drift, §3.4).
+pub fn build_graph_prenormalized(
+    nodes: Vec<NodeInput>,
+    edges: Vec<EdgeInput>,
+) -> (DiGraph<NodeData, EdgeData>, HashMap<String, NodeIndex>) {
+    build_graph_inner(nodes, edges, false)
+}
+
+fn build_graph_inner(
+    nodes: Vec<NodeInput>,
+    edges: Vec<EdgeInput>,
+    normalize: bool,
+) -> (DiGraph<NodeData, EdgeData>, HashMap<String, NodeIndex>) {
     let mut graph = DiGraph::new();
     let mut index_map: HashMap<String, NodeIndex> = HashMap::with_capacity(nodes.len());
 
@@ -67,15 +92,21 @@ pub fn build_graph(
     // [0,1] range (which would invert ranking via a negative base_component).
     let sanitize = |w: f32| if w.is_finite() { w.max(0.0) } else { 0.0 };
 
-    // Find max (sanitized) base_weight for normalization.
-    let max_weight = deduped
-        .iter()
-        .map(|n| sanitize(n.base_weight))
-        .fold(0.0_f32, f32::max);
-    // Skip normalization on a non-finite or non-positive max rather than
-    // poisoning every node.
-    let norm_divisor = if max_weight.is_finite() && max_weight > f32::EPSILON {
-        max_weight
+    // Normalization divisor: divide base_weights by the max so they land in
+    // [0,1]. Skipped entirely (divisor 1.0) when `normalize` is false — the
+    // compaction path, where inputs are already normalized and re-scaling would
+    // change scores at an unchanged seq. Also skipped on a non-finite / non-
+    // positive max rather than poisoning every node.
+    let norm_divisor = if normalize {
+        let max_weight = deduped
+            .iter()
+            .map(|n| sanitize(n.base_weight))
+            .fold(0.0_f32, f32::max);
+        if max_weight.is_finite() && max_weight > f32::EPSILON {
+            max_weight
+        } else {
+            1.0
+        }
     } else {
         1.0
     };

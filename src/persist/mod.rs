@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 
 use crate::accessor::GraphAccessor;
-use crate::builder::build_graph;
+use crate::builder::{build_graph, build_graph_prenormalized};
 use crate::delta::{materialize, GraphDelta, Op};
 use crate::graph::OrpheusGraphInner;
 use crate::serialization::from_rkyv_rebuild;
@@ -169,6 +169,10 @@ impl Writer {
             snapshot_crc32: self.snapshot_crc32,
             compaction_id: self.compaction_id,
             epoch: self.epoch,
+            // The current in-memory seq is durable (it mirrors the last appended
+            // frame): record it as the high-water so a later WAL suffix-loss is
+            // detected as Corrupt on reopen.
+            high_seq: self.seq,
             clean_shutdown,
             created_by: CREATED_BY.to_string(),
         }
@@ -325,6 +329,7 @@ impl PersistentGraph {
             snapshot_crc32,
             compaction_id,
             epoch,
+            high_seq: 0, // fresh store: nothing acked yet
             clean_shutdown: false,
             created_by: CREATED_BY.to_string(),
         };
@@ -490,6 +495,21 @@ impl PersistentGraph {
             expected_next += 1;
         }
 
+        // 3b. Durable high-water check (§7). `high_seq` was the seq durably acked
+        //     at the last close/compaction/recovery. If replay yielded LESS, the
+        //     WAL lost acked data (external truncation / whole-frame suffix loss
+        //     that lands on a boundary, so it isn't seen as a torn tail) — raise
+        //     rather than silently open a regressed store with those batches gone.
+        //     This closes the asymmetry where `rm wal.log` was Corrupt but
+        //     `truncate -s0 wal.log` was silently accepted.
+        if last_applied < manifest.high_seq {
+            return Err(PersistError::Corrupt(format!(
+                "WAL lost acked data: recovered seq {last_applied} < durable high-water {} \
+                 (external WAL truncation/suffix loss)",
+                manifest.high_seq
+            )));
+        }
+
         // 4. Truncate a torn tail (guaranteed the last frame by poisoning).
         let tail_truncated = scan.tail_truncated;
         if tail_truncated {
@@ -521,6 +541,9 @@ impl PersistentGraph {
             snapshot_crc32: manifest.snapshot_crc32,
             compaction_id: manifest.compaction_id,
             epoch,
+            // Post-recovery durable high-water = what we actually recovered. Never
+            // lower it (max guards a torn-tail case where last_applied dipped).
+            high_seq: last_applied.max(manifest.high_seq),
             clean_shutdown: false,
             created_by: manifest.created_by.clone(),
         };
@@ -645,6 +668,13 @@ impl PersistentGraph {
         if w.delta_ops > threshold {
             if let Err(e) = self.compact_locked(&mut w) {
                 eprintln!("orpheusgraph: auto-compaction failed (batch {new_seq} still committed): {e}");
+                // Reset the counter even on failure: leaving delta_ops above the
+                // threshold would retry a full-graph rebuild on EVERY subsequent
+                // apply (a compaction storm after any transient error). The delta
+                // simply keeps growing until it crosses the threshold again; if
+                // the failure poisoned the writer, the next apply returns Poisoned
+                // regardless.
+                w.delta_ops = 0;
             }
         }
 
@@ -675,12 +705,15 @@ impl PersistentGraph {
             return Ok(());
         }
 
-        // 1. Materialize (base ∘ delta) and rebuild a fresh owned graph. This
-        //    recomputes PageRank via build_graph (materialize is the §4.4 step-1
-        //    primitive); the folded graph is the logical (base+delta) view.
+        // 1. Materialize (base ∘ delta) and rebuild a fresh owned graph. Uses
+        //    build_graph_prenormalized: base weights are already normalized and
+        //    delta weights are in [0,1], so re-normalizing would rescale
+        //    survivors (changing scores at an unchanged seq — audit P2). PageRank
+        //    IS recomputed (documented drift, §3.4); the folded graph is the
+        //    logical (base+delta) view.
         let base_node_names = w.base.node_names();
         let (nodes, edges) = materialize(w.base.as_accessor(), &base_node_names, &w.delta);
-        let (g, idx) = build_graph(nodes, edges);
+        let (g, idx) = build_graph_prenormalized(nodes, edges);
         let folded = OrpheusGraphInner::new(g, idx);
 
         // 2. Serialize V1 CSR + crc.
@@ -706,6 +739,9 @@ impl PersistentGraph {
             snapshot_crc32: new_crc,
             compaction_id: new_cid,
             epoch: w.epoch,
+            // Everything up to fold_seq is now folded into the snapshot and
+            // durable — record it as the high-water.
+            high_seq: fold_seq,
             clean_shutdown: false,
             created_by: CREATED_BY.to_string(),
         };
@@ -1495,6 +1531,66 @@ mod tests {
         assert_eq!(full_topology(&acc2, &names), want);
     }
 
+    // ---- compaction determinism: no base_weight re-normalization (audit P2) ----
+
+    #[test]
+    fn compaction_does_not_renormalize_surviving_base_weight() {
+        let dir = tempfile::tempdir().unwrap();
+        // A=1.0 is the max, so build_graph normalizes A->1.0, B->0.5.
+        let mk = |name: &str, w: f32| NodeInput {
+            name: name.into(),
+            kind: "m".into(),
+            metadata: HashMap::new(),
+            base_weight: w,
+            noise_penalty: 0.0,
+        };
+        let (g, idx) = build_graph(vec![mk("A", 1.0), mk("B", 0.5)], vec![]);
+        let pg = PersistentGraph::create(dir.path(), OrpheusGraphInner::new(g, idx)).unwrap();
+
+        pg.apply(vec![Op::RemoveNode { name: "A".into() }], None).unwrap();
+        let seq = pg.seq();
+        let read_b = |pg: &PersistentGraph| {
+            let s = pg.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            acc.get_node("B").unwrap().base_weight
+        };
+        let before = read_b(&pg);
+
+        pg.compact().unwrap();
+
+        assert_eq!(pg.seq(), seq, "compaction must not mint a new seq");
+        // B must NOT be rescaled to 1.0 by re-normalization over the survivors —
+        // that would change the scoring base_component at an identical seq.
+        assert_eq!(read_b(&pg), before, "surviving base_weight rescaled by compaction");
+        assert!((read_b(&pg) - 0.5).abs() < 1e-6, "B should keep its normalized 0.5");
+    }
+
+    // ---- WAL suffix-loss below the durable high-water is Corrupt (audit P2) ----
+
+    #[test]
+    fn wal_truncate_to_zero_after_acked_applies_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        pg.apply(vec![upsert("a", "m")], None).unwrap();
+        pg.apply(vec![upsert("b", "m")], None).unwrap();
+        assert_eq!(pg.seq(), 2);
+        pg.close().unwrap(); // persists high_seq=2, clean_shutdown=true
+
+        // External fault: WAL truncated to empty on a frame boundary (NOT a torn
+        // tail). Without the high-water guard this reopens silently at seq 0.
+        let wal = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("wal.log"))
+            .unwrap();
+        wal.set_len(0).unwrap();
+        wal.sync_all().unwrap();
+
+        match PersistentGraph::open(dir.path(), false) {
+            Err(PersistError::Corrupt(_)) => {}
+            other => panic!("expected Corrupt on WAL suffix-loss below high-water, got {other:?}"),
+        }
+    }
+
     // ---- empty-delta compaction is a no-op -----------------------------
 
     #[test]
@@ -1757,6 +1853,7 @@ mod tests {
             snapshot_crc32: crc,
             compaction_id: 0,
             epoch: 123456789,
+            high_seq: 0,
             clean_shutdown: true,
             created_by: "test-v0".into(),
         };
