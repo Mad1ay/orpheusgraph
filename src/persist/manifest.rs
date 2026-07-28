@@ -114,7 +114,13 @@ pub fn read_manifest(path: &Path) -> Result<Manifest, PersistError> {
 /// Stamps the integrity `checksum` before serializing.
 pub fn write_manifest_atomic(dir: &Path, manifest: &Manifest) -> Result<(), PersistError> {
     let mut m = manifest.clone();
-    m.checksum = manifest_checksum(&m);
+    // Reserve 0 as the "no checksum / pre-field legacy" sentinel: a legitimately
+    // computed crc of 0 is remapped to 1, so a stored 0 always means "unchecked"
+    // and a checksummed manifest never disables its own guard.
+    m.checksum = match manifest_checksum(&m) {
+        0 => 1,
+        c => c,
+    };
     let json = serde_json::to_vec_pretty(&m)
         .map_err(|e| PersistError::Corrupt(format!("MANIFEST serialize failed: {e}")))?;
     write_file_atomic(dir, "MANIFEST.json", &json)

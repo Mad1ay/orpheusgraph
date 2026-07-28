@@ -407,6 +407,17 @@ impl PersistentGraph {
         validate: Validate,
         prefault: bool,
     ) -> Result<Self, PersistError> {
+        // SOUNDNESS: `Validate::None` reaches `rkyv::access_unchecked`, which is
+        // UB on structurally-invalid bytes. A caller-provided path may hold
+        // untrusted/bit-rotted bytes, so a SAFE public open must never use it —
+        // upgrade None to Crc (still O(1)-ish: crc + a *checked* structural
+        // access, no UB). `None` remains valid ONLY on the internal
+        // post-compaction re-mmap of a file this process just wrote, which calls
+        // `open_snapshot` directly, not through this public entry.
+        let validate = match validate {
+            Validate::None => Validate::Crc,
+            v => v,
+        };
         let dir = dir.as_ref().to_path_buf();
         let manifest_path = dir.join("MANIFEST.json");
 
@@ -508,13 +519,26 @@ impl PersistentGraph {
             expected_next += 1;
         }
 
-        // 3b. Durable high-water check (§7). `high_seq` was the seq durably acked
-        //     at the last close/compaction/recovery. If replay yielded LESS, the
-        //     WAL lost acked data (external truncation / whole-frame suffix loss
-        //     that lands on a boundary, so it isn't seen as a torn tail) — raise
-        //     rather than silently open a regressed store with those batches gone.
-        //     This closes the asymmetry where `rm wal.log` was Corrupt but
+        // 3b. Durable high-water check (§7). `high_seq` is the seq durably
+        //     recorded at the last close/compaction (MANIFEST rewrite points).
+        //     If replay yielded LESS, the WAL lost acked data (external truncation
+        //     / whole-frame suffix loss that lands on a boundary, so it isn't seen
+        //     as a torn tail) — raise rather than silently open a regressed store.
+        //     Closes the asymmetry where `rm wal.log` was Corrupt but
         //     `truncate -s0 wal.log` was silently accepted.
+        //
+        //     GRANULARITY (documented limitation, audit #6): this is
+        //     defense-in-depth against EXTERNAL FS faults, and its floor is the
+        //     last MANIFEST high-water, NOT the last fsync. Frames fsync'd under
+        //     EveryBatch AFTER the last close/compaction are durable but not yet
+        //     reflected in `high_seq`, so an external truncation of ONLY those
+        //     frames would not be detected here (it opens at the earlier seq).
+        //     The core durability guarantees are unaffected — process death and
+        //     power-loss of the un-fsync'd tail are handled exactly; this check
+        //     only widens detection of a rarer external-corruption class.
+        //     Persisting high_seq per-fsync would need a MANIFEST rewrite per
+        //     batch (rejected: it burdens the durability hot path for a
+        //     defense-in-depth check).
         if last_applied < manifest.high_seq {
             return Err(PersistError::Corrupt(format!(
                 "WAL lost acked data: recovered seq {last_applied} < durable high-water {} \
@@ -1607,6 +1631,67 @@ mod tests {
         // that would change the scoring base_component at an identical seq.
         assert_eq!(read_b(&pg), before, "surviving base_weight rescaled by compaction");
         assert!((read_b(&pg) - 0.5).abs() < 1e-6, "B should keep its normalized 0.5");
+    }
+
+    #[test]
+    fn compaction_preserves_out_of_range_delta_weight() {
+        // An out-of-[0,1] delta node weight (contract violation) must read
+        // IDENTICALLY before and after compaction — prenormalized must NOT
+        // sanitize it to 0.0 while the live delta view returns it raw (audit #6
+        // same-seq scoring divergence).
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let bad = NodeData {
+            name: "x".into(),
+            kind: "m".into(),
+            metadata: HashMap::new(),
+            base_weight: -0.5, // out of contract
+            noise_penalty: 0.0,
+            pagerank_weight: 0.0,
+        };
+        pg.apply(vec![Op::UpsertNode(bad)], None).unwrap();
+        let seq = pg.seq();
+        let read_x = |pg: &PersistentGraph| {
+            let s = pg.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            acc.get_node("x").unwrap().base_weight
+        };
+        let before = read_x(&pg);
+        assert_eq!(before, -0.5, "delta view returns raw weight");
+        pg.compact().unwrap();
+        assert_eq!(pg.seq(), seq);
+        assert_eq!(read_x(&pg), before, "compaction changed an out-of-range weight (same-seq divergence)");
+    }
+
+    #[test]
+    fn open_with_none_on_corrupt_snapshot_is_error_not_ub() {
+        // A SAFE public open must never reach access_unchecked on untrusted bytes:
+        // Validate::None is upgraded to Crc, so a bit-rotted (crc-mismatch)
+        // snapshot is a typed Corrupt, not UB.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            pg.apply(vec![upsert("a", "m")], None).unwrap();
+            pg.compact().unwrap(); // ensure a V1 snapshot exists
+            pg.close().unwrap();
+        }
+        // Bit-rot the snapshot file (crc will mismatch).
+        let snap = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .find(|n| n.starts_with("snapshot-") && n.ends_with(".og"))
+            .unwrap();
+        let p = dir.path().join(&snap);
+        let mut bytes = std::fs::read(&p).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&p, &bytes).unwrap();
+        // open_with(None) must return a typed error, never panic/UB.
+        match PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::None, false) {
+            Err(PersistError::Corrupt(_)) => {}
+            other => panic!("expected Corrupt (None upgraded to Crc), got {other:?}"),
+        }
     }
 
     // ---- WAL suffix-loss below the durable high-water is Corrupt (audit P2) ----

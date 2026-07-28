@@ -290,6 +290,13 @@ fn validate_csr(a: &ArchivedSerializableGraphV1) -> Result<(), PersistError> {
     let off_at = |v: &rkyv::vec::ArchivedVec<rkyv::Archived<u32>>, i: usize| -> Option<u32> {
         v.get(i).map(|x| x.to_native())
     };
+    // Canonical CSR base: offsets[0] MUST be 0, else edges [0, offsets[0]) fall
+    // into no group and are silently invisible to outgoing traversal (they pass
+    // the monotonic/sentinel checks otherwise). Required for the group-
+    // consistency claim to cover ALL edges, not just [offsets[0], E).
+    if off_at(&a.node_offsets, 0) != Some(0) {
+        return Err(corrupt("node_offsets[0] must be 0 (canonical CSR base)".into()));
+    }
     let mut prev = 0u32;
     for i in 0..=n {
         let cur = off_at(&a.node_offsets, i).ok_or_else(|| corrupt("node_offsets short".into()))?;
@@ -337,6 +344,9 @@ fn validate_csr(a: &ArchivedSerializableGraphV1) -> Result<(), PersistError> {
             a.in_offsets.len(),
             n + 1
         )));
+    }
+    if off_at(&a.in_offsets, 0) != Some(0) {
+        return Err(corrupt("in_offsets[0] must be 0 (canonical CSR base)".into()));
     }
     let mut prev = 0u32;
     for i in 0..=n {
@@ -889,6 +899,25 @@ mod tests {
         let crc = crc32fast::hash(&bytes);
         let err = validate_v1(&bytes, Validate::Full, crc).unwrap_err();
         assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    #[test]
+    fn full_rejects_nonzero_offsets_base() {
+        // node_offsets[0] != 0 orphans edges [0, offsets[0]) (invisible to
+        // outgoing traversal) while passing monotonic/sentinel — must be rejected.
+        let bytes = hostile(|sg| sg.node_offsets[0] = 1);
+        let crc = crc32fast::hash(&bytes);
+        assert!(matches!(
+            validate_v1(&bytes, Validate::Full, crc),
+            Err(PersistError::Corrupt(_))
+        ));
+        // Symmetric for in_offsets (incoming traversal).
+        let bytes2 = hostile(|sg| sg.in_offsets[0] = 1);
+        let crc2 = crc32fast::hash(&bytes2);
+        assert!(matches!(
+            validate_v1(&bytes2, Validate::Full, crc2),
+            Err(PersistError::Corrupt(_))
+        ));
     }
 
     #[test]

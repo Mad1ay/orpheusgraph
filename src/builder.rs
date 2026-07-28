@@ -112,12 +112,25 @@ fn build_graph_inner(
     };
 
     for input in &deduped {
+        // When normalizing (ingestion via build_graph) we sanitize/clamp so a
+        // hostile input can't poison the fold-max or leave weights out of [0,1].
+        // When NOT normalizing (compaction), store the weights EXACTLY as given:
+        // the live DeltaAccessor returns delta-node weights raw (spec §3.3 rule 5,
+        // "no normalization"), so sanitizing here would make a compacted node's
+        // weight differ from the pre-compaction delta view at an UNCHANGED seq
+        // (a determinism divergence for an out-of-[0,1] delta weight). Matching
+        // the raw delta view keeps "same (seq, ctx) -> same output".
+        let (base_weight, noise_penalty) = if normalize {
+            (sanitize(input.base_weight) / norm_divisor, sanitize(input.noise_penalty).clamp(0.0, 1.0))
+        } else {
+            (input.base_weight, input.noise_penalty)
+        };
         let node_data = NodeData {
             name: input.name.clone(),
             kind: input.kind.clone(),
             metadata: input.metadata.clone(),
-            base_weight: sanitize(input.base_weight) / norm_divisor,
-            noise_penalty: sanitize(input.noise_penalty).clamp(0.0, 1.0),
+            base_weight,
+            noise_penalty,
             pagerank_weight: 0.0, // computed in phase 3
         };
         let idx = graph.add_node(node_data);
