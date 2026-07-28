@@ -402,6 +402,36 @@ durable_seq change passed the kill -9 harness ×100/policy unchanged. **132 lib 
 Lesson logged: the audit-#4 high_seq fix conflated "acked" (in-memory) with "durable"
 (fsync'd) — the exact distinction OnFlush is built around. `durable_seq` makes it explicit.
 
+### Audit #6 (maximal — 9 finders, two-lens verification, property/fuzz emphasis)
+
+The biggest pass: 9 finders (durable_seq state machine, MANIFEST checksum, unsafe mmap, delta
+fuzz, recovery byte-fuzz, concurrency, arithmetic, compaction-crash-deep, API/panics) with
+**perspective-diverse verification** — every finding vetted by TWO lenses (a correctness lens
+that live-repros, a skeptic lens that tries to refute), surviving only if BOTH agree.
+**0 P0 / 0 P1 survived; 5 P2 + 1 split.** All 5 fixed (`6d39573`):
+
+- **SOUNDNESS (the standout — safe code → UB):** public `open_with(Validate::None)` reached
+  `rkyv::access_unchecked` on caller-provided bytes. Now the public entry upgrades `None → Crc`
+  (checked access, no UB); `None` stays valid only on the internal self-written re-mmap.
+- **MANIFEST checksum 0-sentinel collision:** a legit crc of 0 disabled its own guard. Write
+  remaps computed 0 → 1.
+- **`validate=Full` accepted `offsets[0] != 0`** → orphaned leading edges. Now requires
+  `offsets[0] == 0` (canonical CSR base).
+- **Compaction sanitized an out-of-[0,1] delta weight** while the live view returns it raw → a
+  same-seq divergence. `build_graph_prenormalized` now stores weights exactly as given.
+- **high_seq detector granularity documented** (its floor is the last close/compaction; an
+  external truncation of only fsync-since-last-close frames isn't caught — a defense-in-depth
+  bound, core durability unaffected; per-batch MANIFEST rewrites rejected as too costly).
+
+The split finding (one lens P1, one refuted) was the same high_seq-lags class → resolved by the
+documentation. 3 regression tests added. **135 lib + crash harness ×100 + 7 integration green.**
+
+**Audit trail:** #1–#3 per-phase (clean/minor) · #4 whole-engine (3 P2) · #5 (2 P1 = regressions
+in #4's fix + 1 P2) · #6 maximal (0 P0/P1, 5 P2). Severity has strictly decreased and the last
+two P0/P1-free passes were the two hardest. The engine is durable (real kill -9 ×100), sound
+(unsafe mmap vetted + the one safe→UB hole closed), and deterministic (same seq,ctx → same output,
+now incl. out-of-contract weights across compaction).
+
 **Deferred (out of the implemented scope, spec §4.6 / future):**
 - **Python API** (`open`/`apply`/`flush`/`compact` PyO3 bindings for `PersistentGraph`) — the
   store is Rust-native today; wiring it into `pybridge` + Orpheus is a distinct Phase 3.
