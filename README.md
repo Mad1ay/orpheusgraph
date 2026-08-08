@@ -83,6 +83,59 @@ graph.close()
 > nodes and edges are arbitrary — orpheusgraph treats them as opaque strings and is fully
 > domain-agnostic.
 
+## Python API — Persistent Store
+
+For workloads that need a durable, crash-safe graph instead of an ephemeral per-request
+build, `orpheusgraph` also exposes `PersistentGraph`: an immutable base plus a WAL-backed
+mutable delta, with optimistic CAS, a CSR mmap snapshot, and compaction. The read API
+(`beam_traverse`, `find_path`, `contextual_subgraph`, …) is identical to `OrpheusGraph`.
+
+```python
+import orpheusgraph as og
+
+# Open or create a durable store on disk
+g = og.open("./graph_dir", create=True)
+
+# Mutate: one call = one atomic WAL frame (all-or-nothing)
+seq = g.apply([
+    {"op": "upsert_node", "name": "sale.order", "kind": "model", "base_weight": 0.6},
+    {"op": "upsert_node", "name": "res.partner", "kind": "model", "base_weight": 0.9},
+    {"op": "add_edge", "from": "sale.order", "to": "res.partner",
+     "kind": "relates_to", "field": "partner_id", "base_weight": 0.8},
+])
+
+# Optimistic CAS for read-modify-write: pass expected_seq, retry on conflict
+try:
+    g.apply([{"op": "remove_node", "name": "res.partner"}], expected_seq=0)  # stale
+except og.ConflictError:
+    g.apply([{"op": "remove_node", "name": "res.partner"}], expected_seq=g.seq)  # re-read + retry
+
+# Traverse — same API as OrpheusGraph, over the live base+delta view
+ctx = og.DynamicContext()
+results = g.beam_traverse("sale.order", k=5, depth=3, ctx=ctx)
+
+# Durability + compaction
+g.flush()      # fsync WAL per the fsync policy
+g.compact()    # fold delta into a new base snapshot (also auto-fires by threshold)
+g.close()      # flush + mark clean shutdown; idempotent
+
+# Context-manager form
+with og.open("./graph_dir") as g:
+    g.apply([{"op": "upsert_node", "name": "extra", "base_weight": 0.3}])
+
+# Seed a new store in one pass (instead of replaying through the delta)
+with og.create_persistent(
+    "./graph_dir_seed",
+    nodes=[{"name": "a", "base_weight": 0.5}, {"name": "b", "base_weight": 0.5}],
+    edges=[{"from": "a", "to": "b", "kind": "relates_to", "base_weight": 1.0}],
+) as seeded:
+    print(seeded.node_count(), seeded.edge_count())
+```
+
+> `orpheusgraph.open(dir, create=False, ...)` raises `FileNotFoundError` for a missing
+> store; `create_persistent` refuses to clobber an existing one. Weights passed to `apply`
+> must already be normalized to `[0.0, 1.0]` — an out-of-range value raises `ValueError`.
+
 ## API Reference
 
 ### `build_graph(nodes, edges) → OrpheusGraph`
@@ -99,6 +152,44 @@ Build an immutable graph. Normalizes weights and computes PageRank.
 | `.outgoing_edges(name)` / `.incoming_edges(name)` | Edge inspection |
 | `.to_rkyv()` | Serialize to bytes (for Redis) |
 | `.close()` | Deterministic memory release |
+
+### `orpheusgraph.open(dir, create=False, mmap=True, validate="full", prefault=False) → PersistentGraph`
+Open a durable store, or (`create=True`) initialize an empty one. `create=False` on a
+missing store raises `FileNotFoundError`. `validate` ∈ `"full"` (default, mandatory for
+untrusted/shared stores), `"crc"`, `"none"`.
+
+### `orpheusgraph.create_persistent(dir, nodes, edges) → PersistentGraph`
+Create a new store, seeding its immutable base directly from `build_graph`-style node/edge
+dicts in one pass (instead of replaying them through the delta). Refuses to clobber an
+existing store.
+
+### `PersistentGraph`
+Durable delta store: an immutable base + a crash-safe mutable delta. Read methods mirror
+`OrpheusGraph` and run over the live base+delta view; the GIL is released during traversal
+and during `apply`/`flush`/`compact`/`close`.
+
+| Member | Description |
+|---|---|
+| `.seq` | Durable commit sequence — the CAS token / cache generation |
+| `.epoch` | Incarnation id (changes across an unclean reopen) |
+| `.apply(ops, expected_seq=None)` | Atomic batch = one WAL frame; returns the new `seq`. Ops are dicts keyed by `"op"`: `upsert_node`, `remove_node`, `add_edge`, `remove_edge`. Weights must be pre-normalized to `[0,1]` (`ValueError` otherwise) |
+| `.flush()` | Durability point (fsync WAL per policy) |
+| `.compact()` | Fold delta into a new base snapshot; also auto-fires by threshold |
+| `.set_fsync_policy(policy, every_n=None)` | `on_flush` \| `every_batch` \| `every_n` |
+| `.set_auto_compact_threshold(n)` | Override the auto-compaction op threshold |
+| `.close()` | Flush + mark clean shutdown; idempotent |
+| context manager | `with orpheusgraph.open(...) as g:` calls `.close()` on exit |
+
+Optimistic **CAS**: pass `expected_seq` to `apply()`; if the store advanced past it,
+`orpheusgraph.ConflictError` is raised and nothing is written — re-read `.seq` and retry.
+
+### Exceptions
+
+| Exception | Raised when |
+|---|---|
+| `orpheusgraph.ConflictError` | `apply(expected_seq=...)` loses the CAS race |
+| `orpheusgraph.CorruptError` | Structural corruption or an unsupported on-disk format version |
+| `FileNotFoundError` | `open(dir, create=False)` on a missing store |
 
 ### `DynamicContext`
 Ephemeral per-request context. Never stored. All parameters optional:

@@ -220,8 +220,7 @@ impl WalWriter {
             // Injected BEFORE any write: nothing hits disk, len unchanged.
             self.fail_next = false;
             self.poisoned = true;
-            return Err(PersistError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(PersistError::Io(std::io::Error::other(
                 "injected WAL append failure",
             )));
         }

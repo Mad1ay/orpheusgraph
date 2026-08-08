@@ -4,6 +4,17 @@ All notable changes to orpheusgraph.
 
 ## [0.1.0] — 2026-03-08
 
+### Sprint 7 — Python Persistence API (Phase 3)
+- `orpheusgraph.open(dir, create=False, mmap=True, validate="full", prefault=False) -> PersistentGraph` — open or initialize the durable store; missing store + `create=False` raises `FileNotFoundError`
+- `orpheusgraph.create_persistent(dir, nodes, edges) -> PersistentGraph` — one-pass base seeding from `build_graph`-style dicts, instead of replaying through the delta; refuses to clobber an existing store
+- `PersistentGraph.apply(ops, expected_seq=None) -> int` — atomic batch (one WAL frame); op dicts: `upsert_node`, `remove_node`, `add_edge`, `remove_edge`; weights must be pre-normalized to [0,1] (`ValueError` otherwise)
+- Optimistic CAS via `expected_seq` — `orpheusgraph.ConflictError` on a stale sequence, nothing written
+- `.seq` / `.epoch` properties — durable commit seq (CAS token / cache generation) and incarnation id
+- Read API identical to `OrpheusGraph` over the live base+delta view: `.get_node`, `.outgoing_edges`, `.incoming_edges`, `.beam_traverse`, `.find_path`, `.contextual_subgraph`, `.multi_beam_intersection`; GIL released during traversal and during `apply`/`flush`/`compact`/`close`
+- `.flush()`, `.compact()` (also auto-fires by threshold), `.set_fsync_policy()`, `.set_auto_compact_threshold()`, `.close()` (idempotent) + context-manager support (`with orpheusgraph.open(...) as g:`)
+- New exceptions: `orpheusgraph.ConflictError`, `orpheusgraph.CorruptError`
+- `build_graph`/`to_rkyv`/`from_rkyv` and the ephemeral in-memory workflow unchanged
+
 ### Sprint 1 — Core Types & Builder
 - `NodeData`, `EdgeData`, `DynamicContext`, `PathStep` types
 - `build_graph()` with base_weight normalization and PageRank computation

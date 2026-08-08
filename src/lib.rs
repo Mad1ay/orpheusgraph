@@ -32,6 +32,7 @@ use pyo3::prelude::*;
 #[pymodule]
 fn orpheusgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pybridge::PyOrpheusGraph>()?;
+    m.add_class::<pybridge::PyPersistentGraph>()?;
     m.add_class::<pybridge::PyDynamicContext>()?;
     m.add_class::<pybridge::PyNodeResult>()?;
     m.add_class::<pybridge::PyEdgeResult>()?;
@@ -39,5 +40,10 @@ fn orpheusgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pybridge::PySubGraph>()?;
     m.add_function(wrap_pyfunction!(pybridge::py_build_graph, m)?)?;
     m.add_function(wrap_pyfunction!(pybridge::py_from_rkyv, m)?)?;
+    m.add_function(wrap_pyfunction!(pybridge::py_open, m)?)?;
+    m.add_function(wrap_pyfunction!(pybridge::py_create_persistent, m)?)?;
+    // Persistence exceptions callers branch on.
+    m.add("ConflictError", m.py().get_type::<pybridge::ConflictError>())?;
+    m.add("CorruptError", m.py().get_type::<pybridge::CorruptError>())?;
     Ok(())
 }

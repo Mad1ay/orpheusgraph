@@ -373,6 +373,84 @@ kill -9 harness still passes ×100/policy after the high-water change (process d
 data below the high-water). **Engine is now P0/P1-clean across three per-phase passes + one
 whole-engine pass.**
 
+---
+
+## Phase 3 — Python API (PyO3 bindings)
+
+**Scope:** spec §4.6 only — wire the already-hardened Rust `PersistentGraph` into `pybridge`
+so it's reachable from Python. No engine-level change; `delta.rs` gets a one-comment-block
+change to remove an invariant now enforced at the FFI boundary instead (below).
+
+**Files:** modified `src/pybridge.rs` (bulk of the change: `PyPersistentGraph`, op parsing,
+`open`/`create_persistent`, exceptions), `src/lib.rs` (class/function/exception module
+registration), `src/delta.rs` (debug_assert removal, see below), `python/orpheusgraph.pyi`
+(type stubs — owned by another agent, not edited here). No changes to `persist/`, `delta.rs`
+mutation logic, `snapshot.rs`, or the WAL/recovery/CAS/compaction engine itself.
+
+### Decisions (with justification)
+
+- **Op-dict schema mirrors the spec verbatim.** `apply(ops, expected_seq=None)` takes a list
+  of dicts keyed by `"op"` (`upsert_node` / `remove_node` / `add_edge` / `remove_edge`,
+  matching §4.6's example exactly), parsed up front into `Vec<Op>` before anything touches the
+  writer — a bad op anywhere in the batch raises before a WAL frame is written, preserving the
+  all-or-nothing batch contract (§3.3 rule 4) at the Python boundary too. Required fields
+  (`name`, `from`/`to`/`kind` on edges) reject empty strings — an empty name would otherwise
+  inject a phantom node into traversal (same contract as the existing overlay parser).
+- **Boundary weight validation via `require_unit`** — `base_weight`/`noise_penalty` on
+  `upsert_node`/`add_edge` are checked against `[0.0, 1.0]` at the FFI boundary and rejected
+  with `ValueError` if out of range, *before* the value ever reaches `GraphDelta`. This let the
+  **stale `debug_assert` in `GraphDelta::upsert_node` be removed**: that assert pre-dates the
+  Python API and would have been the only enforcement point, but it's the wrong layer post-#6 —
+  the audit-#6 determinism guarantee requires that whatever value *does* enter the delta (e.g.
+  from a Rust caller that bypasses the FFI check) is stored **verbatim**, so the live view and
+  a post-compaction rebuild (`build_graph_prenormalized`) return the identical weight at the
+  same `seq`. An assert/clamp inside `GraphDelta` would diverge those two paths (or crash a
+  query-adjacent path on release-mode-invisible debug builds) instead of just documenting the
+  contract. Enforcement moved from "assert deep inside the engine" to "reject loud at the one
+  boundary that can't be bypassed by a well-behaved caller" — `delta.rs` now only comments the
+  invariant, `pybridge.rs`'s `require_unit` is the actual gate for Python callers.
+- **GIL released across `apply`/`flush`/`compact`/`close` and all traversal methods**
+  (`py.allow_threads`), matching the existing `OrpheusGraph` binding convention — a Python
+  caller with multiple threads (or an async loop offloading to a thread pool) doesn't stall
+  other Python work during a WAL fsync or a compaction fold.
+- **`close()` consumes the store via `Option<PersistentGraph>`** (`pg: Option<...>` on
+  `PyPersistentGraph`) — Rust's `PersistentGraph::close(self)` takes ownership (flush + mark
+  clean shutdown), but the Python object must keep living after `.close()`/`__exit__` returns.
+  `.take()` moves the store out for the one real close; a second `close()` (or use after
+  `__exit__`) finds `None` and is a no-op — idempotent by construction, not by a manual flag.
+  A dropped-without-close store still releases its flock + mmap; it's just not marked clean, so
+  the next `open()` re-mints the epoch (the same process-death path the crash harness covers).
+- **Custom `ConflictError` / `CorruptError`** (`pyo3::create_exception!`, registered on the
+  module) so callers can `except` CAS conflicts and corruption precisely instead of parsing
+  message strings. `map_persist_err` fans the Rust `PersistError` enum out to the closest
+  Python type: `Conflict → ConflictError`, `NotFound → FileNotFoundError`, `Delta →
+  ValueError`, `Poisoned`/`LockHeld → RuntimeError`, `Corrupt`/`UnsupportedVersion →
+  CorruptError`, `Io → OSError` — one mapping point, not scattered per call site.
+- **`create_persistent(dir, nodes, edges)`** runs `build_graph` once and hands the result
+  straight to `PersistentGraph::create` as the initial base — a one-pass seed for a
+  freshly-built graph, instead of the alternative of `open(create=True)` followed by an
+  `apply()` that replays every node/edge through the delta (and would defer PageRank/pagerank
+  bypass, §3.4). Refuses to clobber an existing store (delegates to the Rust `create`'s
+  existing-store check).
+
+### Build/test outcome
+
+Compiles clean. No dedicated Rust `#[test]` module for the bindings yet (PyO3 boundary code is
+conventionally exercised from the Python side); verified via a manual smoke script covering
+`open(create=True)`, a multi-op `apply`, read-API parity (`get_node`/`outgoing_edges`/
+`beam_traverse`/`find_path`) against the just-applied state, a CAS conflict + successful retry,
+an out-of-range-weight rejection, `flush`+`compact`, `close`+reopen durability, the `with`
+context-manager form, `create_persistent` seeding, and the `FileNotFoundError` path on a
+missing store with `create=False` — all passed. A proper `pytest` suite is not yet part of this
+phase's delivered scope.
+
+**Delivered (spec §4.6):** `orpheusgraph.open`, `orpheusgraph.create_persistent`,
+`PersistentGraph` (`.seq`, `.epoch`, `.apply`, `.flush`, `.compact`,
+`.set_fsync_policy`, `.set_auto_compact_threshold`, `.close`, context-manager protocol, and the
+full `OrpheusGraph`-parity read API), `orpheusgraph.ConflictError`, `orpheusgraph.CorruptError`.
+The durable engine (Phases 1/2a/2b) is unchanged; this phase only adds a Python-reachable
+surface over it.
+
 ### Audit #5 (deeper edges + regression check on the #4 fixes)
 
 5 finders (recent-fix-regressions / arithmetic-limits / rare-interleavings / recovery-corruption
@@ -433,8 +511,9 @@ two P0/P1-free passes were the two hardest. The engine is durable (real kill -9 
 now incl. out-of-contract weights across compaction).
 
 **Deferred (out of the implemented scope, spec §4.6 / future):**
-- **Python API** (`open`/`apply`/`flush`/`compact` PyO3 bindings for `PersistentGraph`) — the
-  store is Rust-native today; wiring it into `pybridge` + Orpheus is a distinct Phase 3.
+- ~~**Python API** (`open`/`apply`/`flush`/`compact` PyO3 bindings for `PersistentGraph`) — the
+  store is Rust-native today; wiring it into `pybridge` + Orpheus is a distinct Phase 3.~~
+  **DELIVERED — see "Phase 3 — Python API (PyO3 bindings)" below.**
 - **Temporal validity + edge-level ACL** (format headroom reserved; roadmap).
 - **fsync-failure per-frame commit marker** (documented limitation: `apply`-Err ≠ strictly
   not-durable under an fsync error; reconcile via `(epoch, seq)` on reopen).

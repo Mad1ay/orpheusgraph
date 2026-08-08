@@ -957,7 +957,7 @@ mod tests {
         // invalid (OOB to_idx). `none` loads it without error; we only assert
         // node_count (never touch the poisoned edge path).
         let bytes = hostile(|sg| sg.edges[0].to_idx = 99);
-        let crc = crc32fast::hash(&bytes); // matching crc (self-written)
+        let _crc = crc32fast::hash(&bytes); // matching crc (self-written); unused under Validate::None
         let base = open_csr(&bytes, Validate::None).unwrap();
         assert_eq!(base.as_accessor().node_count(), 2);
     }

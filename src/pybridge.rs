@@ -1,19 +1,60 @@
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
+use pyo3::exceptions::{
+    PyFileNotFoundError, PyKeyError, PyOSError, PyRuntimeError, PyValueError,
+};
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::types::{EdgeData, NodeData};
 
 use crate::accessor::GraphAccessor;
 use crate::builder::build_graph;
+use crate::delta::{DeltaAccessor, Op};
 use crate::graph::OrpheusGraphInner;
+use crate::persist::{BaseMode, FsyncPolicy, PersistError, PersistentGraph, Validate};
 use crate::scoring::compute_score;
 use crate::serialization::{to_rkyv, ArchivedGraphView};
 use crate::traversal;
 use crate::types::{
     DynamicContext, EdgeInput, NodeInput,
 };
+
+// ---------------------------------------------------------------------------
+// Persistence exceptions (surface PersistError variants Python code branches on)
+// ---------------------------------------------------------------------------
+
+pyo3::create_exception!(
+    orpheusgraph,
+    ConflictError,
+    pyo3::exceptions::PyException,
+    "Optimistic-CAS conflict: the store advanced past the caller's expected_seq."
+);
+pyo3::create_exception!(
+    orpheusgraph,
+    CorruptError,
+    pyo3::exceptions::PyException,
+    "The on-disk store is structurally corrupt or an unsupported format version."
+);
+
+/// Map a `PersistError` to the closest Python exception. Corruption and CAS
+/// conflicts get dedicated types so callers can `except` them precisely; the
+/// rest fall back to stdlib exceptions with the Rust message preserved.
+fn map_persist_err(e: PersistError) -> PyErr {
+    // Render the message BEFORE moving `e` into the match (borrow, then match on
+    // discriminant only — never touch the message after the move).
+    let msg = e.to_string();
+    match e {
+        PersistError::Conflict { .. } => ConflictError::new_err(msg),
+        PersistError::NotFound(_) => PyFileNotFoundError::new_err(msg),
+        PersistError::Delta(_) => PyValueError::new_err(msg),
+        PersistError::Poisoned | PersistError::LockHeld(_) => PyRuntimeError::new_err(msg),
+        PersistError::Corrupt(_) | PersistError::UnsupportedVersion { .. } => {
+            CorruptError::new_err(msg)
+        }
+        PersistError::Io(_) => PyOSError::new_err(msg),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GraphInner — dual-mode: Owned or Archived zero-copy
@@ -67,21 +108,27 @@ impl PyOrpheusGraph {
     /// this stays `&self` and multiple readers can run concurrently under a
     /// shared borrow while the GIL is released.
     fn resolve_context(&self, ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
-        let (overlay_nodes, overlay_edges) = ctx.parse_overlays()?;
-
-        Ok(DynamicContext {
-            semantic_boosts: ctx.semantic_boosts.clone(),
-            weight_overrides: ctx.weight_overrides.clone(),
-            noise_tags: ctx.noise_tags.clone(),
-            max_fan_out: ctx.max_fan_out,
-            w_base: ctx.w_base,
-            w_semantic: ctx.w_semantic,
-            w_noise: ctx.w_noise,
-            w_override: ctx.w_override,
-            overlay_nodes,
-            overlay_edges,
-        })
+        resolve_dynamic_context(ctx)
     }
+}
+
+/// Shared context resolution used by both `OrpheusGraph` and `PersistentGraph`
+/// (the read API is identical; only the backing store differs).
+fn resolve_dynamic_context(ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
+    let (overlay_nodes, overlay_edges) = ctx.parse_overlays()?;
+
+    Ok(DynamicContext {
+        semantic_boosts: ctx.semantic_boosts.clone(),
+        weight_overrides: ctx.weight_overrides.clone(),
+        noise_tags: ctx.noise_tags.clone(),
+        max_fan_out: ctx.max_fan_out,
+        w_base: ctx.w_base,
+        w_semantic: ctx.w_semantic,
+        w_noise: ctx.w_noise,
+        w_override: ctx.w_override,
+        overlay_nodes,
+        overlay_edges,
+    })
 }
 
 #[pymethods]
@@ -365,13 +412,16 @@ impl PyDynamicContext {
     }
 }
 
+/// Overlay parse result: (overlay nodes, overlay edges as `(from, to, edge)`).
+type ParsedOverlays = (Vec<NodeData>, Vec<(String, String, EdgeData)>);
+
 impl PyDynamicContext {
     /// Parse overlay raw dicts into Rust types.
     ///
     /// Required fields are hard errors — a missing/typo'd key must never be
     /// silently defaulted, as that would inject phantom ''-named nodes or
     /// mis-weighted edges into the traversal.
-    fn parse_overlays(&self) -> PyResult<(Vec<NodeData>, Vec<(String, String, EdgeData)>)> {
+    fn parse_overlays(&self) -> PyResult<ParsedOverlays> {
         let mut overlay_nodes = Vec::with_capacity(self.overlay_nodes_raw.len());
         for m in &self.overlay_nodes_raw {
             let name = m.get("name").cloned().unwrap_or_default();
@@ -588,33 +638,45 @@ impl PySubGraph {
 // Module-level functions
 // ---------------------------------------------------------------------------
 
-/// Build a graph from Python dicts.
-#[pyfunction]
-#[pyo3(name = "build_graph")]
-pub fn py_build_graph(nodes: &Bound<'_, PyList>, edges: &Bound<'_, PyList>) -> PyResult<PyOrpheusGraph> {
+/// Parse a Python list of node dicts into `NodeInput`s (shared by `build_graph`
+/// and `create_persistent`).
+fn parse_node_inputs(nodes: &Bound<'_, PyList>) -> PyResult<Vec<NodeInput>> {
     let mut rust_nodes: Vec<NodeInput> = Vec::with_capacity(nodes.len());
     for item in nodes.iter() {
         let dict = item.downcast::<PyDict>()?;
         rust_nodes.push(NodeInput {
-            name: dict.get_item("name")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("name"))?.extract()?,
-            kind: dict.get_item("kind")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("kind"))?.extract()?,
+            name: dict.get_item("name")?.ok_or_else(|| PyKeyError::new_err("name"))?.extract()?,
+            kind: dict.get_item("kind")?.ok_or_else(|| PyKeyError::new_err("kind"))?.extract()?,
             metadata: dict.get_item("metadata")?.map(|v| v.extract()).transpose()?.unwrap_or_default(),
-            base_weight: dict.get_item("base_weight")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("base_weight"))?.extract()?,
+            base_weight: dict.get_item("base_weight")?.ok_or_else(|| PyKeyError::new_err("base_weight"))?.extract()?,
             noise_penalty: dict.get_item("noise_penalty")?.map(|v| v.extract::<f32>()).transpose()?.unwrap_or(0.0),
         });
     }
+    Ok(rust_nodes)
+}
 
+/// Parse a Python list of edge dicts into `EdgeInput`s.
+fn parse_edge_inputs(edges: &Bound<'_, PyList>) -> PyResult<Vec<EdgeInput>> {
     let mut rust_edges: Vec<EdgeInput> = Vec::with_capacity(edges.len());
     for item in edges.iter() {
         let dict = item.downcast::<PyDict>()?;
         rust_edges.push(EdgeInput {
-            from: dict.get_item("from")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("from"))?.extract()?,
-            to: dict.get_item("to")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("to"))?.extract()?,
-            kind: dict.get_item("kind")?.ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("kind"))?.extract()?,
+            from: dict.get_item("from")?.ok_or_else(|| PyKeyError::new_err("from"))?.extract()?,
+            to: dict.get_item("to")?.ok_or_else(|| PyKeyError::new_err("to"))?.extract()?,
+            kind: dict.get_item("kind")?.ok_or_else(|| PyKeyError::new_err("kind"))?.extract()?,
             field_name: dict.get_item("field")?.map(|v| v.extract()).transpose()?,
             base_weight: dict.get_item("base_weight")?.map(|v| v.extract::<f32>()).transpose()?.unwrap_or(1.0),
         });
     }
+    Ok(rust_edges)
+}
+
+/// Build a graph from Python dicts.
+#[pyfunction]
+#[pyo3(name = "build_graph")]
+pub fn py_build_graph(nodes: &Bound<'_, PyList>, edges: &Bound<'_, PyList>) -> PyResult<PyOrpheusGraph> {
+    let rust_nodes = parse_node_inputs(nodes)?;
+    let rust_edges = parse_edge_inputs(edges)?;
 
     let (g, m) = build_graph(rust_nodes, rust_edges);
     let graph_inner = OrpheusGraphInner::new(g, m);
@@ -635,4 +697,447 @@ pub fn py_from_rkyv(data: &Bound<'_, PyBytes>) -> PyResult<PyOrpheusGraph> {
     Ok(PyOrpheusGraph {
         inner: Some(GraphInner::Archived(view)),
     })
+}
+
+// ===========================================================================
+// PersistentGraph — Python bindings for the durable delta store (§4.6)
+// ===========================================================================
+
+/// Require a present, non-empty string field or raise. Node/edge endpoints and
+/// the discriminant must never be silently defaulted — an empty name injects a
+/// phantom node into traversal (same contract as the overlay parser).
+fn require_op_str(d: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+    match d.get_item(key)? {
+        Some(v) => {
+            let s: String = v.extract()?;
+            if s.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "op field '{key}' must be a non-empty string"
+                )));
+            }
+            Ok(s)
+        }
+        None => Err(PyKeyError::new_err(key.to_string())),
+    }
+}
+
+/// Optional string field (absent → None).
+fn optional_op_str(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
+    d.get_item(key)?.map(|v| v.extract::<String>()).transpose()
+}
+
+/// Optional f32 field with a default.
+fn op_f32(d: &Bound<'_, PyDict>, key: &str, default: f32) -> PyResult<f32> {
+    Ok(d.get_item(key)?.map(|v| v.extract::<f32>()).transpose()?.unwrap_or(default))
+}
+
+/// Enforce the §3.3-rule-5 contract at the FFI boundary: weights must already be
+/// normalized to [0,1]. Rejecting here (rather than clamping) keeps a caller
+/// mistake loud and keeps out-of-range values off the delta `upsert` path. The
+/// delta layer itself no longer asserts this (it stores weights verbatim for the
+/// audit-#6 determinism guarantee), so this boundary check is where the [0,1]
+/// contract is actually enforced for Python callers.
+fn require_unit(v: f32, field: &str, ctx: &str) -> PyResult<()> {
+    if !(0.0..=1.0).contains(&v) {
+        return Err(PyValueError::new_err(format!(
+            "'{ctx}': {field}={v} is out of range [0.0, 1.0] (weights must be pre-normalized)"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a Python list of op dicts into `Vec<Op>`. Every op is validated up
+/// front; a bad op in the middle raises before any WAL frame is written, so an
+/// `apply()` is all-or-nothing (§3.3 rule 4).
+fn parse_ops(ops: &Bound<'_, PyList>) -> PyResult<Vec<Op>> {
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    for item in ops.iter() {
+        let d = item.downcast::<PyDict>()?;
+        let op = require_op_str(d, "op")?;
+        match op.as_str() {
+            "upsert_node" => {
+                let name = require_op_str(d, "name")?;
+                let base_weight = op_f32(d, "base_weight", 0.5)?;
+                let noise_penalty = op_f32(d, "noise_penalty", 0.0)?;
+                require_unit(base_weight, "base_weight", &name)?;
+                require_unit(noise_penalty, "noise_penalty", &name)?;
+                let kind = optional_op_str(d, "kind")?.unwrap_or_default();
+                let metadata = d
+                    .get_item("metadata")?
+                    .map(|v| v.extract())
+                    .transpose()?
+                    .unwrap_or_default();
+                out.push(Op::UpsertNode(NodeData {
+                    name,
+                    kind,
+                    metadata,
+                    base_weight,
+                    noise_penalty,
+                    pagerank_weight: 0.0,
+                }));
+            }
+            "remove_node" => {
+                let name = require_op_str(d, "name")?;
+                out.push(Op::RemoveNode { name });
+            }
+            "add_edge" => {
+                let from = require_op_str(d, "from")?;
+                let to = require_op_str(d, "to")?;
+                let kind = require_op_str(d, "kind")?;
+                let base_weight = op_f32(d, "base_weight", 1.0)?;
+                require_unit(base_weight, "base_weight", &format!("{from}->{to}"))?;
+                let field_name = optional_op_str(d, "field")?;
+                out.push(Op::AddEdge {
+                    from,
+                    to,
+                    edge: EdgeData { kind, field_name, base_weight },
+                });
+            }
+            "remove_edge" => {
+                let from = require_op_str(d, "from")?;
+                let to = require_op_str(d, "to")?;
+                let kind = require_op_str(d, "kind")?;
+                out.push(Op::RemoveEdge { from, to, kind });
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown op {other:?}; expected one of \
+                     upsert_node | remove_node | add_edge | remove_edge"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Python-facing durable graph store. Wraps a Rust `PersistentGraph`; the read
+/// API mirrors `OrpheusGraph` (over a live base∘delta view), plus the mutating
+/// `apply`/`flush`/`compact`/`close` durability surface (§4.6).
+#[pyclass(name = "PersistentGraph")]
+pub struct PyPersistentGraph {
+    // `Option` so `close()`/`__exit__` can consume the store (its `close(self)`
+    // takes ownership) while the Python object lives on. A dropped-without-close
+    // store still releases its flock + mmap; it just is not marked clean, so the
+    // next open re-mints the epoch (the process-death path, §4.3 — safe).
+    pg: Option<PersistentGraph>,
+}
+
+impl PyPersistentGraph {
+    fn require_pg(&self) -> PyResult<&PersistentGraph> {
+        self.pg
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("PersistentGraph has been closed"))
+    }
+}
+
+#[pymethods]
+impl PyPersistentGraph {
+    /// Current durable commit seq — the CAS token and the cache "generation".
+    #[getter]
+    fn seq(&self) -> PyResult<u64> {
+        Ok(self.require_pg()?.seq())
+    }
+
+    /// Current incarnation epoch (changes across an unclean reopen).
+    #[getter]
+    fn epoch(&self) -> PyResult<u128> {
+        Ok(self.require_pg()?.epoch())
+    }
+
+    fn node_count(&self) -> PyResult<usize> {
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        Ok(acc.node_count())
+    }
+
+    fn edge_count(&self) -> PyResult<usize> {
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        Ok(acc.edge_count())
+    }
+
+    /// Apply a batch atomically (one WAL frame). Returns the new seq.
+    ///
+    /// `expected_seq` gives optimistic CAS: if the store moved past it, a
+    /// `ConflictError` is raised and nothing is written — re-read and retry.
+    /// The GIL is released across the durable append (fsync may block).
+    #[pyo3(signature = (ops, expected_seq = None))]
+    fn apply(
+        &self,
+        py: Python<'_>,
+        ops: &Bound<'_, PyList>,
+        expected_seq: Option<u64>,
+    ) -> PyResult<u64> {
+        let parsed = parse_ops(ops)?;
+        let pg = self.require_pg()?;
+        py.allow_threads(|| pg.apply(parsed, expected_seq))
+            .map_err(map_persist_err)
+    }
+
+    /// Force the WAL to stable storage (the durability point under OnFlush).
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let pg = self.require_pg()?;
+        py.allow_threads(|| pg.flush()).map_err(map_persist_err)
+    }
+
+    /// Fold the delta into a fresh base snapshot and empty the delta. Also fires
+    /// automatically once the delta crosses its size threshold.
+    fn compact(&self, py: Python<'_>) -> PyResult<()> {
+        let pg = self.require_pg()?;
+        py.allow_threads(|| pg.compact()).map_err(map_persist_err)
+    }
+
+    fn get_node(&self, name: &str) -> PyResult<Option<PyNodeResult>> {
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        Ok(acc.get_node(name).map(|nv| {
+            let ctx = DynamicContext::default();
+            PyNodeResult::from_node_result(compute_score(&nv, &ctx))
+        }))
+    }
+
+    fn outgoing_edges(&self, name: &str) -> PyResult<Vec<PyEdgeResult>> {
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        Ok(acc
+            .outgoing_neighbors(name)
+            .iter()
+            .map(|n| PyEdgeResult {
+                source: name.to_string(),
+                target: n.target_name.clone(),
+                kind: n.edge_kind.clone(),
+                field_name: n.field_name.clone(),
+                weight: n.edge_weight,
+            })
+            .collect())
+    }
+
+    fn incoming_edges(&self, name: &str) -> PyResult<Vec<PyEdgeResult>> {
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        Ok(acc
+            .incoming_neighbors(name)
+            .iter()
+            .map(|n| PyEdgeResult {
+                source: n.target_name.clone(),
+                target: name.to_string(),
+                kind: n.edge_kind.clone(),
+                field_name: n.field_name.clone(),
+                weight: n.edge_weight,
+            })
+            .collect())
+    }
+
+    /// Top-K pruned BFS over the live base∘delta view. GIL released.
+    fn beam_traverse(
+        &self,
+        py: Python<'_>,
+        start: &str,
+        k: usize,
+        depth: usize,
+        ctx: &PyDynamicContext,
+    ) -> PyResult<Vec<PyNodeResult>> {
+        let rust_ctx = resolve_dynamic_context(ctx)?;
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        let start_owned = start.to_string();
+
+        let results = py.allow_threads(|| {
+            traversal::beam_traverse(&acc, &rust_ctx, &start_owned, k, depth)
+        });
+
+        Ok(results.into_iter().map(PyNodeResult::from_node_result).collect())
+    }
+
+    /// Weighted Dijkstra over the live base∘delta view. GIL released.
+    fn find_path(
+        &self,
+        py: Python<'_>,
+        start: &str,
+        end: &str,
+        ctx: &PyDynamicContext,
+    ) -> PyResult<Option<Vec<PyPathStep>>> {
+        let rust_ctx = resolve_dynamic_context(ctx)?;
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        let start_owned = start.to_string();
+        let end_owned = end.to_string();
+
+        let path = py.allow_threads(|| {
+            traversal::find_path(&acc, &rust_ctx, &start_owned, &end_owned)
+        });
+
+        Ok(path.map(|steps| steps.into_iter().map(PyPathStep::from_path_step).collect()))
+    }
+
+    /// Contextual subgraph extraction over the live view. GIL released.
+    fn contextual_subgraph(
+        &self,
+        py: Python<'_>,
+        ctx: &PyDynamicContext,
+        k: usize,
+    ) -> PyResult<PySubGraph> {
+        let rust_ctx = resolve_dynamic_context(ctx)?;
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+
+        let sg = py.allow_threads(|| traversal::contextual_subgraph(&acc, &rust_ctx, k));
+
+        Ok(PySubGraph {
+            nodes: sg.nodes.into_iter().map(PyNodeResult::from_node_result).collect(),
+            edges: sg.edges.into_iter().map(PyEdgeResult::from_edge_result).collect(),
+        })
+    }
+
+    /// Multi-source heatmap intersection over the live view. GIL released.
+    #[pyo3(signature = (start_nodes, k, depth, ctx, threshold = None))]
+    fn multi_beam_intersection(
+        &self,
+        py: Python<'_>,
+        start_nodes: Vec<String>,
+        k: usize,
+        depth: usize,
+        ctx: &PyDynamicContext,
+        threshold: Option<usize>,
+    ) -> PyResult<PySubGraph> {
+        let rust_ctx = resolve_dynamic_context(ctx)?;
+        let pg = self.require_pg()?;
+        let s = pg.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        let t = threshold.unwrap_or_else(|| {
+            let len = start_nodes.len();
+            len.min(len.saturating_sub(1).max(2))
+        });
+
+        let sg = py.allow_threads(|| {
+            traversal::multi_beam_intersection(&acc, &rust_ctx, &start_nodes, k, depth, t)
+        });
+
+        Ok(PySubGraph {
+            nodes: sg.nodes.into_iter().map(PyNodeResult::from_node_result).collect(),
+            edges: sg.edges.into_iter().map(PyEdgeResult::from_edge_result).collect(),
+        })
+    }
+
+    /// Set the WAL fsync policy: "on_flush" (default), "every_batch", or
+    /// "every_n" (requires `every_n=N`).
+    #[pyo3(signature = (policy, every_n = None))]
+    fn set_fsync_policy(&self, policy: &str, every_n: Option<u32>) -> PyResult<()> {
+        let p = match policy {
+            "on_flush" => FsyncPolicy::OnFlush,
+            "every_batch" => FsyncPolicy::EveryBatch,
+            "every_n" => FsyncPolicy::EveryN(every_n.ok_or_else(|| {
+                PyValueError::new_err("fsync policy 'every_n' requires every_n=N")
+            })?),
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown fsync policy {other:?}; expected on_flush | every_batch | every_n"
+                )))
+            }
+        };
+        self.require_pg()?.set_fsync_policy(p);
+        Ok(())
+    }
+
+    /// Override the auto-compaction op threshold (None restores the computed
+    /// `max(1000, base_nodes/10)`).
+    #[pyo3(signature = (threshold = None))]
+    fn set_auto_compact_threshold(&self, threshold: Option<usize>) -> PyResult<()> {
+        self.require_pg()?.set_auto_compact_threshold(threshold);
+        Ok(())
+    }
+
+    /// Flush + mark a clean shutdown, then release the store. Idempotent: a
+    /// second call (or use after `__exit__`) is a no-op.
+    ///
+    /// Takes `&mut self`, so under multithreading it can raise a transient
+    /// `RuntimeError("Already borrowed")` if another thread is mid-traversal on
+    /// the same object (PyO3's borrow check) — treat `close()` as retryable, or
+    /// call it only once no read is in flight.
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        if let Some(pg) = self.pg.take() {
+            py.allow_threads(|| pg.close()).map_err(map_persist_err)?;
+        }
+        Ok(())
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false) // never suppress an in-`with` exception
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.pg {
+            Some(pg) => format!("PersistentGraph(seq={})", pg.seq()),
+            None => "PersistentGraph(closed)".to_string(),
+        }
+    }
+}
+
+/// Open (or create) a durable store at `dir` (§4.6).
+///
+/// `create=True` initializes an empty store when the directory has none;
+/// `create=False` raises `FileNotFoundError`. `mmap=True` (default) maps the CSR
+/// snapshot lazily (larger-than-RAM capable); `validate` is "full" (default,
+/// mandatory for untrusted/shared stores), "crc", or "none".
+#[pyfunction]
+#[pyo3(name = "open", signature = (dir, create = false, mmap = true, validate = "full", prefault = false))]
+pub fn py_open(
+    dir: &str,
+    create: bool,
+    mmap: bool,
+    validate: &str,
+    prefault: bool,
+) -> PyResult<PyPersistentGraph> {
+    let mode = if mmap { BaseMode::Mmap } else { BaseMode::Owned };
+    let v = match validate {
+        "full" => Validate::Full,
+        "crc" => Validate::Crc,
+        "none" => Validate::None,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown validate mode {other:?}; expected full | crc | none"
+            )))
+        }
+    };
+    let pg = PersistentGraph::open_with(dir, create, mode, v, prefault).map_err(map_persist_err)?;
+    Ok(PyPersistentGraph { pg: Some(pg) })
+}
+
+/// Create a NEW durable store at `dir`, seeding its immutable base from
+/// `nodes`/`edges` (same dict schema as `build_graph`). Refuses to clobber an
+/// existing store. Use this to persist a freshly-built base graph in one pass
+/// instead of replaying it through the delta.
+#[pyfunction]
+#[pyo3(name = "create_persistent")]
+pub fn py_create_persistent(
+    dir: &str,
+    nodes: &Bound<'_, PyList>,
+    edges: &Bound<'_, PyList>,
+) -> PyResult<PyPersistentGraph> {
+    let rust_nodes = parse_node_inputs(nodes)?;
+    let rust_edges = parse_edge_inputs(edges)?;
+    let (g, m) = build_graph(rust_nodes, rust_edges);
+    let base = OrpheusGraphInner::new(g, m);
+    let pg = PersistentGraph::create(dir, base).map_err(map_persist_err)?;
+    Ok(PyPersistentGraph { pg: Some(pg) })
 }

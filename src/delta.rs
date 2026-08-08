@@ -265,13 +265,14 @@ impl GraphDelta {
 
         // §3.3 rule 5: NO normalization/clamp of base_weight/noise_penalty here
         // (unlike build_graph) — the caller supplies values already in [0,1].
-        debug_assert!(
-            (0.0..=1.0).contains(&nd.base_weight) && (0.0..=1.0).contains(&nd.noise_penalty),
-            "upsert weights must be pre-normalized to [0,1]: base_weight={}, noise_penalty={}",
-            nd.base_weight,
-            nd.noise_penalty
-        );
-
+        // We deliberately do NOT panic/assert on out-of-range input: the audit-#6
+        // determinism guarantee requires that whatever value enters the delta is
+        // stored VERBATIM, so the live view and a post-compaction rebuild
+        // (`build_graph_prenormalized`) return the identical weight at the same
+        // seq. Clamping/asserting here would diverge those two paths. The [0,1]
+        // contract is enforced at the ingest boundary instead (the Python FFI
+        // `require_unit` check); a Rust caller that violates it gets deterministic
+        // (if unnormalized) scores, never a crash on a query path.
         let newly = self.added_nodes.insert(name, nd).is_none();
         if newly && !in_base {
             self.added_non_base += 1;
@@ -1335,7 +1336,7 @@ mod tests {
 
         let mut d = GraphDelta::new();
         let mut seed: u64 = 0x1234_5678;
-        let mut next = |seed: &mut u64, m: u64| {
+        let next = |seed: &mut u64, m: u64| {
             *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (*seed >> 33) % m
         };

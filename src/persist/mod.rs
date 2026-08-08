@@ -1500,9 +1500,13 @@ mod tests {
 
     use crate::serialization::to_rkyv;
 
+    /// Per-node (name, is_outgoing, sorted (target, kind) pairs) — the oracle
+    /// shape for "logical graph unchanged" comparisons.
+    type Topology = Vec<(String, bool, Vec<(String, String)>)>;
+
     /// All-node outgoing+incoming neighbor sets (sorted) for a whole accessor.
     /// The oracle for "logical graph unchanged" across compaction / mmap.
-    fn full_topology(acc: &dyn GraphAccessor, names: &[String]) -> Vec<(String, bool, Vec<(String, String)>)> {
+    fn full_topology(acc: &dyn GraphAccessor, names: &[String]) -> Topology {
         let mut out = Vec::new();
         for n in names {
             out.push((n.clone(), true, out_pairs(acc, n)));
@@ -1520,7 +1524,7 @@ mod tests {
 
     /// Recompute the logical (base+delta) graph independently via
     /// materialize->build_graph and return its topology over `names`.
-    fn recompute_topology(pg: &PersistentGraph, names: &[String]) -> Vec<(String, bool, Vec<(String, String)>)> {
+    fn recompute_topology(pg: &PersistentGraph, names: &[String]) -> Topology {
         let s = pg.snapshot();
         let base_names = s.base.node_names();
         let (nodes, edges) = materialize(s.base.as_accessor(), &base_names, s.delta.as_ref());

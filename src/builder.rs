@@ -279,7 +279,7 @@ mod tests {
         use std::time::Instant;
         let (nodes, edges) = leaf_heavy(200, 14_800);
         // warm + measure a few builds
-        let mut best = std::f64::MAX;
+        let mut best = f64::MAX;
         for _ in 0..3 {
             let (n2, e2) = (nodes.clone(), edges.clone());
             let t = Instant::now();
