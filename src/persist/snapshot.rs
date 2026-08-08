@@ -91,10 +91,7 @@ pub fn to_rkyv_v1(graph: &OrpheusGraphInner) -> Vec<u8> {
     let inner = graph.inner_graph();
 
     // 1. Deterministic node order: total-order by unique name.
-    let mut nodes: Vec<NodeData> = inner
-        .node_indices()
-        .map(|i| inner[i].clone())
-        .collect();
+    let mut nodes: Vec<NodeData> = inner.node_indices().map(|i| inner[i].clone()).collect();
     nodes.sort_by(|a, b| a.name.cmp(&b.name));
 
     let n = nodes.len();
@@ -202,8 +199,7 @@ pub fn from_rkyv_rebuild_v1(data: &[u8]) -> Result<OrpheusGraphInner, String> {
 
 /// How much a snapshot is checked at open. See module docs for the trust
 /// contract. Defaults to [`Validate::Full`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Validate {
     /// crc32 + rkyv structural (`bytecheck`) + the `O(N+E)` §5.1 semantic sweep.
     /// MANDATORY for any untrusted / shared / remote snapshot.
@@ -220,14 +216,9 @@ pub enum Validate {
     None,
 }
 
-
 /// Validate V1 bytes per `mode`. Never panics — every failure is a typed
 /// [`PersistError`]. `expected_crc` is the crc recorded in the MANIFEST.
-pub fn validate_v1(
-    bytes: &[u8],
-    mode: Validate,
-    expected_crc: u32,
-) -> Result<(), PersistError> {
+pub fn validate_v1(bytes: &[u8], mode: Validate, expected_crc: u32) -> Result<(), PersistError> {
     match mode {
         Validate::None => Ok(()),
         Validate::Crc => {
@@ -295,7 +286,9 @@ fn validate_csr(a: &ArchivedSerializableGraphV1) -> Result<(), PersistError> {
     // the monotonic/sentinel checks otherwise). Required for the group-
     // consistency claim to cover ALL edges, not just [offsets[0], E).
     if off_at(&a.node_offsets, 0) != Some(0) {
-        return Err(corrupt("node_offsets[0] must be 0 (canonical CSR base)".into()));
+        return Err(corrupt(
+            "node_offsets[0] must be 0 (canonical CSR base)".into(),
+        ));
     }
     let mut prev = 0u32;
     for i in 0..=n {
@@ -311,18 +304,18 @@ fn validate_csr(a: &ArchivedSerializableGraphV1) -> Result<(), PersistError> {
         prev = cur;
     }
     if prev as usize != e {
-        return Err(corrupt(format!(
-            "node_offsets sentinel {prev} != E={e}"
-        )));
+        return Err(corrupt(format!("node_offsets sentinel {prev} != E={e}")));
     }
     // Strong form: edges[node_offsets[i]..node_offsets[i+1]].from_idx == i.
     // The two `off_at` reads are `?`-guarded (not unwrapped) so a hostile file
     // can never panic here even though the shape check above already proved len.
     for i in 0..n {
         let lo = off_at(&a.node_offsets, i)
-            .ok_or_else(|| corrupt("node_offsets short (strong)".into()))? as usize;
+            .ok_or_else(|| corrupt("node_offsets short (strong)".into()))?
+            as usize;
         let hi = off_at(&a.node_offsets, i + 1)
-            .ok_or_else(|| corrupt("node_offsets short (strong)".into()))? as usize;
+            .ok_or_else(|| corrupt("node_offsets short (strong)".into()))?
+            as usize;
         for k in lo..hi {
             let edge = a
                 .edges
@@ -346,7 +339,9 @@ fn validate_csr(a: &ArchivedSerializableGraphV1) -> Result<(), PersistError> {
         )));
     }
     if off_at(&a.in_offsets, 0) != Some(0) {
-        return Err(corrupt("in_offsets[0] must be 0 (canonical CSR base)".into()));
+        return Err(corrupt(
+            "in_offsets[0] must be 0 (canonical CSR base)".into(),
+        ));
     }
     let mut prev = 0u32;
     for i in 0..=n {
@@ -500,8 +495,10 @@ impl GraphAccessor for ArchivedCsrView {
         let a = self.archived();
         let idx = idx as usize;
         // `.get()` everywhere: even a `none`-validated hostile file cannot panic.
-        let (Some(lo), Some(hi)) = (Self::off(&a.node_offsets, idx), Self::off(&a.node_offsets, idx + 1))
-        else {
+        let (Some(lo), Some(hi)) = (
+            Self::off(&a.node_offsets, idx),
+            Self::off(&a.node_offsets, idx + 1),
+        ) else {
             return vec![];
         };
         let mut out = Vec::new();
@@ -526,8 +523,10 @@ impl GraphAccessor for ArchivedCsrView {
         };
         let a = self.archived();
         let idx = idx as usize;
-        let (Some(lo), Some(hi)) = (Self::off(&a.in_offsets, idx), Self::off(&a.in_offsets, idx + 1))
-        else {
+        let (Some(lo), Some(hi)) = (
+            Self::off(&a.in_offsets, idx),
+            Self::off(&a.in_offsets, idx + 1),
+        ) else {
             return vec![];
         };
         let mut inc = Vec::new();
@@ -595,9 +594,8 @@ pub fn open_snapshot(
                     // SAFETY: `none` is only ever passed for a file this process
                     // wrote this run (post-compaction re-mmap); its structure is
                     // known-valid, so `access_unchecked` has no UB.
-                    let a = unsafe {
-                        rkyv::access_unchecked::<ArchivedSerializableGraphV1>(&mmap[..])
-                    };
+                    let a =
+                        unsafe { rkyv::access_unchecked::<ArchivedSerializableGraphV1>(&mmap[..]) };
                     a as *const _
                 }
                 _ => {
@@ -649,10 +647,7 @@ mod tests {
     use std::collections::HashMap as Map;
     use std::io::Write;
 
-    fn inner(
-        nodes: Vec<(&str, &str)>,
-        edges: Vec<(&str, &str, &str)>,
-    ) -> OrpheusGraphInner {
+    fn inner(nodes: Vec<(&str, &str)>, edges: Vec<(&str, &str, &str)>) -> OrpheusGraphInner {
         let n: Vec<NodeInput> = nodes
             .iter()
             .map(|(name, kind)| NodeInput {
@@ -679,7 +674,12 @@ mod tests {
 
     fn sample() -> OrpheusGraphInner {
         inner(
-            vec![("A", "model"), ("B", "model"), ("C", "field"), ("D", "model")],
+            vec![
+                ("A", "model"),
+                ("B", "model"),
+                ("C", "field"),
+                ("D", "model"),
+            ],
             vec![
                 ("A", "B", "rel"),
                 ("A", "C", "contains"),
@@ -752,8 +752,16 @@ mod tests {
             assert_eq!(a.kind, o.kind);
             assert_eq!(a.base_weight.to_bits(), o.base_weight.to_bits());
             assert_eq!(a.pagerank_weight.to_bits(), o.pagerank_weight.to_bits());
-            assert_eq!(nbrs(view, name, true), nbrs(&owned, name, true), "out {name}");
-            assert_eq!(nbrs(view, name, false), nbrs(&owned, name, false), "in {name}");
+            assert_eq!(
+                nbrs(view, name, true),
+                nbrs(&owned, name, true),
+                "out {name}"
+            );
+            assert_eq!(
+                nbrs(view, name, false),
+                nbrs(&owned, name, false),
+                "in {name}"
+            );
         }
         assert!(view.get_node("nonexistent").is_none());
         assert!(view.outgoing_neighbors("nonexistent").is_empty());
@@ -838,8 +846,7 @@ mod tests {
         // Start from a valid graph, then corrupt one invariant.
         let owned = inner(vec![("A", "m"), ("B", "m")], vec![("A", "B", "r")]);
         let good = to_rkyv_v1(&owned);
-        let mut sg =
-            rkyv::from_bytes::<SerializableGraphV1, rkyv::rancor::Error>(&good).unwrap();
+        let mut sg = rkyv::from_bytes::<SerializableGraphV1, rkyv::rancor::Error>(&good).unwrap();
         mutate(&mut sg);
         rkyv::to_bytes::<rkyv::rancor::Error>(&sg).unwrap().to_vec()
     }
@@ -923,7 +930,10 @@ mod tests {
     #[test]
     fn full_rejects_in_mirror_duplicate() {
         // Two-edge graph so a duplicate is possible.
-        let owned = inner(vec![("A", "m"), ("B", "m")], vec![("A", "B", "r"), ("B", "A", "r")]);
+        let owned = inner(
+            vec![("A", "m"), ("B", "m")],
+            vec![("A", "B", "r"), ("B", "A", "r")],
+        );
         let good = to_rkyv_v1(&owned);
         let mut sg = rkyv::from_bytes::<SerializableGraphV1, rkyv::rancor::Error>(&good).unwrap();
         // Force a duplicate (0,0) — no longer a permutation.

@@ -1,9 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use pyo3::exceptions::{PyFileNotFoundError, PyKeyError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::exceptions::{
-    PyFileNotFoundError, PyKeyError, PyOSError, PyRuntimeError, PyValueError,
-};
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use crate::types::{EdgeData, NodeData};
@@ -16,9 +14,7 @@ use crate::persist::{BaseMode, FsyncPolicy, PersistError, PersistentGraph, Valid
 use crate::scoring::compute_score;
 use crate::serialization::{to_rkyv, ArchivedGraphView};
 use crate::traversal;
-use crate::types::{
-    DynamicContext, EdgeInput, NodeInput,
-};
+use crate::types::{DynamicContext, EdgeInput, NodeInput};
 
 // ---------------------------------------------------------------------------
 // Persistence exceptions (surface PersistError variants Python code branches on)
@@ -92,14 +88,11 @@ impl Drop for PyOrpheusGraph {
 
 impl PyOrpheusGraph {
     fn require_inner(&self) -> PyResult<&dyn GraphAccessor> {
-        self.inner
-            .as_ref()
-            .map(|g| g.as_accessor())
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "Graph has been closed. Call build_graph() or from_rkyv() to create a new one.",
-                )
-            })
+        self.inner.as_ref().map(|g| g.as_accessor()).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "Graph has been closed. Call build_graph() or from_rkyv() to create a new one.",
+            )
+        })
     }
 
     /// Resolve a PyDynamicContext into a fresh Rust DynamicContext.
@@ -193,11 +186,13 @@ impl PyOrpheusGraph {
         let graph = self.require_inner()?;
         let start_owned = start.to_string();
 
-        let results = py.allow_threads(|| {
-            traversal::beam_traverse(graph, &rust_ctx, &start_owned, k, depth)
-        });
+        let results =
+            py.allow_threads(|| traversal::beam_traverse(graph, &rust_ctx, &start_owned, k, depth));
 
-        Ok(results.into_iter().map(PyNodeResult::from_node_result).collect())
+        Ok(results
+            .into_iter()
+            .map(PyNodeResult::from_node_result)
+            .collect())
     }
 
     /// Weighted Dijkstra. GIL released during traversal.
@@ -213,9 +208,8 @@ impl PyOrpheusGraph {
         let start_owned = start.to_string();
         let end_owned = end.to_string();
 
-        let path = py.allow_threads(|| {
-            traversal::find_path(graph, &rust_ctx, &start_owned, &end_owned)
-        });
+        let path =
+            py.allow_threads(|| traversal::find_path(graph, &rust_ctx, &start_owned, &end_owned));
 
         Ok(path.map(|steps| steps.into_iter().map(PyPathStep::from_path_step).collect()))
     }
@@ -230,13 +224,19 @@ impl PyOrpheusGraph {
         let rust_ctx = self.resolve_context(ctx)?;
         let graph = self.require_inner()?;
 
-        let sg = py.allow_threads(|| {
-            traversal::contextual_subgraph(graph, &rust_ctx, k)
-        });
+        let sg = py.allow_threads(|| traversal::contextual_subgraph(graph, &rust_ctx, k));
 
         Ok(PySubGraph {
-            nodes: sg.nodes.into_iter().map(PyNodeResult::from_node_result).collect(),
-            edges: sg.edges.into_iter().map(PyEdgeResult::from_edge_result).collect(),
+            nodes: sg
+                .nodes
+                .into_iter()
+                .map(PyNodeResult::from_node_result)
+                .collect(),
+            edges: sg
+                .edges
+                .into_iter()
+                .map(PyEdgeResult::from_edge_result)
+                .collect(),
         })
     }
 
@@ -270,16 +270,25 @@ impl PyOrpheusGraph {
         });
 
         Ok(PySubGraph {
-            nodes: sg.nodes.into_iter().map(PyNodeResult::from_node_result).collect(),
-            edges: sg.edges.into_iter().map(PyEdgeResult::from_edge_result).collect(),
+            nodes: sg
+                .nodes
+                .into_iter()
+                .map(PyNodeResult::from_node_result)
+                .collect(),
+            edges: sg
+                .edges
+                .into_iter()
+                .map(PyEdgeResult::from_edge_result)
+                .collect(),
         })
     }
 
     /// Serialize to rkyv bytes. Only works on Owned graphs.
     fn to_rkyv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let inner = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Graph has been closed")
-        })?;
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Graph has been closed"))?;
 
         match inner {
             GraphInner::Owned(graph) => {
@@ -459,11 +468,7 @@ impl PyDynamicContext {
 }
 
 /// Extract a required non-empty overlay field or raise a PyErr.
-fn require_overlay_field(
-    m: &HashMap<String, String>,
-    field: &str,
-    what: &str,
-) -> PyResult<String> {
+fn require_overlay_field(m: &HashMap<String, String>, field: &str, what: &str) -> PyResult<String> {
     match m.get(field) {
         Some(v) if !v.is_empty() => Ok(v.clone()),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -540,7 +545,10 @@ impl PyNodeResult {
     }
 
     fn __repr__(&self) -> String {
-        format!("NodeResult(name={:?}, weight={:.4})", self.name, self.weight)
+        format!(
+            "NodeResult(name={:?}, weight={:.4})",
+            self.name, self.weight
+        )
     }
 }
 
@@ -645,11 +653,28 @@ fn parse_node_inputs(nodes: &Bound<'_, PyList>) -> PyResult<Vec<NodeInput>> {
     for item in nodes.iter() {
         let dict = item.downcast::<PyDict>()?;
         rust_nodes.push(NodeInput {
-            name: dict.get_item("name")?.ok_or_else(|| PyKeyError::new_err("name"))?.extract()?,
-            kind: dict.get_item("kind")?.ok_or_else(|| PyKeyError::new_err("kind"))?.extract()?,
-            metadata: dict.get_item("metadata")?.map(|v| v.extract()).transpose()?.unwrap_or_default(),
-            base_weight: dict.get_item("base_weight")?.ok_or_else(|| PyKeyError::new_err("base_weight"))?.extract()?,
-            noise_penalty: dict.get_item("noise_penalty")?.map(|v| v.extract::<f32>()).transpose()?.unwrap_or(0.0),
+            name: dict
+                .get_item("name")?
+                .ok_or_else(|| PyKeyError::new_err("name"))?
+                .extract()?,
+            kind: dict
+                .get_item("kind")?
+                .ok_or_else(|| PyKeyError::new_err("kind"))?
+                .extract()?,
+            metadata: dict
+                .get_item("metadata")?
+                .map(|v| v.extract())
+                .transpose()?
+                .unwrap_or_default(),
+            base_weight: dict
+                .get_item("base_weight")?
+                .ok_or_else(|| PyKeyError::new_err("base_weight"))?
+                .extract()?,
+            noise_penalty: dict
+                .get_item("noise_penalty")?
+                .map(|v| v.extract::<f32>())
+                .transpose()?
+                .unwrap_or(0.0),
         });
     }
     Ok(rust_nodes)
@@ -661,11 +686,24 @@ fn parse_edge_inputs(edges: &Bound<'_, PyList>) -> PyResult<Vec<EdgeInput>> {
     for item in edges.iter() {
         let dict = item.downcast::<PyDict>()?;
         rust_edges.push(EdgeInput {
-            from: dict.get_item("from")?.ok_or_else(|| PyKeyError::new_err("from"))?.extract()?,
-            to: dict.get_item("to")?.ok_or_else(|| PyKeyError::new_err("to"))?.extract()?,
-            kind: dict.get_item("kind")?.ok_or_else(|| PyKeyError::new_err("kind"))?.extract()?,
+            from: dict
+                .get_item("from")?
+                .ok_or_else(|| PyKeyError::new_err("from"))?
+                .extract()?,
+            to: dict
+                .get_item("to")?
+                .ok_or_else(|| PyKeyError::new_err("to"))?
+                .extract()?,
+            kind: dict
+                .get_item("kind")?
+                .ok_or_else(|| PyKeyError::new_err("kind"))?
+                .extract()?,
             field_name: dict.get_item("field")?.map(|v| v.extract()).transpose()?,
-            base_weight: dict.get_item("base_weight")?.map(|v| v.extract::<f32>()).transpose()?.unwrap_or(1.0),
+            base_weight: dict
+                .get_item("base_weight")?
+                .map(|v| v.extract::<f32>())
+                .transpose()?
+                .unwrap_or(1.0),
         });
     }
     Ok(rust_edges)
@@ -674,7 +712,10 @@ fn parse_edge_inputs(edges: &Bound<'_, PyList>) -> PyResult<Vec<EdgeInput>> {
 /// Build a graph from Python dicts.
 #[pyfunction]
 #[pyo3(name = "build_graph")]
-pub fn py_build_graph(nodes: &Bound<'_, PyList>, edges: &Bound<'_, PyList>) -> PyResult<PyOrpheusGraph> {
+pub fn py_build_graph(
+    nodes: &Bound<'_, PyList>,
+    edges: &Bound<'_, PyList>,
+) -> PyResult<PyOrpheusGraph> {
     let rust_nodes = parse_node_inputs(nodes)?;
     let rust_edges = parse_edge_inputs(edges)?;
 
@@ -691,8 +732,8 @@ pub fn py_build_graph(nodes: &Bound<'_, PyList>, edges: &Bound<'_, PyList>) -> P
 #[pyo3(name = "from_rkyv")]
 pub fn py_from_rkyv(data: &Bound<'_, PyBytes>) -> PyResult<PyOrpheusGraph> {
     let bytes = data.as_bytes().to_vec();
-    let view = ArchivedGraphView::from_bytes(bytes)
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let view =
+        ArchivedGraphView::from_bytes(bytes).map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     Ok(PyOrpheusGraph {
         inner: Some(GraphInner::Archived(view)),
@@ -728,7 +769,10 @@ fn optional_op_str(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>>
 
 /// Optional f32 field with a default.
 fn op_f32(d: &Bound<'_, PyDict>, key: &str, default: f32) -> PyResult<f32> {
-    Ok(d.get_item(key)?.map(|v| v.extract::<f32>()).transpose()?.unwrap_or(default))
+    Ok(d.get_item(key)?
+        .map(|v| v.extract::<f32>())
+        .transpose()?
+        .unwrap_or(default))
 }
 
 /// Enforce the §3.3-rule-5 contract at the FFI boundary: weights must already be
@@ -790,7 +834,11 @@ fn parse_ops(ops: &Bound<'_, PyList>) -> PyResult<Vec<Op>> {
                 out.push(Op::AddEdge {
                     from,
                     to,
-                    edge: EdgeData { kind, field_name, base_weight },
+                    edge: EdgeData {
+                        kind,
+                        field_name,
+                        base_weight,
+                    },
                 });
             }
             "remove_edge" => {
@@ -948,11 +996,13 @@ impl PyPersistentGraph {
         let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
         let start_owned = start.to_string();
 
-        let results = py.allow_threads(|| {
-            traversal::beam_traverse(&acc, &rust_ctx, &start_owned, k, depth)
-        });
+        let results =
+            py.allow_threads(|| traversal::beam_traverse(&acc, &rust_ctx, &start_owned, k, depth));
 
-        Ok(results.into_iter().map(PyNodeResult::from_node_result).collect())
+        Ok(results
+            .into_iter()
+            .map(PyNodeResult::from_node_result)
+            .collect())
     }
 
     /// Weighted Dijkstra over the live base∘delta view. GIL released.
@@ -970,9 +1020,8 @@ impl PyPersistentGraph {
         let start_owned = start.to_string();
         let end_owned = end.to_string();
 
-        let path = py.allow_threads(|| {
-            traversal::find_path(&acc, &rust_ctx, &start_owned, &end_owned)
-        });
+        let path =
+            py.allow_threads(|| traversal::find_path(&acc, &rust_ctx, &start_owned, &end_owned));
 
         Ok(path.map(|steps| steps.into_iter().map(PyPathStep::from_path_step).collect()))
     }
@@ -992,8 +1041,16 @@ impl PyPersistentGraph {
         let sg = py.allow_threads(|| traversal::contextual_subgraph(&acc, &rust_ctx, k));
 
         Ok(PySubGraph {
-            nodes: sg.nodes.into_iter().map(PyNodeResult::from_node_result).collect(),
-            edges: sg.edges.into_iter().map(PyEdgeResult::from_edge_result).collect(),
+            nodes: sg
+                .nodes
+                .into_iter()
+                .map(PyNodeResult::from_node_result)
+                .collect(),
+            edges: sg
+                .edges
+                .into_iter()
+                .map(PyEdgeResult::from_edge_result)
+                .collect(),
         })
     }
 
@@ -1022,8 +1079,16 @@ impl PyPersistentGraph {
         });
 
         Ok(PySubGraph {
-            nodes: sg.nodes.into_iter().map(PyNodeResult::from_node_result).collect(),
-            edges: sg.edges.into_iter().map(PyEdgeResult::from_edge_result).collect(),
+            nodes: sg
+                .nodes
+                .into_iter()
+                .map(PyNodeResult::from_node_result)
+                .collect(),
+            edges: sg
+                .edges
+                .into_iter()
+                .map(PyEdgeResult::from_edge_result)
+                .collect(),
         })
     }
 
@@ -1108,7 +1173,11 @@ pub fn py_open(
     validate: &str,
     prefault: bool,
 ) -> PyResult<PyPersistentGraph> {
-    let mode = if mmap { BaseMode::Mmap } else { BaseMode::Owned };
+    let mode = if mmap {
+        BaseMode::Mmap
+    } else {
+        BaseMode::Owned
+    };
     let v = match validate {
         "full" => Validate::Full,
         "crc" => Validate::Crc,

@@ -64,9 +64,9 @@ pub struct Manifest {
 pub fn mint_epoch() -> Result<u128, PersistError> {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).map_err(|e| {
-        PersistError::Io(std::io::Error::other(
-            format!("getrandom failed while minting epoch: {e}"),
-        ))
+        PersistError::Io(std::io::Error::other(format!(
+            "getrandom failed while minting epoch: {e}"
+        )))
     })?;
     Ok(u128::from_le_bytes(buf))
 }

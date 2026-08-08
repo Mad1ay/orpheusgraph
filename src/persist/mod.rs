@@ -59,8 +59,7 @@ use snapshot::{open_snapshot, to_rkyv_v1};
 use wal::{read_and_scan, WalRecord, WalWriter};
 
 /// When the WAL is forced to durable storage.
-#[derive(Clone, Copy, Debug)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum FsyncPolicy {
     /// fsync only on explicit `flush()`/`close()` (default). Write-through means
     /// process death still loses nothing; only power loss needs the flush.
@@ -72,7 +71,6 @@ pub enum FsyncPolicy {
     EveryN(u32),
 }
 
-
 /// Which representation the snapshot base is loaded as.
 ///
 /// `Mmap` is the default and the only option for larger-than-RAM bases (the OS
@@ -81,14 +79,12 @@ pub enum FsyncPolicy {
 /// larger-than-RAM-under-pressure callers who must read + validate up front
 /// rather than risk a lazy-fault SIGBUS (§4.5). A V0 store is ALWAYS loaded as
 /// `Owned` regardless of this setting (it has no CSR to mmap-traverse).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BaseMode {
     Owned,
     #[default]
     Mmap,
 }
-
 
 /// The base half of a [`GraphState`]. `Owned` is a materialized petgraph;
 /// `Archived` is a zero-copy CSR view over a memory-mapped V1 snapshot (§4.4b).
@@ -668,10 +664,7 @@ impl PersistentGraph {
 
         // 4/5. Encode + append (the commit point). Append poisons on failure.
         let new_seq = w.seq + 1;
-        let rec = WalRecord {
-            seq: new_seq,
-            ops,
-        };
+        let rec = WalRecord { seq: new_seq, ops };
         let frame = wal::encode_frame(&rec)?;
         let fsynced = w.wal.append(&frame)?; // fsync per policy happens inside append
 
@@ -722,7 +715,9 @@ impl PersistentGraph {
             .unwrap_or_else(|| auto_compact_threshold(w.base.as_accessor().node_count()));
         if w.delta_ops > threshold {
             if let Err(e) = self.compact_locked(&mut w) {
-                eprintln!("orpheusgraph: auto-compaction failed (batch {new_seq} still committed): {e}");
+                eprintln!(
+                    "orpheusgraph: auto-compaction failed (batch {new_seq} still committed): {e}"
+                );
                 // Reset the counter even on failure: leaving delta_ops above the
                 // threshold would retry a full-graph rebuild on EVERY subsequent
                 // apply (a compaction storm after any transient error). The delta
@@ -1030,10 +1025,7 @@ mod tests {
 
     // ---- fixtures -------------------------------------------------------
 
-    fn base_inner(
-        nodes: Vec<(&str, &str)>,
-        edges: Vec<(&str, &str, &str)>,
-    ) -> OrpheusGraphInner {
+    fn base_inner(nodes: Vec<(&str, &str)>, edges: Vec<(&str, &str, &str)>) -> OrpheusGraphInner {
         let n: Vec<NodeInput> = nodes
             .iter()
             .map(|(name, kind)| NodeInput {
@@ -1107,11 +1099,25 @@ mod tests {
         {
             let pg = PersistentGraph::create(
                 dir.path(),
-                base_inner(vec![("root", "m"), ("leaf", "m")], vec![("root", "leaf", "rel")]),
+                base_inner(
+                    vec![("root", "m"), ("leaf", "m")],
+                    vec![("root", "leaf", "rel")],
+                ),
             )
             .unwrap();
-            assert_eq!(pg.apply(vec![upsert("mid", "m"), addedge("root", "mid", "rel")], None).unwrap(), 1);
-            assert_eq!(pg.apply(vec![upsert("tip", "m"), addedge("mid", "tip", "rel")], None).unwrap(), 2);
+            assert_eq!(
+                pg.apply(
+                    vec![upsert("mid", "m"), addedge("root", "mid", "rel")],
+                    None
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                pg.apply(vec![upsert("tip", "m"), addedge("mid", "tip", "rel")], None)
+                    .unwrap(),
+                2
+            );
             // drop without close -> crash-like; batches were write-through.
         }
 
@@ -1176,8 +1182,13 @@ mod tests {
         let seq_before = pg.seq();
 
         // AddEdge to a missing endpoint -> validation error on the clone.
-        let err = pg.apply(vec![addedge("a", "ghost", "rel")], None).unwrap_err();
-        assert!(matches!(err, PersistError::Delta(DeltaError::MissingEndpoint { .. })));
+        let err = pg
+            .apply(vec![addedge("a", "ghost", "rel")], None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PersistError::Delta(DeltaError::MissingEndpoint { .. })
+        ));
 
         assert_eq!(wal_len(dir.path()), len_before, "no frame written");
         assert_eq!(pg.seq(), seq_before, "seq unchanged");
@@ -1201,7 +1212,11 @@ mod tests {
         pg.arm_append_failure();
         let err = pg.apply(vec![upsert("c", "m")], None).unwrap_err();
         assert!(matches!(err, PersistError::Io(_)));
-        assert_eq!(wal_len(dir.path()), len_after_good, "failed append wrote nothing");
+        assert_eq!(
+            wal_len(dir.path()),
+            len_after_good,
+            "failed append wrote nothing"
+        );
 
         // Subsequent apply short-circuits with Poisoned, still no write.
         let err2 = pg.apply(vec![upsert("d", "m")], None).unwrap_err();
@@ -1238,7 +1253,11 @@ mod tests {
         let mut buf = Vec::new();
         for (s, name) in [(1u64, "a"), (2, "b"), (3, "z")] {
             buf.extend_from_slice(
-                &wal::encode_frame(&WalRecord { seq: s, ops: vec![upsert(name, "m")] }).unwrap(),
+                &wal::encode_frame(&WalRecord {
+                    seq: s,
+                    ops: vec![upsert(name, "m")],
+                })
+                .unwrap(),
             );
         }
         std::fs::write(dir.path().join("wal.log"), &buf).unwrap();
@@ -1272,7 +1291,10 @@ mod tests {
         // Append a truncated/garbage extra frame after the 4 intact ones.
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(dir.path().join("wal.log")).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join("wal.log"))
+                .unwrap();
             // A plausible-looking header claiming 100 payload bytes, but only 5 follow.
             f.write_all(&100u32.to_le_bytes()).unwrap();
             f.write_all(&0u32.to_le_bytes()).unwrap();
@@ -1282,7 +1304,11 @@ mod tests {
 
         let pg = PersistentGraph::open(dir.path(), false).unwrap();
         assert_eq!(pg.seq(), 4, "4 intact frames replayed");
-        assert_eq!(wal_len(dir.path()), good_len, "torn tail truncated to boundary");
+        assert_eq!(
+            wal_len(dir.path()),
+            good_len,
+            "torn tail truncated to boundary"
+        );
     }
 
     // ---- recovery: seq gap is a hard error -----------------------------
@@ -1297,14 +1323,20 @@ mod tests {
         let mut buf = Vec::new();
         for s in [1u64, 2, 4] {
             buf.extend_from_slice(
-                &wal::encode_frame(&WalRecord { seq: s, ops: vec![upsert(&format!("n{s}"), "m")] }).unwrap(),
+                &wal::encode_frame(&WalRecord {
+                    seq: s,
+                    ops: vec![upsert(&format!("n{s}"), "m")],
+                })
+                .unwrap(),
             );
         }
         std::fs::write(dir.path().join("wal.log"), &buf).unwrap();
 
         let err = PersistentGraph::open(dir.path(), false).unwrap_err();
         match err {
-            PersistError::Corrupt(msg) => assert!(msg.contains("gap"), "message should mention gap: {msg}"),
+            PersistError::Corrupt(msg) => {
+                assert!(msg.contains("gap"), "message should mention gap: {msg}")
+            }
             other => panic!("expected Corrupt gap, got {other:?}"),
         }
     }
@@ -1437,7 +1469,11 @@ mod tests {
             // no close/flush
         }
         let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
-        assert_eq!(pg2.seq(), 5, "all acknowledged batches present after crash-like drop");
+        assert_eq!(
+            pg2.seq(),
+            5,
+            "all acknowledged batches present after crash-like drop"
+        );
         let s = pg2.snapshot();
         let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
         for i in 0..5 {
@@ -1451,11 +1487,7 @@ mod tests {
     fn concurrent_readers_see_consistent_states() {
         let dir = tempfile::tempdir().unwrap();
         let pg = Arc::new(
-            PersistentGraph::create(
-                dir.path(),
-                base_inner(vec![("root", "m")], vec![]),
-            )
-            .unwrap(),
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap(),
         );
 
         const READERS: usize = 4;
@@ -1482,7 +1514,10 @@ mod tests {
         for i in 0..BATCHES {
             // root + n{i}; edge root->n{i}. Every published state is consistent.
             pg.apply(
-                vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")],
+                vec![
+                    upsert(&format!("n{i}"), "m"),
+                    addedge("root", &format!("n{i}"), "rel"),
+                ],
                 None,
             )
             .unwrap();
@@ -1552,15 +1587,15 @@ mod tests {
     #[test]
     fn compact_folds_delta_and_empties_it() {
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(
-            dir.path(),
-            base_inner(vec![("root", "m")], vec![]),
-        )
-        .unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
 
         for i in 0..20 {
             pg.apply(
-                vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")],
+                vec![
+                    upsert(&format!("n{i}"), "m"),
+                    addedge("root", &format!("n{i}"), "rel"),
+                ],
                 None,
             )
             .unwrap();
@@ -1619,7 +1654,8 @@ mod tests {
         let (g, idx) = build_graph(vec![mk("A", 1.0), mk("B", 0.5)], vec![]);
         let pg = PersistentGraph::create(dir.path(), OrpheusGraphInner::new(g, idx)).unwrap();
 
-        pg.apply(vec![Op::RemoveNode { name: "A".into() }], None).unwrap();
+        pg.apply(vec![Op::RemoveNode { name: "A".into() }], None)
+            .unwrap();
         let seq = pg.seq();
         let read_b = |pg: &PersistentGraph| {
             let s = pg.snapshot();
@@ -1633,8 +1669,15 @@ mod tests {
         assert_eq!(pg.seq(), seq, "compaction must not mint a new seq");
         // B must NOT be rescaled to 1.0 by re-normalization over the survivors —
         // that would change the scoring base_component at an identical seq.
-        assert_eq!(read_b(&pg), before, "surviving base_weight rescaled by compaction");
-        assert!((read_b(&pg) - 0.5).abs() < 1e-6, "B should keep its normalized 0.5");
+        assert_eq!(
+            read_b(&pg),
+            before,
+            "surviving base_weight rescaled by compaction"
+        );
+        assert!(
+            (read_b(&pg) - 0.5).abs() < 1e-6,
+            "B should keep its normalized 0.5"
+        );
     }
 
     #[test]
@@ -1644,7 +1687,8 @@ mod tests {
         // sanitize it to 0.0 while the live delta view returns it raw (audit #6
         // same-seq scoring divergence).
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
         let bad = NodeData {
             name: "x".into(),
             kind: "m".into(),
@@ -1664,7 +1708,11 @@ mod tests {
         assert_eq!(before, -0.5, "delta view returns raw weight");
         pg.compact().unwrap();
         assert_eq!(pg.seq(), seq);
-        assert_eq!(read_x(&pg), before, "compaction changed an out-of-range weight (same-seq divergence)");
+        assert_eq!(
+            read_x(&pg),
+            before,
+            "compaction changed an out-of-range weight (same-seq divergence)"
+        );
     }
 
     #[test]
@@ -1674,7 +1722,8 @@ mod tests {
         // snapshot is a typed Corrupt, not UB.
         let dir = tempfile::tempdir().unwrap();
         {
-            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![]))
+                .unwrap();
             pg.apply(vec![upsert("a", "m")], None).unwrap();
             pg.compact().unwrap(); // ensure a V1 snapshot exists
             pg.close().unwrap();
@@ -1703,7 +1752,8 @@ mod tests {
     #[test]
     fn wal_truncate_to_zero_after_acked_applies_is_corrupt() {
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
         pg.apply(vec![upsert("a", "m")], None).unwrap();
         pg.apply(vec![upsert("b", "m")], None).unwrap();
         assert_eq!(pg.seq(), 2);
@@ -1725,7 +1775,10 @@ mod tests {
     }
 
     fn truncate_wal(dir: &Path) {
-        let f = std::fs::OpenOptions::new().write(true).open(dir.join("wal.log")).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("wal.log"))
+            .unwrap();
         f.set_len(0).unwrap();
         f.sync_all().unwrap();
     }
@@ -1733,7 +1786,8 @@ mod tests {
     #[test]
     fn manifest_field_bitrot_is_corrupt() {
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
         pg.apply(vec![upsert("a", "m")], None).unwrap();
         pg.close().unwrap();
         // Bit-rot snapshot_seq in the MANIFEST to a valid-but-wrong value (would
@@ -1758,7 +1812,8 @@ mod tests {
     fn onflush_crash_recover_then_powerloss_reopens_gracefully() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![]))
+                .unwrap();
             // OnFlush (default): applies are write-through only, never fsync'd.
             pg.apply(vec![upsert("a", "m")], None).unwrap();
             pg.apply(vec![upsert("b", "m")], None).unwrap();
@@ -1783,7 +1838,8 @@ mod tests {
     #[test]
     fn onflush_poisoned_close_then_powerloss_reopens_gracefully() {
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
         pg.apply(vec![upsert("a", "m")], None).unwrap();
         pg.apply(vec![upsert("b", "m")], None).unwrap();
         assert_eq!(pg.seq(), 2);
@@ -1838,9 +1894,17 @@ mod tests {
     #[test]
     fn crash_after_manifest_before_wal_truncate_recovers_folded() {
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
         for i in 0..8 {
-            pg.apply(vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")], None).unwrap();
+            pg.apply(
+                vec![
+                    upsert(&format!("n{i}"), "m"),
+                    addedge("root", &format!("n{i}"), "rel"),
+                ],
+                None,
+            )
+            .unwrap();
         }
         let seq = pg.seq();
         let names = live_node_names(&pg);
@@ -1874,7 +1938,8 @@ mod tests {
     #[test]
     fn crash_after_snapshot_before_manifest_gc_removes_orphan() {
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
         for i in 0..6 {
             pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
         }
@@ -1899,7 +1964,10 @@ mod tests {
         let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
         assert_eq!(full_topology(&acc, &names), want);
         assert!(!dir.path().join(&orphan_file).exists(), "orphan not GC'd");
-        assert!(dir.path().join(&live_file).exists(), "live file wrongly removed");
+        assert!(
+            dir.path().join(&live_file).exists(),
+            "live file wrongly removed"
+        );
     }
 
     // ---- mmap open == owned open ---------------------------------------
@@ -1908,9 +1976,17 @@ mod tests {
     fn mmap_open_equals_owned_open() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![]))
+                .unwrap();
             for i in 0..10 {
-                pg.apply(vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")], None).unwrap();
+                pg.apply(
+                    vec![
+                        upsert(&format!("n{i}"), "m"),
+                        addedge("root", &format!("n{i}"), "rel"),
+                    ],
+                    None,
+                )
+                .unwrap();
             }
             // Compact so the base carries all the data (delta empty) -> the CSR
             // is what both opens traverse.
@@ -1918,7 +1994,9 @@ mod tests {
             pg.close().unwrap();
         }
 
-        let mmap = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false).unwrap();
+        let mmap =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false)
+                .unwrap();
         let names = live_node_names(&mmap);
         let t_mmap = {
             let s = mmap.snapshot();
@@ -1929,7 +2007,9 @@ mod tests {
         };
         drop(mmap);
 
-        let owned = PersistentGraph::open_with(dir.path(), false, BaseMode::Owned, Validate::Full, false).unwrap();
+        let owned =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Owned, Validate::Full, false)
+                .unwrap();
         let t_owned = {
             let s = owned.snapshot();
             let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
@@ -1944,14 +2024,24 @@ mod tests {
     fn prefault_open_is_transparent() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+            let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![]))
+                .unwrap();
             for i in 0..5 {
-                pg.apply(vec![upsert(&format!("n{i}"), "m"), addedge("root", &format!("n{i}"), "rel")], None).unwrap();
+                pg.apply(
+                    vec![
+                        upsert(&format!("n{i}"), "m"),
+                        addedge("root", &format!("n{i}"), "rel"),
+                    ],
+                    None,
+                )
+                .unwrap();
             }
             pg.compact().unwrap();
             pg.close().unwrap();
         }
-        let plain = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false).unwrap();
+        let plain =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false)
+                .unwrap();
         let names = live_node_names(&plain);
         let want = {
             let s = plain.snapshot();
@@ -1960,7 +2050,9 @@ mod tests {
         };
         drop(plain);
 
-        let pf = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, true).unwrap();
+        let pf =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, true)
+                .unwrap();
         let s = pf.snapshot();
         let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
         assert_eq!(full_topology(&acc, &names), want);
@@ -1976,13 +2068,18 @@ mod tests {
         pg.close().unwrap();
 
         // Drop a stray snapshot-*.og not named by the MANIFEST.
-        let orphan = dir.path().join("snapshot-00000000000000000009-0000000007.og");
+        let orphan = dir
+            .path()
+            .join("snapshot-00000000000000000009-0000000007.og");
         std::fs::write(&orphan, b"garbage-orphan").unwrap();
         assert!(orphan.exists());
 
         let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
         assert!(!orphan.exists(), "open-time GC did not remove the orphan");
-        assert!(dir.path().join(&live).exists(), "live snapshot wrongly removed");
+        assert!(
+            dir.path().join(&live).exists(),
+            "live snapshot wrongly removed"
+        );
         drop(pg2);
     }
 
@@ -2003,9 +2100,14 @@ mod tests {
 
         // A compaction must have fired: snapshot_seq advanced past 0, delta_ops
         // reset below threshold, delta empty at the fold point.
-        assert!(pg.snapshot_seq() > 0, "auto-compaction never advanced snapshot_seq");
-        assert!(pg.delta_ops() <= auto_compact_threshold(pg.snapshot().base.as_accessor().node_count()),
-            "delta_ops not bounded by threshold after auto-compaction");
+        assert!(
+            pg.snapshot_seq() > 0,
+            "auto-compaction never advanced snapshot_seq"
+        );
+        assert!(
+            pg.delta_ops() <= auto_compact_threshold(pg.snapshot().base.as_accessor().node_count()),
+            "delta_ops not bounded by threshold after auto-compaction"
+        );
         assert_eq!(pg.seq(), n_batches, "seq preserved across auto-compaction");
 
         // Everything still present.
@@ -2020,7 +2122,8 @@ mod tests {
     #[test]
     fn post_compaction_old_snapshot_deleted_inline() {
         let dir = tempfile::tempdir().unwrap();
-        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
         let first_file = pg.snapshot_file_name();
         for i in 0..12 {
             pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
@@ -2028,7 +2131,10 @@ mod tests {
         pg.compact().unwrap();
         let new_file = pg.snapshot_file_name();
         assert_ne!(new_file, first_file);
-        assert!(!dir.path().join(&first_file).exists(), "old snapshot not deleted inline");
+        assert!(
+            !dir.path().join(&first_file).exists(),
+            "old snapshot not deleted inline"
+        );
         assert!(dir.path().join(&new_file).exists(), "new snapshot missing");
 
         // New base is traversable.
@@ -2069,20 +2175,29 @@ mod tests {
         write_manifest_atomic(dir.path(), &m).unwrap();
 
         // Even with mode=Mmap requested, a V0 store must load as Owned.
-        let pg = PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false).unwrap();
+        let pg =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false)
+                .unwrap();
         {
             let s = pg.snapshot();
-            assert!(matches!(s.base.as_ref(), BaseGraph::Owned(_)), "V0 must be Owned, never mmap");
+            assert!(
+                matches!(s.base.as_ref(), BaseGraph::Owned(_)),
+                "V0 must be Owned, never mmap"
+            );
             let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
             assert_eq!(out_pairs(&acc, "a"), vec![("b".into(), "rel".into())]);
         }
 
         // Applying + compacting upgrades it to V1 (migration path).
-        pg.apply(vec![upsert("c", "m"), addedge("b", "c", "rel")], None).unwrap();
+        pg.apply(vec![upsert("c", "m"), addedge("b", "c", "rel")], None)
+            .unwrap();
         pg.compact().unwrap();
         {
             let s = pg.snapshot();
-            assert!(matches!(s.base.as_ref(), BaseGraph::Archived(_)), "post-compaction base should be V1 mmap");
+            assert!(
+                matches!(s.base.as_ref(), BaseGraph::Archived(_)),
+                "post-compaction base should be V1 mmap"
+            );
         }
         drop(pg);
         // Reopen reads the now-V1 manifest and mmaps.

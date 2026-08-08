@@ -41,9 +41,17 @@ pub enum Op {
     /// Tombstone a node and mask all its incident edges.
     RemoveNode { name: String },
     /// Add a new (parallel) edge; both endpoints must exist at this point.
-    AddEdge { from: String, to: String, edge: EdgeData },
+    AddEdge {
+        from: String,
+        to: String,
+        edge: EdgeData,
+    },
     /// Tombstone every matching `(from, to, kind)` edge (base + delta). Idempotent.
-    RemoveEdge { from: String, to: String, kind: String },
+    RemoveEdge {
+        from: String,
+        to: String,
+        kind: String,
+    },
 }
 
 /// Error returned by [`GraphDelta::apply`]. Only `AddEdge` can produce one.
@@ -332,10 +340,7 @@ impl GraphDelta {
     fn remove_edge(&mut self, base: &dyn GraphAccessor, from: String, to: String, kind: String) {
         // Kill ALL matching live delta edges (deterministic; avoids ambiguity
         // when base+delta both carry the triple).
-        let positions: Vec<u32> = self
-            .out_index
-            .get(&from).cloned()
-            .unwrap_or_default();
+        let positions: Vec<u32> = self.out_index.get(&from).cloned().unwrap_or_default();
         for p in positions {
             let e = &mut self.added_edges[p as usize];
             if !e.dead && e.to == to && e.edge.kind == kind {
@@ -346,8 +351,12 @@ impl GraphDelta {
 
         // Tombstone matching base edge(s): +masked for each currently-live match
         // (0 if already masked by a node tombstone → no double-count).
-        if self.removed_edges.insert((from.clone(), to.clone(), kind.clone())) {
-            self.masked_base_edge_count += self.count_live_base_edges_matching(base, &from, &to, &kind);
+        if self
+            .removed_edges
+            .insert((from.clone(), to.clone(), kind.clone()))
+        {
+            self.masked_base_edge_count +=
+                self.count_live_base_edges_matching(base, &from, &to, &kind);
         }
     }
 
@@ -396,10 +405,11 @@ impl GraphDelta {
             if self.removed_nodes.contains(source) {
                 continue;
             }
-            if self
-                .removed_edges
-                .contains(&(source.clone(), name.to_string(), nb.edge_kind.clone()))
-            {
+            if self.removed_edges.contains(&(
+                source.clone(),
+                name.to_string(),
+                nb.edge_kind.clone(),
+            )) {
                 continue;
             }
             self.masked_base_edge_count += 1;
@@ -430,10 +440,11 @@ impl GraphDelta {
             if self.removed_nodes.contains(source) {
                 continue;
             }
-            if self
-                .removed_edges
-                .contains(&(source.clone(), name.to_string(), nb.edge_kind.clone()))
-            {
+            if self.removed_edges.contains(&(
+                source.clone(),
+                name.to_string(),
+                nb.edge_kind.clone(),
+            )) {
                 continue;
             }
             self.masked_base_edge_count -= 1;
@@ -537,7 +548,8 @@ impl GraphAccessor for DeltaAccessor<'_> {
     }
 
     fn edge_count(&self) -> usize {
-        (self.base.edge_count() + self.delta.live_delta_edge_count) - self.delta.masked_base_edge_count
+        (self.base.edge_count() + self.delta.live_delta_edge_count)
+            - self.delta.masked_base_edge_count
     }
 
     fn get_node(&self, name: &str) -> Option<NodeView> {
@@ -705,10 +717,7 @@ mod tests {
 
     // ---- fixtures -------------------------------------------------------
 
-    fn base_graph(
-        nodes: Vec<(&str, &str)>,
-        edges: Vec<(&str, &str, &str)>,
-    ) -> OrpheusGraphInner {
+    fn base_graph(nodes: Vec<(&str, &str)>, edges: Vec<(&str, &str, &str)>) -> OrpheusGraphInner {
         let n: Vec<NodeInput> = nodes
             .iter()
             .map(|(name, kind)| NodeInput {
@@ -846,7 +855,10 @@ mod tests {
         let base = base_graph(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
         let d = GraphDelta::new();
         let acc = DeltaAccessor::new(&base, &d);
-        assert_eq!(triples(acc.outgoing_neighbors("a")), triples(base.outgoing_neighbors("a")));
+        assert_eq!(
+            triples(acc.outgoing_neighbors("a")),
+            triples(base.outgoing_neighbors("a"))
+        );
     }
 
     #[test]
@@ -895,7 +907,10 @@ mod tests {
         let mut d = GraphDelta::new();
         d.apply(&base, vec![rmnode("a")]).unwrap();
         let acc = DeltaAccessor::new(&base, &d);
-        assert!(acc.outgoing_neighbors("a").is_empty(), "tombstoned node exposes nothing");
+        assert!(
+            acc.outgoing_neighbors("a").is_empty(),
+            "tombstoned node exposes nothing"
+        );
     }
 
     #[test]
@@ -997,10 +1012,23 @@ mod tests {
         d.apply(&base, vec![upsert(node_meta("h", "m", "note", "hi"))])
             .unwrap();
         let acc = DeltaAccessor::new(&base, &d);
-        assert_eq!(sorted_triples(acc.outgoing_neighbors("h")), sorted_triples(base.outgoing_neighbors("h")));
-        assert_eq!(sorted_triples(acc.incoming_neighbors("h")), sorted_triples(base.incoming_neighbors("h")));
+        assert_eq!(
+            sorted_triples(acc.outgoing_neighbors("h")),
+            sorted_triples(base.outgoing_neighbors("h"))
+        );
+        assert_eq!(
+            sorted_triples(acc.incoming_neighbors("h")),
+            sorted_triples(base.incoming_neighbors("h"))
+        );
         assert_eq!(acc.node_count(), base.node_count());
-        assert_eq!(acc.get_node("h").unwrap().metadata.get("note").map(String::as_str), Some("hi"));
+        assert_eq!(
+            acc.get_node("h")
+                .unwrap()
+                .metadata
+                .get("note")
+                .map(String::as_str),
+            Some("hi")
+        );
     }
 
     #[test]
@@ -1014,7 +1042,10 @@ mod tests {
         let acc = DeltaAccessor::new(&base, &d);
         // The tombstoned node itself exposes no edges in EITHER direction and
         // resolves to None (the audit-fixed rule §3.2).
-        assert!(acc.get_node("h").is_none(), "tombstoned node must resolve to None");
+        assert!(
+            acc.get_node("h").is_none(),
+            "tombstoned node must resolve to None"
+        );
         assert!(
             acc.outgoing_neighbors("h").is_empty() && acc.incoming_neighbors("h").is_empty(),
             "tombstoned node must expose no edges in either direction"
@@ -1120,14 +1151,18 @@ mod tests {
         assert_eq!(acc.node_count(), bn);
         assert_eq!(acc.edge_count(), be, "incident base edges restored");
         assert!(acc.get_node("h").is_some());
-        assert_eq!(sorted_triples(acc.outgoing_neighbors("h")), sorted_triples(base.outgoing_neighbors("h")));
+        assert_eq!(
+            sorted_triples(acc.outgoing_neighbors("h")),
+            sorted_triples(base.outgoing_neighbors("h"))
+        );
     }
 
     #[test]
     fn remove_after_upsert_symmetry() {
         let base = base_graph(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
         let mut d = GraphDelta::new();
-        d.apply(&base, vec![upsert(node("a", "table")), rmnode("a")]).unwrap();
+        d.apply(&base, vec![upsert(node("a", "table")), rmnode("a")])
+            .unwrap();
         let acc = DeltaAccessor::new(&base, &d);
         assert!(acc.get_node("a").is_none(), "final tombstoned");
         assert!(acc.outgoing_neighbors("a").is_empty());
@@ -1139,7 +1174,9 @@ mod tests {
         let base = base_graph(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
         let mut d = GraphDelta::new();
         d.apply(&base, vec![rmedge("a", "b", "rel")]).unwrap();
-        assert!(DeltaAccessor::new(&base, &d).outgoing_neighbors("a").is_empty());
+        assert!(DeltaAccessor::new(&base, &d)
+            .outgoing_neighbors("a")
+            .is_empty());
         d.apply(&base, vec![addedge("a", "b", "rel")]).unwrap();
         let acc = DeltaAccessor::new(&base, &d);
         assert_eq!(
@@ -1255,8 +1292,11 @@ mod tests {
         let base = base_graph(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
         // Seed a non-empty delta first.
         let mut d = GraphDelta::new();
-        d.apply(&base, vec![upsert(node("x", "m")), addedge("x", "a", "rel")])
-            .unwrap();
+        d.apply(
+            &base,
+            vec![upsert(node("x", "m")), addedge("x", "a", "rel")],
+        )
+        .unwrap();
         let (n0, e0) = {
             let acc = DeltaAccessor::new(&base, &d);
             (acc.node_count(), acc.edge_count())
@@ -1288,13 +1328,22 @@ mod tests {
         let base = base_graph(vec![("a", "m")], vec![]);
 
         let mut d1 = GraphDelta::new();
-        d1.apply(&base, vec![upsert(node("a", "table")), rmnode("a")]).unwrap();
-        assert!(DeltaAccessor::new(&base, &d1).get_node("a").is_none(), "final tombstoned");
+        d1.apply(&base, vec![upsert(node("a", "table")), rmnode("a")])
+            .unwrap();
+        assert!(
+            DeltaAccessor::new(&base, &d1).get_node("a").is_none(),
+            "final tombstoned"
+        );
 
         let mut d2 = GraphDelta::new();
-        d2.apply(&base, vec![rmnode("a"), upsert(node("a", "table"))]).unwrap();
+        d2.apply(&base, vec![rmnode("a"), upsert(node("a", "table"))])
+            .unwrap();
         let acc = DeltaAccessor::new(&base, &d2);
-        assert_eq!(acc.get_node("a").unwrap().kind, "table", "final shadowed present");
+        assert_eq!(
+            acc.get_node("a").unwrap().kind,
+            "table",
+            "final shadowed present"
+        );
 
         // disjointness holds for both
         for d in [&d1, &d2] {
@@ -1315,9 +1364,18 @@ mod tests {
         assert_eq!(acc.node_count(), base.node_count());
         assert_eq!(acc.edge_count(), base.edge_count());
         for n in ["a", "b"] {
-            assert_eq!(acc.get_node(n).map(|v| v.kind.clone()), base.get_node(n).map(|v| v.kind.clone()));
-            assert_eq!(triples(acc.outgoing_neighbors(n)), triples(base.outgoing_neighbors(n)));
-            assert_eq!(triples(acc.incoming_neighbors(n)), triples(base.incoming_neighbors(n)));
+            assert_eq!(
+                acc.get_node(n).map(|v| v.kind.clone()),
+                base.get_node(n).map(|v| v.kind.clone())
+            );
+            assert_eq!(
+                triples(acc.outgoing_neighbors(n)),
+                triples(base.outgoing_neighbors(n))
+            );
+            assert_eq!(
+                triples(acc.incoming_neighbors(n)),
+                triples(base.incoming_neighbors(n))
+            );
         }
     }
 
@@ -1328,16 +1386,26 @@ mod tests {
         // Deterministic pseudo-random mix (no proptest dep needed here).
         let base = base_graph(
             vec![("n0", "m"), ("n1", "m"), ("n2", "f"), ("n3", "f")],
-            vec![("n0", "n1", "rel"), ("n1", "n2", "rel"), ("n0", "n3", "rel"), ("n2", "n0", "back")],
+            vec![
+                ("n0", "n1", "rel"),
+                ("n1", "n2", "rel"),
+                ("n0", "n3", "rel"),
+                ("n2", "n0", "back"),
+            ],
         );
-        let base_names: Vec<String> = vec!["n0", "n1", "n2", "n3"].into_iter().map(String::from).collect();
+        let base_names: Vec<String> = vec!["n0", "n1", "n2", "n3"]
+            .into_iter()
+            .map(String::from)
+            .collect();
         let names = ["n0", "n1", "n2", "n3", "n4", "n5"];
         let kinds = ["rel", "back", "contains"];
 
         let mut d = GraphDelta::new();
         let mut seed: u64 = 0x1234_5678;
         let next = |seed: &mut u64, m: u64| {
-            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (*seed >> 33) % m
         };
         for _ in 0..400 {
@@ -1401,16 +1469,18 @@ mod tests {
     }
     fn op_strat() -> impl Strategy<Value = Op> {
         prop_oneof![
-            (name_strat(), kind_strat())
-                .prop_map(|(n, k)| Op::UpsertNode(node(&n, &k))),
+            (name_strat(), kind_strat()).prop_map(|(n, k)| Op::UpsertNode(node(&n, &k))),
             name_strat().prop_map(|n| Op::RemoveNode { name: n }),
             (name_strat(), name_strat(), kind_strat()).prop_map(|(f, t, k)| Op::AddEdge {
                 from: f,
                 to: t,
                 edge: edata(&k),
             }),
-            (name_strat(), name_strat(), kind_strat())
-                .prop_map(|(f, t, k)| Op::RemoveEdge { from: f, to: t, kind: k }),
+            (name_strat(), name_strat(), kind_strat()).prop_map(|(f, t, k)| Op::RemoveEdge {
+                from: f,
+                to: t,
+                kind: k
+            }),
         ]
     }
 

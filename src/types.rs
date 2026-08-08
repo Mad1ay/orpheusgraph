@@ -1,8 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 /// Data stored in each graph node.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize,
-         rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[rkyv(derive(Debug))]
 pub struct NodeData {
     /// Unique key: "sale.order", "users_table", "AccountEntity"
@@ -20,8 +27,15 @@ pub struct NodeData {
 }
 
 /// Data stored on each graph edge.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize,
-         rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[rkyv(derive(Debug))]
 pub struct EdgeData {
     /// Edge type: "inherits", "relates_to", "depends_on", "contains", "describes", etc.
@@ -97,7 +111,7 @@ pub struct DynamicContext {
     pub weight_overrides: HashMap<String, f32>,
 
     /// Scoring coefficients — configurable for A/B testing without Rust recompile
-    pub w_base: f32,     // default 1.0
+    pub w_base: f32, // default 1.0
     pub w_semantic: f32, // default 1.5
     pub w_noise: f32,    // default 1.0
     pub w_override: f32, // default 1.0

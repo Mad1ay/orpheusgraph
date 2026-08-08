@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use petgraph::graph::{DiGraph, NodeIndex};
 
-use crate::types::{EdgeData, EdgeInput, NodeData, NodeInput};
 use crate::graph::OrpheusGraphInner;
+use crate::types::{EdgeData, EdgeInput, NodeData, NodeInput};
 
 /// Rebuild a graph from already-serialized data (nodes with pagerank, indexed edges).
 /// No normalization or PageRank recomputation — data is already processed.
@@ -121,7 +121,10 @@ fn build_graph_inner(
         // (a determinism divergence for an out-of-[0,1] delta weight). Matching
         // the raw delta view keeps "same (seq, ctx) -> same output".
         let (base_weight, noise_penalty) = if normalize {
-            (sanitize(input.base_weight) / norm_divisor, sanitize(input.noise_penalty).clamp(0.0, 1.0))
+            (
+                sanitize(input.base_weight) / norm_divisor,
+                sanitize(input.noise_penalty).clamp(0.0, 1.0),
+            )
         } else {
             (input.base_weight, input.noise_penalty)
         };
@@ -222,7 +225,11 @@ fn compute_pagerank(graph: &mut DiGraph<NodeData, EdgeData>, damping: f32, itera
 
     // Normalize to [0.0, 1.0]
     let max_score = scores.iter().copied().fold(0.0_f32, f32::max);
-    let norm = if max_score > f32::EPSILON { max_score } else { 1.0 };
+    let norm = if max_score > f32::EPSILON {
+        max_score
+    } else {
+        1.0
+    };
 
     for node_idx in graph.node_indices() {
         graph[node_idx].pagerank_weight = scores[node_idx.index()] / norm;
@@ -263,7 +270,11 @@ mod tests {
             nodes.push(make_node(&format!("m{h}"), "model", 0.5));
         }
         for h in 0..hubs {
-            edges.push(make_edge(&format!("m{h}"), &format!("m{}", (h + 1) % hubs), "relates_to"));
+            edges.push(make_edge(
+                &format!("m{h}"),
+                &format!("m{}", (h + 1) % hubs),
+                "relates_to",
+            ));
         }
         for l in 0..leaves {
             let name = format!("f{l}");
@@ -290,9 +301,7 @@ mod tests {
                 best = dt;
             }
         }
-        println!(
-            "build_graph (200 hubs + 14800 dangling leaves): {best:.1} ms (best of 3)"
-        );
+        println!("build_graph (200 hubs + 14800 dangling leaves): {best:.1} ms (best of 3)");
     }
 
     #[test]
@@ -318,11 +327,20 @@ mod tests {
         assert!((pr("H").max(pr("A")).max(pr("B")).max(pr("L")) - 1.0).abs() < 1e-6);
         // Nodes that receive edge mass (H from A,B; L as the sink H feeds)
         // outrank the pure sources A,B which only get teleport + dangling mass.
-        assert!(pr("H") > pr("A") && pr("H") > pr("B"), "cited hub outranks its sources");
-        assert!(pr("L") > pr("A"), "sink accumulating the hub's mass outranks a bare source");
+        assert!(
+            pr("H") > pr("A") && pr("H") > pr("B"),
+            "cited hub outranks its sources"
+        );
+        assert!(
+            pr("L") > pr("A"),
+            "sink accumulating the hub's mass outranks a bare source"
+        );
         // Dangling mass + teleport is redistributed, never lost — all positive.
         for n in ["A", "B", "H", "L"] {
-            assert!(pr(n) > 0.0, "{n} should get positive rank from teleport+dangling");
+            assert!(
+                pr(n) > 0.0,
+                "{n} should get positive rank from teleport+dangling"
+            );
         }
     }
 
@@ -389,7 +407,10 @@ mod tests {
             hub_pr > leaf_pr,
             "Hub PR ({hub_pr}) should be > leaf PR ({leaf_pr})"
         );
-        assert!((hub_pr - 1.0).abs() < 0.001, "Hub should be normalized to 1.0");
+        assert!(
+            (hub_pr - 1.0).abs() < 0.001,
+            "Hub should be normalized to 1.0"
+        );
     }
 
     #[test]

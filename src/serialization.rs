@@ -238,26 +238,41 @@ mod tests {
     fn make_graph() -> OrpheusGraphInner {
         let nodes = vec![
             NodeInput {
-                name: "A".into(), kind: "model".into(), metadata: HashMap::new(),
-                base_weight: 0.5, noise_penalty: 0.1,
+                name: "A".into(),
+                kind: "model".into(),
+                metadata: HashMap::new(),
+                base_weight: 0.5,
+                noise_penalty: 0.1,
             },
             NodeInput {
-                name: "B".into(), kind: "model".into(), metadata: HashMap::new(),
-                base_weight: 0.8, noise_penalty: 0.0,
+                name: "B".into(),
+                kind: "model".into(),
+                metadata: HashMap::new(),
+                base_weight: 0.8,
+                noise_penalty: 0.0,
             },
             NodeInput {
-                name: "C".into(), kind: "field".into(), metadata: HashMap::new(),
-                base_weight: 0.3, noise_penalty: 0.5,
+                name: "C".into(),
+                kind: "field".into(),
+                metadata: HashMap::new(),
+                base_weight: 0.3,
+                noise_penalty: 0.5,
             },
         ];
         let edges = vec![
             EdgeInput {
-                from: "A".into(), to: "B".into(), kind: "relates_to".into(),
-                field_name: Some("partner_id".into()), base_weight: 1.0,
+                from: "A".into(),
+                to: "B".into(),
+                kind: "relates_to".into(),
+                field_name: Some("partner_id".into()),
+                base_weight: 1.0,
             },
             EdgeInput {
-                from: "B".into(), to: "C".into(), kind: "contains".into(),
-                field_name: None, base_weight: 0.5,
+                from: "B".into(),
+                to: "C".into(),
+                kind: "contains".into(),
+                field_name: None,
+                base_weight: 0.5,
             },
         ];
         let (g, m) = build_graph(nodes, edges);

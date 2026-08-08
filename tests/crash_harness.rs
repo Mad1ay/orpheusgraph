@@ -18,7 +18,9 @@
 
 use orpheusgraph::accessor::GraphAccessor;
 use orpheusgraph::types::NodeData;
-use orpheusgraph::{build_graph, DeltaAccessor, FsyncPolicy, Op, OrpheusGraphInner, PersistentGraph};
+use orpheusgraph::{
+    build_graph, DeltaAccessor, FsyncPolicy, Op, OrpheusGraphInner, PersistentGraph,
+};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -133,8 +135,9 @@ fn kill9_crash_harness() {
             let _ = child.wait();
 
             // (i) reopen after a real kill -9 must succeed, never panic on bytes.
-            let pg = PersistentGraph::open(&dir, false)
-                .unwrap_or_else(|e| panic!("[{policy_name} #{i}] reopen after kill -9 failed: {e}"));
+            let pg = PersistentGraph::open(&dir, false).unwrap_or_else(|e| {
+                panic!("[{policy_name} #{i}] reopen after kill -9 failed: {e}")
+            });
             let seq = pg.seq();
             let acked = max_acked(&dir);
 
@@ -189,9 +192,7 @@ fn kill9_crash_harness() {
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
             .any(|n| {
-                n.starts_with("snapshot-")
-                    && n.ends_with(".og")
-                    && !n.contains("-0000000000.og")
+                n.starts_with("snapshot-") && n.ends_with(".og") && !n.contains("-0000000000.og")
             });
         assert!(
             compacted,

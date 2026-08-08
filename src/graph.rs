@@ -16,10 +16,7 @@ pub struct OrpheusGraphInner {
 
 impl OrpheusGraphInner {
     /// Create a new wrapper from a built graph and its index map.
-    pub fn new(
-        graph: DiGraph<NodeData, EdgeData>,
-        index_map: HashMap<String, NodeIndex>,
-    ) -> Self {
+    pub fn new(graph: DiGraph<NodeData, EdgeData>, index_map: HashMap<String, NodeIndex>) -> Self {
         Self { graph, index_map }
     }
 

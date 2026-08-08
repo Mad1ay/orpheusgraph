@@ -43,7 +43,10 @@ fn orpheusgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pybridge::py_open, m)?)?;
     m.add_function(wrap_pyfunction!(pybridge::py_create_persistent, m)?)?;
     // Persistence exceptions callers branch on.
-    m.add("ConflictError", m.py().get_type::<pybridge::ConflictError>())?;
+    m.add(
+        "ConflictError",
+        m.py().get_type::<pybridge::ConflictError>(),
+    )?;
     m.add("CorruptError", m.py().get_type::<pybridge::CorruptError>())?;
     Ok(())
 }

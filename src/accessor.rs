@@ -68,11 +68,21 @@ impl GraphAccessor for OrpheusGraphInner {
     }
 
     fn outgoing_neighbors(&self, name: &str) -> Vec<NeighborView> {
-        graph_neighbors(self.inner_graph(), self.index_map(), name, petgraph::Direction::Outgoing)
+        graph_neighbors(
+            self.inner_graph(),
+            self.index_map(),
+            name,
+            petgraph::Direction::Outgoing,
+        )
     }
 
     fn incoming_neighbors(&self, name: &str) -> Vec<NeighborView> {
-        graph_neighbors(self.inner_graph(), self.index_map(), name, petgraph::Direction::Incoming)
+        graph_neighbors(
+            self.inner_graph(),
+            self.index_map(),
+            name,
+            petgraph::Direction::Incoming,
+        )
     }
 }
 

@@ -33,7 +33,12 @@ fn test_graph_wrapper_basic() {
         make_node("stock.picking", "model", 0.5),
     ];
     let edges = vec![
-        make_edge("sale.order", "res.partner", "relates_to", Some("partner_id")),
+        make_edge(
+            "sale.order",
+            "res.partner",
+            "relates_to",
+            Some("partner_id"),
+        ),
         make_edge("sale.order", "stock.picking", "relates_to", Some("origin")),
     ];
 
@@ -74,7 +79,12 @@ fn test_outgoing_edges() {
         make_node("stock.picking", "model", 1.0),
     ];
     let edges = vec![
-        make_edge("sale.order", "res.partner", "relates_to", Some("partner_id")),
+        make_edge(
+            "sale.order",
+            "res.partner",
+            "relates_to",
+            Some("partner_id"),
+        ),
         make_edge("sale.order", "stock.picking", "relates_to", Some("origin")),
     ];
 

@@ -13,18 +13,10 @@ use crate::types::{DynamicContext, NodeResult};
 pub fn compute_score(node: &NodeView, ctx: &DynamicContext) -> NodeResult {
     let base_component = ctx.w_base * node.base_weight;
 
-    let semantic_boost = ctx
-        .semantic_boosts
-        .get(&node.name)
-        .copied()
-        .unwrap_or(0.0);
+    let semantic_boost = ctx.semantic_boosts.get(&node.name).copied().unwrap_or(0.0);
     let semantic_component = ctx.w_semantic * semantic_boost;
 
-    let weight_override = ctx
-        .weight_overrides
-        .get(&node.name)
-        .copied()
-        .unwrap_or(0.0);
+    let weight_override = ctx.weight_overrides.get(&node.name).copied().unwrap_or(0.0);
     let override_component = ctx.w_override * weight_override;
 
     // Domain-aware noise: if node metadata contains a tag in ctx.noise_tags, force high penalty
@@ -93,8 +85,7 @@ mod tests {
     fn test_semantic_boost_raises_score() {
         let node = make_node("stock.picking", 0.5, 0.0);
         let mut ctx = DynamicContext::default();
-        ctx.semantic_boosts
-            .insert("stock.picking".to_string(), 2.0);
+        ctx.semantic_boosts.insert("stock.picking".to_string(), 2.0);
         let result = compute_score(&node, &ctx);
         assert!((result.weight - 3.5).abs() < 0.001);
         assert!((result.semantic_component - 3.0).abs() < 0.001);
@@ -105,17 +96,24 @@ mod tests {
         let node = make_node("create_uid", 0.8, 0.9);
         let ctx = DynamicContext::default();
         let result = compute_score(&node, &ctx);
-        assert!(result.weight < 0.1, "noise=0.9 should kill node: {}", result.weight);
+        assert!(
+            result.weight < 0.1,
+            "noise=0.9 should kill node: {}",
+            result.weight
+        );
     }
 
     #[test]
     fn test_multiplicative_noise_beats_boost() {
         let node = make_node("create_uid", 0.8, 0.9);
         let mut ctx = DynamicContext::default();
-        ctx.semantic_boosts
-            .insert("create_uid".to_string(), 5.0);
+        ctx.semantic_boosts.insert("create_uid".to_string(), 5.0);
         let result = compute_score(&node, &ctx);
-        assert!(result.weight < 1.0, "Boosted noisy node should still score low: {}", result.weight);
+        assert!(
+            result.weight < 1.0,
+            "Boosted noisy node should still score low: {}",
+            result.weight
+        );
     }
 
     #[test]
@@ -124,7 +122,11 @@ mod tests {
         let mut ctx = DynamicContext::default();
         ctx.noise_tags.insert("technical".to_string());
         let result = compute_score(&node, &ctx);
-        assert!(result.weight < 0.1, "Domain-tagged node should be penalized: {}", result.weight);
+        assert!(
+            result.weight < 0.1,
+            "Domain-tagged node should be penalized: {}",
+            result.weight
+        );
         assert!((result.noise_component - 0.9).abs() < 0.001);
     }
 

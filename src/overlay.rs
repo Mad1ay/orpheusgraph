@@ -82,7 +82,10 @@ fn collect_overlay_edges(
 
 /// Look up an overlay node by name, returning a NodeView.
 pub fn resolve_overlay_node(name: &str, ctx: &DynamicContext) -> Option<NodeView> {
-    ctx.overlay_nodes.iter().find(|n| n.name == name).map(NodeView::from)
+    ctx.overlay_nodes
+        .iter()
+        .find(|n| n.name == name)
+        .map(NodeView::from)
 }
 
 #[cfg(test)]
@@ -266,20 +269,32 @@ mod tests {
         ctx_a.overlay_edges.push((
             "sale.order".to_string(),
             "x_warehouse".to_string(),
-            EdgeData { kind: "relates_to".to_string(), field_name: None, base_weight: 1.0 },
+            EdgeData {
+                kind: "relates_to".to_string(),
+                field_name: None,
+                base_weight: 1.0,
+            },
         ));
 
         let mut ctx_b = DynamicContext::default();
         ctx_b.overlay_edges.push((
             "sale.order".to_string(),
             "x_hr_skill".to_string(),
-            EdgeData { kind: "relates_to".to_string(), field_name: None, base_weight: 1.0 },
+            EdgeData {
+                kind: "relates_to".to_string(),
+                field_name: None,
+                base_weight: 1.0,
+            },
         ));
 
         let names_a: Vec<String> = neighbors_with_overlay(&graph, &ctx_a, "sale.order")
-            .iter().map(|n| n.name.clone()).collect();
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
         let names_b: Vec<String> = neighbors_with_overlay(&graph, &ctx_b, "sale.order")
-            .iter().map(|n| n.name.clone()).collect();
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
 
         assert!(names_a.contains(&"x_warehouse".to_string()));
         assert!(!names_a.contains(&"x_hr_skill".to_string()));

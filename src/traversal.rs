@@ -4,9 +4,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::accessor::GraphAccessor;
 use crate::overlay::{neighbors_with_overlay, resolve_overlay_node};
 use crate::scoring::compute_score;
-use crate::types::{
-    DynamicContext, EdgeResult, NodeResult, PathStep, SubGraph,
-};
+use crate::types::{DynamicContext, EdgeResult, NodeResult, PathStep, SubGraph};
 
 // ---------------------------------------------------------------------------
 // 1. Beam Traverse — Top-K pruned BFS
@@ -80,8 +78,11 @@ pub fn beam_traverse(
         // Sort by weight descending, take Top-K. `total_cmp` gives a total
         // order even with NaN weights; the name tiebreak makes Top-K
         // deterministic despite the non-deterministic HashMap iteration order.
-        level_candidates
-            .sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
+        level_candidates.sort_by(|a, b| {
+            b.weight
+                .total_cmp(&a.weight)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         level_candidates.truncate(k);
 
         // Build next frontier from Top-K, mark visited
@@ -97,7 +98,11 @@ pub fn beam_traverse(
 
     // Final sort: all results by weight descending, name tiebreak for a
     // total deterministic order (total_cmp is NaN-safe).
-    all_results.sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
+    all_results.sort_by(|a, b| {
+        b.weight
+            .total_cmp(&a.weight)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     all_results
 }
 
@@ -251,18 +256,18 @@ fn reconstruct_path(start: &str, end: &str, parent: &HashMap<String, ParentInfo>
 // ---------------------------------------------------------------------------
 
 /// Extract a compact subgraph of `k` nodes most relevant to the context.
-pub fn contextual_subgraph(
-    graph: &dyn GraphAccessor,
-    ctx: &DynamicContext,
-    k: usize,
-) -> SubGraph {
+pub fn contextual_subgraph(graph: &dyn GraphAccessor, ctx: &DynamicContext, k: usize) -> SubGraph {
     // Seed order must be deterministic: HashMap iteration order + a stable
     // sort on tied boosts would otherwise pick different seeds across runs.
     // Sort by (boost desc, name asc) so ties break by name (total_cmp is
     // NaN-safe).
     let mut boost_entries: Vec<(&String, &f32)> = ctx.semantic_boosts.iter().collect();
     boost_entries.sort_by(|a, b| b.1.total_cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    let seeds: Vec<&str> = boost_entries.iter().take(k).map(|(name, _)| name.as_str()).collect();
+    let seeds: Vec<&str> = boost_entries
+        .iter()
+        .take(k)
+        .map(|(name, _)| name.as_str())
+        .collect();
 
     let mut node_set: HashSet<String> = HashSet::new();
     let mut nodes: Vec<NodeResult> = Vec::new();
@@ -308,7 +313,11 @@ pub fn contextual_subgraph(
     }
 
     // total_cmp + name tiebreak → total deterministic order (NaN-safe).
-    nodes.sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.name.cmp(&b.name)));
+    nodes.sort_by(|a, b| {
+        b.weight
+            .total_cmp(&a.weight)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     // Drop dangling edges whose endpoint was never materialized as a node
     // (e.g. an overlay edge to a nonexistent target), then sort for a
@@ -563,8 +572,10 @@ mod tests {
             assert!(
                 results[i].weight >= results[i + 1].weight,
                 "Results not sorted: {} ({}) before {} ({})",
-                results[i].name, results[i].weight,
-                results[i + 1].name, results[i + 1].weight,
+                results[i].name,
+                results[i].weight,
+                results[i + 1].name,
+                results[i + 1].weight,
             );
         }
     }
@@ -589,7 +600,11 @@ mod tests {
 
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
         let unique: HashSet<&str> = names.iter().copied().collect();
-        assert_eq!(unique.len(), names.len(), "Duplicate node in beam: {names:?}");
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "Duplicate node in beam: {names:?}"
+        );
         let d_count = names.iter().filter(|n| **n == "D").count();
         assert_eq!(d_count, 1, "D must appear exactly once: {names:?}");
     }
@@ -671,7 +686,10 @@ mod tests {
                 .iter()
                 .map(|r| r.name.clone())
                 .collect();
-            assert_eq!(run, baseline, "Beam order nondeterministic with NaN weights");
+            assert_eq!(
+                run, baseline,
+                "Beam order nondeterministic with NaN weights"
+            );
         }
     }
 
@@ -696,7 +714,10 @@ mod tests {
                 .iter()
                 .map(|n| n.name.clone())
                 .collect();
-            assert_eq!(run, baseline, "Seed selection nondeterministic on tied boosts");
+            assert_eq!(
+                run, baseline,
+                "Seed selection nondeterministic on tied boosts"
+            );
         }
     }
 
@@ -724,7 +745,10 @@ mod tests {
 
         let results = beam_traverse(&graph, &ctx, "A", 5, 1);
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"X_CUSTOM"), "Overlay node should appear: {names:?}");
+        assert!(
+            names.contains(&"X_CUSTOM"),
+            "Overlay node should appear: {names:?}"
+        );
     }
 
     #[test]
@@ -815,7 +839,10 @@ mod tests {
         let node_names: HashSet<&str> = sg.nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(node_names.contains("B"), "Start B missing");
         assert!(node_names.contains("C"), "Start C missing");
-        assert!(node_names.contains("D"), "Shared node D missing from intersection");
+        assert!(
+            node_names.contains("D"),
+            "Shared node D missing from intersection"
+        );
     }
 
     #[test]
@@ -832,7 +859,10 @@ mod tests {
         // With threshold=2, E should appear only if reached by both beams.
         // Both B→D→E and C→D→E exist, so E should be hit by both.
         assert!(node_names.contains("D"), "D should be in intersection");
-        assert!(node_names.contains("E"), "E reachable from both beams via D");
+        assert!(
+            node_names.contains("E"),
+            "E reachable from both beams via D"
+        );
     }
 
     #[test]
