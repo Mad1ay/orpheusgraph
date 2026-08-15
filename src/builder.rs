@@ -84,6 +84,20 @@ fn build_graph_inner(
             }
         }
     }
+    // Canonical insertion order: sort the deduped nodes by (unique) name.
+    // petgraph node indices then follow name order regardless of input order.
+    // This is what determinism actually needs: compute_pagerank does
+    // `new_scores[target] += share` inside an OUTER `for node_idx in
+    // graph.node_indices()` loop over SOURCE nodes, so the summation order into
+    // each target's accumulator is exactly that source node-index order — now
+    // name-canonical. The INNER loop (one source's outgoing neighbors) touches
+    // each distinct target at most once per source, so within a single source
+    // the edge/neighbor insertion order never changes which additions land in a
+    // target's cell — only the outer node-iteration order does, and only it
+    // needs to be canonicalized. f32 addition is non-associative, so without
+    // this sort two orderings of identical inputs yield ~ULP-different
+    // pagerank_weight and thus non-byte-identical snapshots (determinism bug).
+    deduped.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Sanitize weights before normalization: a single non-finite base_weight
     // would otherwise make the fold-max non-finite and divide every node to
