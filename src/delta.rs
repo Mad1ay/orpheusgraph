@@ -553,10 +553,12 @@ impl GraphAccessor for DeltaAccessor<'_> {
     }
 
     fn get_node(&self, name: &str) -> Option<NodeView> {
-        if let Some(nd) = self.delta.added_nodes.get(name) {
-            return Some(NodeView::from(nd)); // shadow wins (§3.3 rule 1)
+        if !self.delta.added_nodes.is_empty() {
+            if let Some(nd) = self.delta.added_nodes.get(name) {
+                return Some(NodeView::from(nd)); // shadow wins (§3.3 rule 1)
+            }
         }
-        if self.delta.removed_nodes.contains(name) {
+        if !self.delta.removed_nodes.is_empty() && self.delta.removed_nodes.contains(name) {
             return None; // tombstoned
         }
         self.base.get_node(name)
@@ -566,29 +568,42 @@ impl GraphAccessor for DeltaAccessor<'_> {
         if self.delta.is_empty() {
             return self.base.outgoing_neighbors(name); // §4.5 fast path
         }
-        if self.delta.removed_nodes.contains(name) {
+        let removed_nodes = &self.delta.removed_nodes;
+        let removed_edges = &self.delta.removed_edges;
+        if !removed_nodes.is_empty() && removed_nodes.contains(name) {
             return vec![]; // tombstoned node exposes nothing
         }
 
-        let mut out: Vec<NeighborView> = self
-            .base
-            .outgoing_neighbors(name)
-            .into_iter()
-            .filter(|nb| {
-                !self.delta.removed_nodes.contains(&nb.target_name)
-                    && !self.delta.removed_edges.contains(&(
+        // Reuse the base's Vec and mask IN PLACE. The edge-mask check builds a
+        // 3-String tuple key per base edge, so both mask checks run ONLY when
+        // their tombstone set is actually non-empty — an additive delta (the
+        // common case) pays zero allocations here, just the base call plus the
+        // out_index probe below, instead of a `filter().collect()` that cloned
+        // three strings per base edge on every visit regardless of removals.
+        let mut out = self.base.outgoing_neighbors(name);
+        if !removed_nodes.is_empty() || !removed_edges.is_empty() {
+            out.retain(|nb| {
+                if !removed_nodes.is_empty() && removed_nodes.contains(&nb.target_name) {
+                    return false;
+                }
+                if !removed_edges.is_empty()
+                    && removed_edges.contains(&(
                         name.to_string(),
                         nb.target_name.clone(),
                         nb.edge_kind.clone(),
                     ))
-            })
-            .collect();
+                {
+                    return false;
+                }
+                true
+            });
+        }
 
         // Delta edges appended AFTER base edges, in insertion order.
         if let Some(positions) = self.delta.out_index.get(name) {
             for &p in positions {
                 let e = &self.delta.added_edges[p as usize];
-                if e.dead || self.delta.removed_nodes.contains(&e.to) {
+                if e.dead || (!removed_nodes.is_empty() && removed_nodes.contains(&e.to)) {
                     continue;
                 }
                 out.push(NeighborView {
@@ -606,29 +621,37 @@ impl GraphAccessor for DeltaAccessor<'_> {
         if self.delta.is_empty() {
             return self.base.incoming_neighbors(name); // §4.5 fast path
         }
-        if self.delta.removed_nodes.contains(name) {
+        let removed_nodes = &self.delta.removed_nodes;
+        let removed_edges = &self.delta.removed_edges;
+        if !removed_nodes.is_empty() && removed_nodes.contains(name) {
             return vec![];
         }
 
-        // For incoming edges, NeighborView.target_name carries the SOURCE.
-        let mut inc: Vec<NeighborView> = self
-            .base
-            .incoming_neighbors(name)
-            .into_iter()
-            .filter(|nb| {
-                !self.delta.removed_nodes.contains(&nb.target_name)
-                    && !self.delta.removed_edges.contains(&(
+        // For incoming edges, NeighborView.target_name carries the SOURCE. Same
+        // in-place, allocation-free-on-additive-delta masking as outgoing above.
+        let mut inc = self.base.incoming_neighbors(name);
+        if !removed_nodes.is_empty() || !removed_edges.is_empty() {
+            inc.retain(|nb| {
+                if !removed_nodes.is_empty() && removed_nodes.contains(&nb.target_name) {
+                    return false;
+                }
+                if !removed_edges.is_empty()
+                    && removed_edges.contains(&(
                         nb.target_name.clone(),
                         name.to_string(),
                         nb.edge_kind.clone(),
                     ))
-            })
-            .collect();
+                {
+                    return false;
+                }
+                true
+            });
+        }
 
         if let Some(positions) = self.delta.in_index.get(name) {
             for &p in positions {
                 let e = &self.delta.added_edges[p as usize];
-                if e.dead || self.delta.removed_nodes.contains(&e.from) {
+                if e.dead || (!removed_nodes.is_empty() && removed_nodes.contains(&e.from)) {
                     continue;
                 }
                 inc.push(NeighborView {
