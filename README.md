@@ -136,6 +136,10 @@ with og.create_persistent(
 > store; `create_persistent` refuses to clobber an existing one. Weights passed to `apply`
 > must already be normalized to `[0.0, 1.0]` — an out-of-range value raises `ValueError`.
 
+> The on-disk snapshot format is **V2**, which persists a `name -> idx` index inside the
+> snapshot for O(1) warm-open (no per-open index build). Stores written by an older build
+> are not auto-migrated — `open()` raises `CorruptError`; recreate the store.
+
 ## API Reference
 
 ### `build_graph(nodes, edges) → OrpheusGraph`

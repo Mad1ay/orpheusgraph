@@ -8,12 +8,12 @@ use std::path::Path;
 
 use crate::persist::error::PersistError;
 
-/// Highest on-disk `format_version` this build understands. `0` is the flat
-/// rkyv format (Phase 2a, ephemeral/Redis path); `1` is the CSR mmap snapshot
-/// (Phase 2b). The gate rejects anything `> FORMAT_VERSION`, so this build reads
-/// BOTH 0 and 1. `create()` writes 1 going forward; V0 stores still open (as
-/// owned, never mmap-traversed).
-pub const FORMAT_VERSION: u32 = 1;
+/// Highest on-disk `format_version` this build understands. `2` is the CSR mmap
+/// snapshot with a persisted `name -> idx` open-addressing index (O(1) zero-copy
+/// lookup, no per-open index build). Legacy `0` (flat rkyv, Phase 2a) and `1`
+/// (CSR without the persisted index, Phase 2b) are REJECTED at open — recreate
+/// the store to migrate. `create()`/compaction write `2` going forward.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// `created_by` stamp written into every MANIFEST.
 pub const CREATED_BY: &str = concat!("orpheusgraph ", env!("CARGO_PKG_VERSION"));
@@ -22,10 +22,11 @@ pub const CREATED_BY: &str = concat!("orpheusgraph ", env!("CARGO_PKG_VERSION"))
 /// forward-tolerant; the `format_version` gate rejects unknown layouts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
-    /// On-disk snapshot encoding version (0: flat rkyv; 1: CSR mmap). Gate rejects `>`.
+    /// On-disk snapshot encoding version. 2 = current CSR-mmap-with-persisted-
+    /// name-index; 0 (flat rkyv) and 1 (CSR without the index) are legacy and
+    /// rejected at open. The gate also rejects anything `> FORMAT_VERSION`.
     pub format_version: u32,
-    /// Snapshot filename: `snapshot-{seq:020}.og` (V0) or
-    /// `snapshot-{seq:020}-{cid:010}.og` (V1, cid = compaction id).
+    /// Snapshot filename: `snapshot-{seq:020}-{cid:010}.og` (cid = compaction id).
     pub snapshot_file: String,
     /// Seq folded into the snapshot; WAL frames `<=` this are already durable.
     pub snapshot_seq: u64,

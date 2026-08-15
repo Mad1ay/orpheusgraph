@@ -13,7 +13,26 @@ All notable changes to orpheusgraph.
 - Read API identical to `OrpheusGraph` over the live base+delta view: `.get_node`, `.outgoing_edges`, `.incoming_edges`, `.beam_traverse`, `.find_path`, `.contextual_subgraph`, `.multi_beam_intersection`; GIL released during traversal and during `apply`/`flush`/`compact`/`close`
 - `.flush()`, `.compact()` (also auto-fires by threshold), `.set_fsync_policy()`, `.set_auto_compact_threshold()`, `.close()` (idempotent) + context-manager support (`with orpheusgraph.open(...) as g:`)
 - New exceptions: `orpheusgraph.ConflictError`, `orpheusgraph.CorruptError`
-- `build_graph`/`to_rkyv`/`from_rkyv` and the ephemeral in-memory workflow unchanged
+- `to_rkyv`/`from_rkyv` unchanged, but `build_graph` now sorts input nodes by name
+  before petgraph insertion so PageRank's summation order is canonical regardless of
+  input order (previously order-dependent, since f32 addition is non-associative) —
+  this applies to the ephemeral in-memory workflow too, so a caller relying on the
+  prior `to_rkyv()` byte layout or exact `pagerank_weight` bits for identical inputs
+  will see different (now-deterministic) output — a bugfix, but a behavior change
+- `PersistentGraph` on-disk snapshot format bumped to **V2**: a persisted open-addressing
+  `name -> idx` index (`name_buckets`, FNV-1a) built once at write time, giving O(1)
+  warm-open (no more eager per-open index build) and O(1) lookup while preserving mmap
+  larger-than-RAM lazy paging
+- Legacy snapshot formats 0 and 1 are now rejected at `open()` (`CorruptError`) instead of
+  being read — pre-release, no in-place migration; recreate the store
+- `DeltaAccessor` (internal delta-overlay reader): fixed an allocation regression in
+  `outgoing_neighbors`/`incoming_neighbors` — a per-base-edge 3-`String` tuple
+  tombstone-probe key was built even when the delta had no removals; now masks the base
+  edge list in place and skips the tombstone check entirely when there's nothing to mask
+  (`get_node`'s empty-set short-circuits are a readability win, not an allocation fix —
+  `HashMap::get`/`HashSet::contains` never allocated)
+- Added `benches/bench_persist.rs`: `apply`, warm-`open`, delta-traversal-overhead, and
+  CSR-vs-petgraph-beam benchmarks for the persistent store (spec §6)
 
 ### Sprint 1 — Core Types & Builder
 - `NodeData`, `EdgeData`, `DynamicContext`, `PathStep` types

@@ -18,10 +18,11 @@
 //!   timeline fork (§4.3). No recovery path panics on disk bytes.
 //!
 //! ## Phase 2b (this module + [`snapshot`])
-//! `create()` now writes the **V1 CSR** snapshot (`format_version` 1); `open()`
-//! reads BOTH V0 (flat, always materialized [`BaseGraph::Owned`], never
-//! mmap-traversed) and V1 (mmap-traversed [`BaseGraph::Archived`], honoring
-//! [`BaseMode`]/[`Validate`]/`prefault`). Added: crash-safe [`compact`] +
+//! `create()` writes the **V2 CSR** snapshot (`format_version` 2); `open()`
+//! reads ONLY V2 (mmap-traversed [`BaseGraph::Archived`], honoring
+//! [`BaseMode`]/[`Validate`]/`prefault`) and REJECTS legacy formats 0 and 1 as
+//! [`PersistError::Corrupt`] — pre-release, no in-place migration; recreate
+//! the store instead. Added: crash-safe [`compact`] +
 //! auto-compaction (fold the delta into a fresh base), a two-tier snapshot GC
 //! (inline post-compaction delete + open-time orphan sweep), and the §5.1
 //! trust-boundary validation of untrusted snapshots. The CSR format, the
@@ -39,7 +40,6 @@ use crate::accessor::GraphAccessor;
 use crate::builder::{build_graph, build_graph_prenormalized};
 use crate::delta::{materialize, GraphDelta, Op};
 use crate::graph::OrpheusGraphInner;
-use crate::serialization::from_rkyv_rebuild;
 
 mod error;
 mod lock;
@@ -55,7 +55,7 @@ use manifest::{
     fsync_dir, mint_epoch, read_manifest, write_file_atomic, write_manifest_atomic, Manifest,
     CREATED_BY, FORMAT_VERSION,
 };
-use snapshot::{open_snapshot, to_rkyv_v1};
+use snapshot::{open_snapshot, to_rkyv_v2};
 use wal::{read_and_scan, WalRecord, WalWriter};
 
 /// When the WAL is forced to durable storage.
@@ -77,8 +77,7 @@ pub enum FsyncPolicy {
 /// pages the CSR file lazily). `Owned` materializes a petgraph at open —
 /// exactly the 2a hot path, and the mandatory choice for network /
 /// larger-than-RAM-under-pressure callers who must read + validate up front
-/// rather than risk a lazy-fault SIGBUS (§4.5). A V0 store is ALWAYS loaded as
-/// `Owned` regardless of this setting (it has no CSR to mmap-traverse).
+/// rather than risk a lazy-fault SIGBUS (§4.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BaseMode {
     Owned,
@@ -87,7 +86,7 @@ pub enum BaseMode {
 }
 
 /// The base half of a [`GraphState`]. `Owned` is a materialized petgraph;
-/// `Archived` is a zero-copy CSR view over a memory-mapped V1 snapshot (§4.4b).
+/// `Archived` is a zero-copy CSR view over a memory-mapped V2 snapshot (§4.4b).
 pub enum BaseGraph {
     Owned(OrpheusGraphInner),
     Archived(ArchivedCsrView),
@@ -146,10 +145,11 @@ struct Writer {
     snapshot_file: String,
     snapshot_crc32: u32,
     /// On-disk snapshot encoding version of the CURRENT `snapshot_file`. Tracked
-    /// per-writer (not the FORMAT_VERSION constant) so a V0 store rewritten by
-    /// close()/open() keeps `format_version=0` until it is actually compacted to
-    /// V1 — otherwise the next open would mmap-CSR a flat V0 file. Compaction
-    /// sets it to 1.
+    /// per-writer rather than just reading the FORMAT_VERSION constant so this
+    /// field stays faithful to what's actually on disk (relevant if a future
+    /// format bump adds a live in-place upgrade path). Today `open()` rejects
+    /// any format below FORMAT_VERSION outright (legacy 0/1 -> `Corrupt`), so
+    /// this is always FORMAT_VERSION for any store that opened successfully.
     format_version: u32,
     /// Monotonic compaction id; the current snapshot's cid (§4.4b).
     compaction_id: u64,
@@ -224,17 +224,17 @@ fn auto_compact_threshold(base_node_count: usize) -> usize {
 }
 
 /// V0 flat-snapshot filename (legacy; still matched by the GC prefix/suffix
-/// rule). Only the V0 back-compat test writes one now; V1 uses
-/// [`snapshot_v1_name`].
+/// rule). Only the V0 back-compat test writes one now; V2 uses
+/// [`snapshot_v2_name`].
 #[cfg(test)]
 fn snapshot_name(seq: u64) -> String {
     format!("snapshot-{seq:020}.og")
 }
 
-/// V1 CSR snapshot filename. The monotonic `cid` makes successive filenames
+/// V2 CSR snapshot filename. The monotonic `cid` makes successive filenames
 /// distinct even when `seq` is unchanged (compaction folds AT the current seq),
 /// so the post-compaction GC can always name a file distinct from the live one.
-fn snapshot_v1_name(seq: u64, cid: u64) -> String {
+fn snapshot_v2_name(seq: u64, cid: u64) -> String {
     format!("snapshot-{seq:020}-{cid:010}.og")
 }
 
@@ -313,11 +313,11 @@ impl PersistentGraph {
             )));
         }
 
-        // Snapshot (V1 CSR going forward), crc-guarded, atomically written.
-        let bytes = to_rkyv_v1(&base_graph);
+        // Snapshot (V2 CSR going forward), crc-guarded, atomically written.
+        let bytes = to_rkyv_v2(&base_graph);
         let snapshot_crc32 = crc32fast::hash(&bytes);
         let compaction_id = 0u64;
-        let snapshot_file = snapshot_v1_name(0, compaction_id);
+        let snapshot_file = snapshot_v2_name(0, compaction_id);
         write_file_atomic(&dir, &snapshot_file, &bytes)?;
 
         // Empty WAL, durably created.
@@ -394,8 +394,9 @@ impl PersistentGraph {
     }
 
     /// [`open`](Self::open) with explicit base [`BaseMode`], [`Validate`] mode
-    /// and `prefault` (madvise WILLNEED). A V0 store is always loaded as `Owned`
-    /// regardless of `mode`; `validate`/`prefault` apply only to the V1 CSR path.
+    /// and `prefault` (madvise WILLNEED), applied to the V2 CSR path — the only
+    /// format `open()` accepts. Legacy formats 0 and 1 are rejected before any
+    /// of these options are consulted (see the `format_version` match below).
     pub fn open_with(
         dir: impl AsRef<Path>,
         create: bool,
@@ -438,25 +439,25 @@ impl PersistentGraph {
         let clean_shutdown = manifest.clean_shutdown;
         let snapshot_seq = manifest.snapshot_seq;
 
-        // 2. Load + integrity-check the snapshot, branching on format_version.
-        //    V0 (flat) is ALWAYS materialized as Owned and NEVER mmap-traversed
-        //    (it has no CSR); V1 honors mode/validate/prefault via open_snapshot,
-        //    whose full/crc modes do the crc check internally.
+        // 2. Load + integrity-check the snapshot. Only format_version 2 (V2 CSR)
+        //    is accepted below (legacy 0/1 are rejected, see the match arm's own
+        //    comment); the accepted path honors mode/validate/prefault via
+        //    open_snapshot, whose full/crc modes do the crc check internally.
         let snap_path = dir.join(&manifest.snapshot_file);
         let base = match manifest.format_version {
-            0 => {
-                let snap_bytes = std::fs::read(&snap_path)?;
-                let computed = crc32fast::hash(&snap_bytes);
-                if computed != manifest.snapshot_crc32 {
-                    return Err(PersistError::Corrupt(format!(
-                        "snapshot crc mismatch: computed {computed}, manifest {}",
-                        manifest.snapshot_crc32
-                    )));
-                }
-                let inner = from_rkyv_rebuild(&snap_bytes).map_err(PersistError::Corrupt)?;
-                Arc::new(BaseGraph::Owned(inner))
+            // V0 (flat) and V1 (CSR without the persisted name index) are legacy
+            // on-disk formats this build no longer reads. They are REJECTED, not
+            // silently upgraded, so a stale store fails loudly instead of feeding
+            // a mislabelled snapshot to the V2 reader. Recreate the store to
+            // migrate (pre-release: no in-place migration path).
+            0 | 1 => {
+                return Err(PersistError::Corrupt(format!(
+                    "legacy snapshot format_version {} is no longer supported \
+                     (recreate the store; current format is {FORMAT_VERSION})",
+                    manifest.format_version
+                )))
             }
-            1 => Arc::new(open_snapshot(
+            2 => Arc::new(open_snapshot(
                 &snap_path,
                 mode,
                 validate,
@@ -564,9 +565,11 @@ impl PersistentGraph {
 
         // 6. Persist clean_shutdown=false for this (now open) incarnation. This
         //    also lands the possibly re-minted epoch from step 5. format_version
-        //    and compaction_id are PRESERVED from the on-disk manifest — writing
-        //    the FORMAT_VERSION constant here would mislabel a still-flat V0
-        //    snapshot as V1 and brick the next open.
+        //    and compaction_id are PRESERVED from the on-disk manifest rather
+        //    than overwritten with the FORMAT_VERSION constant, so this stays
+        //    correct if a future format bump adds an in-place upgrade path
+        //    (today it is always FORMAT_VERSION, since anything older is
+        //    rejected in step 2).
         let out_manifest = Manifest {
             format_version: manifest.format_version,
             snapshot_file: manifest.snapshot_file.clone(),
@@ -591,7 +594,7 @@ impl PersistentGraph {
         //     snapshots (and any Windows-deferred deletes) left by a compaction
         //     that died between writing a new snapshot and renaming the MANIFEST.
         //     Runs under the writer lock, before priming; never touches the live
-        //     file. For V1 mmap the live file is already mapped in `base` — on
+        //     file. For V2 mmap the live file is already mapped in `base` — on
         //     Linux unlinking OTHER snapshots is safe.
         gc_orphan_snapshots(&dir, &manifest.snapshot_file);
 
@@ -766,8 +769,8 @@ impl PersistentGraph {
         let (g, idx) = build_graph_prenormalized(nodes, edges);
         let folded = OrpheusGraphInner::new(g, idx);
 
-        // 2. Serialize V1 CSR + crc.
-        let bytes = to_rkyv_v1(&folded);
+        // 2. Serialize V2 CSR + crc.
+        let bytes = to_rkyv_v2(&folded);
         let new_crc = crc32fast::hash(&bytes);
 
         // 3. New filename: fold AT the current seq, monotonic cid guarantees a
@@ -776,14 +779,14 @@ impl PersistentGraph {
         let fold_seq = w.seq;
         let new_cid = w.compaction_id + 1;
         let old_snapshot_file = w.snapshot_file.clone();
-        let new_snapshot_file = snapshot_v1_name(fold_seq, new_cid);
+        let new_snapshot_file = snapshot_v2_name(fold_seq, new_cid);
 
         // 4. Write the new snapshot durably (tmp+fsync+rename+fsync(dir)).
         write_file_atomic(&self.dir, &new_snapshot_file, &bytes)?;
 
-        // 5. Commit point: rename the MANIFEST to point at the new V1 snapshot.
+        // 5. Commit point: rename the MANIFEST to point at the new V2 snapshot.
         let new_manifest = Manifest {
-            format_version: 1,
+            format_version: FORMAT_VERSION,
             snapshot_file: new_snapshot_file.clone(),
             snapshot_seq: fold_seq,
             snapshot_crc32: new_crc,
@@ -808,7 +811,7 @@ impl PersistentGraph {
         w.snapshot_seq = fold_seq;
         w.snapshot_file = new_snapshot_file.clone();
         w.snapshot_crc32 = new_crc;
-        w.format_version = 1;
+        w.format_version = FORMAT_VERSION;
         w.compaction_id = new_cid;
         // fold_seq is now durable IN THE SNAPSHOT (fsync'd + renamed above), so
         // the durable high-water advances to it even under OnFlush.
@@ -823,7 +826,7 @@ impl PersistentGraph {
         //    the just-built inner (no mmap round-trip); mode=Mmap drops it and
         //    re-mmaps the freshly-written file with validate=None (sound — this
         //    process wrote it this run) so a months-long larger-than-RAM process
-        //    actually stays on mmap. V0-opened stores upgrade to V1 mmap here.
+        //    actually stays on mmap.
         let new_base = match w.mode {
             BaseMode::Owned => Arc::new(BaseGraph::Owned(folded)),
             BaseMode::Mmap => {
@@ -974,10 +977,10 @@ impl PersistentGraph {
         let (nodes, edges) = materialize(w.base.as_accessor(), &base_node_names, &w.delta);
         let (g, idx) = build_graph(nodes, edges);
         let folded = OrpheusGraphInner::new(g, idx);
-        let bytes = to_rkyv_v1(&folded);
+        let bytes = to_rkyv_v2(&folded);
         let crc = crc32fast::hash(&bytes);
         let new_cid = w.compaction_id + 1;
-        let file = snapshot_v1_name(w.seq, new_cid);
+        let file = snapshot_v2_name(w.seq, new_cid);
         (bytes, crc, file, w.seq, new_cid)
     }
 
@@ -1725,7 +1728,7 @@ mod tests {
             let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![]))
                 .unwrap();
             pg.apply(vec![upsert("a", "m")], None).unwrap();
-            pg.compact().unwrap(); // ensure a V1 snapshot exists
+            pg.compact().unwrap(); // ensure a V2 snapshot exists
             pg.close().unwrap();
         }
         // Bit-rot the snapshot file (crc will mismatch).
@@ -1916,7 +1919,7 @@ mod tests {
         let (bytes, crc, file, fold_seq, cid) = pg.test_fold_bytes();
         write_file_atomic(dir.path(), &file, &bytes).unwrap();
         let mut m = read_manifest(&dir.path().join("MANIFEST.json")).unwrap();
-        m.format_version = 1;
+        m.format_version = FORMAT_VERSION;
         m.snapshot_file = file.clone();
         m.snapshot_seq = fold_seq;
         m.snapshot_crc32 = crc;
@@ -2144,67 +2147,45 @@ mod tests {
         assert!(acc.get_node("n11").is_some());
     }
 
-    // ---- format_version 0 back-compat ----------------------------------
+    // ---- legacy format_version 0 / 1 are rejected ----------------------
 
     #[test]
-    fn v0_store_opens_owned_never_mmap() {
-        let dir = tempfile::tempdir().unwrap();
-        // Hand-build a V0 store: flat rkyv snapshot + format_version 0 MANIFEST +
-        // empty WAL. This mirrors the retired 2a create() path.
-        let base = base_inner(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
-        let bytes = to_rkyv(&base);
-        let crc = crc32fast::hash(&bytes);
-        let file = snapshot_name(0);
-        write_file_atomic(dir.path(), &file, &bytes).unwrap();
-        {
-            let f = std::fs::File::create(dir.path().join("wal.log")).unwrap();
-            f.sync_all().unwrap();
-        }
-        let m = Manifest {
-            format_version: 0,
-            snapshot_file: file.clone(),
-            snapshot_seq: 0,
-            snapshot_crc32: crc,
-            compaction_id: 0,
-            epoch: 123456789,
-            high_seq: 0,
-            clean_shutdown: true,
-            created_by: "test-v0".into(),
-            checksum: 0,
-        };
-        write_manifest_atomic(dir.path(), &m).unwrap();
+    fn legacy_format_versions_are_rejected() {
+        // A legacy store (flat V0 rkyv snapshot + a MANIFEST tagging it) must be
+        // rejected as Corrupt, not silently opened by the V2 reader. Same for a
+        // MANIFEST claiming V1. Both are `< FORMAT_VERSION`, so they slip past the
+        // `> FORMAT_VERSION` gate and are caught by the explicit legacy arm.
+        for legacy in [0u32, 1u32] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base_inner(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
+            let bytes = to_rkyv(&base);
+            let crc = crc32fast::hash(&bytes);
+            let file = snapshot_name(0);
+            write_file_atomic(dir.path(), &file, &bytes).unwrap();
+            {
+                let f = std::fs::File::create(dir.path().join("wal.log")).unwrap();
+                f.sync_all().unwrap();
+            }
+            let m = Manifest {
+                format_version: legacy,
+                snapshot_file: file.clone(),
+                snapshot_seq: 0,
+                snapshot_crc32: crc,
+                compaction_id: 0,
+                epoch: 123456789,
+                high_seq: 0,
+                clean_shutdown: true,
+                created_by: "test-legacy".into(),
+                checksum: 0,
+            };
+            write_manifest_atomic(dir.path(), &m).unwrap();
 
-        // Even with mode=Mmap requested, a V0 store must load as Owned.
-        let pg =
-            PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false)
-                .unwrap();
-        {
-            let s = pg.snapshot();
+            let err = PersistentGraph::open(dir.path(), false).unwrap_err();
             assert!(
-                matches!(s.base.as_ref(), BaseGraph::Owned(_)),
-                "V0 must be Owned, never mmap"
-            );
-            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
-            assert_eq!(out_pairs(&acc, "a"), vec![("b".into(), "rel".into())]);
-        }
-
-        // Applying + compacting upgrades it to V1 (migration path).
-        pg.apply(vec![upsert("c", "m"), addedge("b", "c", "rel")], None)
-            .unwrap();
-        pg.compact().unwrap();
-        {
-            let s = pg.snapshot();
-            assert!(
-                matches!(s.base.as_ref(), BaseGraph::Archived(_)),
-                "post-compaction base should be V1 mmap"
+                matches!(err, PersistError::Corrupt(_)),
+                "legacy format_version {legacy} must be rejected as Corrupt, got {err:?}"
             );
         }
-        drop(pg);
-        // Reopen reads the now-V1 manifest and mmaps.
-        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
-        let s = pg2.snapshot();
-        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
-        assert!(acc.get_node("c").is_some());
     }
 
     // ---- property: compaction preserves the logical graph --------------

@@ -1,10 +1,10 @@
-//! # V1 CSR snapshot format + mmap-traversed archived accessor (Phase 2b)
+//! # V2 CSR snapshot format + mmap-traversed archived accessor (Phase 2b)
 //!
 //! This module is the persistent-store-only snapshot path. It is deliberately
 //! separate from [`crate::serialization`] (the legacy ephemeral/Redis V0 flat
 //! path, `format_version` 0, never mmap-traversed):
 //!
-//! * V1 is a **CSR** (compressed-sparse-row) layout — `nodes`, `edges`,
+//! * V2 is a **CSR** (compressed-sparse-row) layout — `nodes`, `edges`,
 //!   `node_offsets` (outgoing), plus `in_offsets` + `in_mirror` (incoming) —
 //!   so neighbor expansion is `O(degree)` over a memory-mapped file with no
 //!   per-open build cost beyond the `name → idx` index. This fixes the §4.4b
@@ -15,7 +15,7 @@
 //!   §5.1 semantic sweep in one auditable place.
 //!
 //! ## Trust boundary (§5.1)
-//! [`validate_v1`] with [`Validate::Full`] is MANDATORY for any untrusted
+//! [`validate_v2`] with [`Validate::Full`] is MANDATORY for any untrusted
 //! (shared/remote/network) snapshot: it checks the crc, runs rkyv structural
 //! (`bytecheck`) validation, and then a linear `O(N+E)` semantic sweep that
 //! proves every edge endpoint is in range, `node_offsets`/`in_offsets` are
@@ -39,10 +39,10 @@ use super::BaseGraph;
 use super::BaseMode;
 
 // ---------------------------------------------------------------------------
-// V1 CSR archive types
+// V2 CSR archive types
 // ---------------------------------------------------------------------------
 
-/// V1 CSR snapshot. Reuses [`NodeData`] for nodes and a dedicated [`CsrEdge`]
+/// V2 CSR snapshot. Reuses [`NodeData`] for nodes and a dedicated [`CsrEdge`]
 /// for edges. The offset arrays are the CSR machinery:
 ///
 /// * `node_offsets` (len `N+1`): outgoing CSR keyed by `from_idx`. Node `i`'s
@@ -52,18 +52,126 @@ use super::BaseMode;
 ///   `in_mirror[in_offsets[j] .. in_offsets[j+1]]`. `in_mirror` is a permutation
 ///   of `0..E`. `in_offsets` alone would force an `O(E)` scan to find a node's
 ///   incoming group, so it is validated with the same rules as `node_offsets`.
+/// * `name_buckets` (len a power of two `> N`): a persisted open-addressing hash
+///   index, `fnv1a(name) & (M-1)` with linear probing, each slot holding a node
+///   index or `EMPTY_BUCKET`. It moves `name -> idx` resolution from an O(N)
+///   per-open build (which faulted every node into RAM, defeating larger-than-
+///   RAM mmap) to a zero-copy O(1) probe over the mapped bytes (§4.5). The fixed
+///   FNV-1a hash + name-sorted node order make the built table byte-deterministic.
 #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(derive(Debug))]
-pub struct SerializableGraphV1 {
-    pub nodes: Vec<NodeData>,
+pub struct SerializableGraphV2 {
+    pub nodes: Vec<CsrNode>,
     pub edges: Vec<CsrEdge>,
     pub node_offsets: Vec<u32>,
     pub in_offsets: Vec<u32>,
     pub in_mirror: Vec<u32>,
+    pub name_buckets: Vec<u32>,
+}
+
+/// A snapshot node. Mirrors [`NodeData`] but stores `metadata` as a
+/// **key-sorted `Vec`** instead of a `HashMap`. rkyv archives a `HashMap` in its
+/// (per-instance, `RandomState`-seeded) iteration order, so the same node's
+/// metadata would serialize to different bytes each run — breaking the byte-
+/// determinism guarantee. A sorted `Vec<(String, String)>` archives to a stable,
+/// order-independent layout (and rkyv archives it without the `ArchiveContext`
+/// bound a `BTreeMap` field would impose). Keys are unique (from a `HashMap`), so
+/// the sort is a total order.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct CsrNode {
+    pub name: String,
+    pub kind: String,
+    pub metadata: Vec<(String, String)>,
+    pub base_weight: f32,
+    pub noise_penalty: f32,
+    pub pagerank_weight: f32,
+}
+
+impl CsrNode {
+    /// Convert a runtime [`NodeData`] into a deterministic snapshot node
+    /// (metadata sorted by key).
+    fn from_node_data(nd: &NodeData) -> Self {
+        let mut metadata: Vec<(String, String)> = nd
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        metadata.sort();
+        Self {
+            name: nd.name.clone(),
+            kind: nd.kind.clone(),
+            metadata,
+            base_weight: nd.base_weight,
+            noise_penalty: nd.noise_penalty,
+            pagerank_weight: nd.pagerank_weight,
+        }
+    }
+
+    /// Convert back to a runtime [`NodeData`] (used by the `Owned`-mode rebuild).
+    fn into_node_data(self) -> NodeData {
+        NodeData {
+            name: self.name,
+            kind: self.kind,
+            metadata: self.metadata.into_iter().collect(),
+            base_weight: self.base_weight,
+            noise_penalty: self.noise_penalty,
+            pagerank_weight: self.pagerank_weight,
+        }
+    }
+}
+
+/// Empty-slot sentinel in `name_buckets`. Node count is capped well below this
+/// (indices are `u32`), so it never collides with a real index.
+pub const EMPTY_BUCKET: u32 = u32::MAX;
+
+/// Deterministic 64-bit FNV-1a over raw bytes. Pure integer arithmetic, so it is
+/// identical across platforms and endianness (unlike a randomly-seeded SipHash),
+/// which is what keeps the persisted `name_buckets` layout byte-reproducible.
+#[inline]
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// Table size for `n` entries at a ~0.7 load factor: the next power of two
+/// strictly greater than `n` and `>= n / 0.7`. Strictly greater guarantees at
+/// least one `EMPTY_BUCKET`, so linear probing always terminates.
+fn bucket_capacity(n: usize) -> usize {
+    // n * 10 / 7 ≈ n / 0.7; +1 guarantees strictly-greater-than-n even when the
+    // ratio rounds down. `next_power_of_two` of that; min 2 so `M-1` masks work.
+    // Fully saturating so there is no overflow discontinuity (unreachable for the
+    // u32-bounded node count, but keeps the function total for any usize).
+    let want = (n.saturating_mul(10) / 7)
+        .saturating_add(1)
+        .max(n.saturating_add(1));
+    want.checked_next_power_of_two().unwrap_or(want).max(2)
+}
+
+/// Build the open-addressing `name -> idx` table for name-sorted `nodes`.
+/// Deterministic: fixed hash, fixed (sorted) insertion order, linear probing.
+fn build_name_buckets(nodes: &[NodeData]) -> Vec<u32> {
+    let m = bucket_capacity(nodes.len());
+    let mask = (m - 1) as u64;
+    let mut buckets = vec![EMPTY_BUCKET; m];
+    for (i, node) in nodes.iter().enumerate() {
+        let mut slot = (fnv1a(node.name.as_bytes()) & mask) as usize;
+        while buckets[slot] != EMPTY_BUCKET {
+            slot = (slot + 1) & (mask as usize);
+        }
+        buckets[slot] = i as u32;
+    }
+    buckets
 }
 
 /// A CSR edge stored by node indices. Distinct from
-/// [`crate::serialization::SerializableEdge`] so V1 stays self-contained.
+/// [`crate::serialization::SerializableEdge`] so V2 stays self-contained.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct CsrEdge {
@@ -75,10 +183,10 @@ pub struct CsrEdge {
 }
 
 // ---------------------------------------------------------------------------
-// Serialization: OrpheusGraphInner -> V1 CSR bytes (deterministic)
+// Serialization: OrpheusGraphInner -> V2 CSR bytes (deterministic)
 // ---------------------------------------------------------------------------
 
-/// Serialize an owned graph to V1 CSR rkyv bytes.
+/// Serialize an owned graph to V2 CSR rkyv bytes.
 ///
 /// **Determinism** (spec: byte-identical for the same logical graph): nodes are
 /// emitted in total-order by `name` (names are unique keys); edges are emitted
@@ -87,7 +195,7 @@ pub struct CsrEdge {
 /// is a stable-by-index sort of `0..E` by `to_idx`. Two serializations of the
 /// same graph therefore produce identical bytes regardless of internal petgraph
 /// index order.
-pub fn to_rkyv_v1(graph: &OrpheusGraphInner) -> Vec<u8> {
+pub fn to_rkyv_v2(graph: &OrpheusGraphInner) -> Vec<u8> {
     let inner = graph.inner_graph();
 
     // 1. Deterministic node order: total-order by unique name.
@@ -153,26 +261,33 @@ pub fn to_rkyv_v1(graph: &OrpheusGraphInner) -> Vec<u8> {
         in_offsets[i + 1] += in_offsets[i];
     }
 
-    let sg = SerializableGraphV1 {
-        nodes,
+    // Persisted name -> idx index (built from the name-sorted nodes).
+    let name_buckets = build_name_buckets(&nodes);
+
+    // Snapshot nodes: metadata sorted for byte-determinism (see `CsrNode`).
+    let csr_nodes: Vec<CsrNode> = nodes.iter().map(CsrNode::from_node_data).collect();
+
+    let sg = SerializableGraphV2 {
+        nodes: csr_nodes,
         edges,
         node_offsets,
         in_offsets,
         in_mirror,
+        name_buckets,
     };
     rkyv::to_bytes::<rkyv::rancor::Error>(&sg)
-        .expect("rkyv V1 serialization failed")
+        .expect("rkyv V2 serialization failed")
         .to_vec()
 }
 
-/// Rebuild an owned [`OrpheusGraphInner`] from V1 CSR bytes (for `mode=Owned`).
+/// Rebuild an owned [`OrpheusGraphInner`] from V2 CSR bytes (for `mode=Owned`).
 ///
 /// The CSR offset arrays are ignored on rebuild — the petgraph is reconstructed
 /// from `nodes` + `edges(from_idx,to_idx)` alone, mirroring
 /// [`crate::serialization::from_rkyv_rebuild`].
-pub fn from_rkyv_rebuild_v1(data: &[u8]) -> Result<OrpheusGraphInner, String> {
-    let sg = rkyv::from_bytes::<SerializableGraphV1, rkyv::rancor::Error>(data)
-        .map_err(|e| format!("rkyv V1 deserialization failed: {e}"))?;
+pub fn from_rkyv_rebuild_v2(data: &[u8]) -> Result<OrpheusGraphInner, String> {
+    let sg = rkyv::from_bytes::<SerializableGraphV2, rkyv::rancor::Error>(data)
+        .map_err(|e| format!("rkyv V2 deserialization failed: {e}"))?;
 
     let edges: Vec<(usize, usize, EdgeData)> = sg
         .edges
@@ -190,7 +305,8 @@ pub fn from_rkyv_rebuild_v1(data: &[u8]) -> Result<OrpheusGraphInner, String> {
         })
         .collect();
 
-    Ok(rebuild_from_serialized(sg.nodes, edges))
+    let nodes: Vec<NodeData> = sg.nodes.into_iter().map(CsrNode::into_node_data).collect();
+    Ok(rebuild_from_serialized(nodes, edges))
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +324,7 @@ pub enum Validate {
     /// crc32 + rkyv structural only; SKIP the semantic sweep. For a file THIS
     /// process wrote but whose RAM copy it no longer trusts bit-for-bit — a
     /// matching crc proves the bytes are exactly what we wrote, and we only ever
-    /// write semantically-valid V1.
+    /// write semantically-valid V2.
     Crc,
     /// No crc, no structural walk, `access_unchecked` — `O(1)`. Permitted ONLY
     /// for a file the process itself wrote this run (e.g. the post-compaction
@@ -216,9 +332,9 @@ pub enum Validate {
     None,
 }
 
-/// Validate V1 bytes per `mode`. Never panics — every failure is a typed
+/// Validate V2 bytes per `mode`. Never panics — every failure is a typed
 /// [`PersistError`]. `expected_crc` is the crc recorded in the MANIFEST.
-pub fn validate_v1(bytes: &[u8], mode: Validate, expected_crc: u32) -> Result<(), PersistError> {
+pub fn validate_v2(bytes: &[u8], mode: Validate, expected_crc: u32) -> Result<(), PersistError> {
     match mode {
         Validate::None => Ok(()),
         Validate::Crc => {
@@ -239,25 +355,160 @@ fn check_crc(bytes: &[u8], expected_crc: u32) -> Result<(), PersistError> {
     let computed = crc32fast::hash(bytes);
     if computed != expected_crc {
         return Err(PersistError::Corrupt(format!(
-            "V1 snapshot crc mismatch: computed {computed}, expected {expected_crc}"
+            "V2 snapshot crc mismatch: computed {computed}, expected {expected_crc}"
         )));
     }
     Ok(())
 }
 
-fn access_checked(bytes: &[u8]) -> Result<&ArchivedSerializableGraphV1, PersistError> {
-    rkyv::access::<ArchivedSerializableGraphV1, rkyv::rancor::Error>(bytes)
-        .map_err(|e| PersistError::Corrupt(format!("V1 rkyv structural validation failed: {e}")))
+fn access_checked(bytes: &[u8]) -> Result<&ArchivedSerializableGraphV2, PersistError> {
+    rkyv::access::<ArchivedSerializableGraphV2, rkyv::rancor::Error>(bytes)
+        .map_err(|e| PersistError::Corrupt(format!("V2 rkyv structural validation failed: {e}")))
 }
 
 /// The §5.1 semantic sweep. One linear pass each over edges and the two CSR
 /// offset arrays; a single `seen` bitset proves `in_mirror` is a permutation.
 /// Consumes ONLY `.get()`/`.to_native()` — never index-panics.
-fn validate_csr(a: &ArchivedSerializableGraphV1) -> Result<(), PersistError> {
+fn validate_csr(a: &ArchivedSerializableGraphV2) -> Result<(), PersistError> {
     let n = a.nodes.len();
     let e = a.edges.len();
 
-    let corrupt = |msg: String| PersistError::Corrupt(format!("V1 CSR invalid: {msg}"));
+    let corrupt = |msg: String| PersistError::Corrupt(format!("V2 CSR invalid: {msg}"));
+
+    // --- nodes strictly name-sorted (=> names unique) ---
+    // `to_rkyv_v2` emits nodes in strict ascending name order. Enforcing it here
+    // does double duty: it proves node NAMES ARE UNIQUE, which is what makes the
+    // `name_buckets` reachability check below (which matches by index) equivalent
+    // to `idx_of` (which matches by name). Without uniqueness a hostile snapshot
+    // with two equally-named nodes would pass the table checks yet make one of
+    // them unreachable by name.
+    for i in 1..n {
+        let prev = a
+            .nodes
+            .get(i - 1)
+            .ok_or_else(|| corrupt("nodes short (sort check)".into()))?
+            .name
+            .as_str();
+        let cur = a
+            .nodes
+            .get(i)
+            .ok_or_else(|| corrupt("nodes short (sort check)".into()))?
+            .name
+            .as_str();
+        if prev >= cur {
+            return Err(corrupt(format!(
+                "nodes not strictly name-sorted at {i}: {prev:?} >= {cur:?}"
+            )));
+        }
+    }
+
+    // --- name_buckets: the persisted name -> idx hash index ---
+    // Lookups (`idx_of`) hash the query and linear-probe this table, confirming
+    // the real node name on each hit. A hostile/bit-rotted table can never cause
+    // UB (every access is `.get()`-bounded and probing is capped at `M`), but it
+    // could make lookups silently MISS an existing node. The checks close that:
+    //   (a) M is EXACTLY the canonical `bucket_capacity(N)` — a power of two > N
+    //       (so the mask is valid and >= 1 EMPTY_BUCKET exists => probes
+    //       terminate) AND bounded to Θ(N), so an attacker cannot inflate M to
+    //       make the O(M) bijection scan a super-linear validation-time DoS;
+    //   (b) occupied slots form a bijection with 0..N (each node index appears
+    //       exactly once, in range) — no duplicates, no phantom indices;
+    //   (c) reachability — `idx_of(name[i]) == Some(i)` for every node, checked
+    //       via the linear-probe invariant (see below), NOT by re-probing.
+    // (a)+(b) alone do NOT imply (c): a valid bijection can still strand a node
+    // behind an empty slot. A table built by `build_name_buckets` satisfies all
+    // three by construction. The whole sweep is a hard O(N+M): (a) is O(1), (b)
+    // is one O(M) pass, (c) is O(1) per node over a prefix sum — pathological
+    // FNV clustering (self-inflicted or adversarial) cannot inflate the cost,
+    // so no probe budget is needed and every self-written table validates.
+    let m = a.name_buckets.len();
+    let expected_m = bucket_capacity(n);
+    if m != expected_m {
+        return Err(corrupt(format!(
+            "name_buckets len {m} != canonical bucket_capacity({n})={expected_m}"
+        )));
+    }
+    // Independent guard of the mask precondition: `& (M-1)` is only a modulo
+    // when M is a power of two, and probe termination needs >= 1 EMPTY slot
+    // (M > N). `bucket_capacity` guarantees both today; assert them directly so
+    // a future change to its load-factor math cannot silently break the mask.
+    if !m.is_power_of_two() || m <= n {
+        return Err(corrupt(format!(
+            "name_buckets len {m} is not a power of two > N={n}"
+        )));
+    }
+    let mask = (m - 1) as u64;
+    let bucket_at = |i: usize| a.name_buckets.get(i).map(|x| x.to_native());
+    // (b) bijection — one pass that also records, for (c), where each node
+    // index sits (`slot_of`) and a prefix count of EMPTY slots (`empties[s]` =
+    // EMPTY slots among `buckets[0..s)`).
+    let mut seen = vec![false; n];
+    let mut slot_of = vec![0usize; n];
+    let mut empties = vec![0usize; m + 1];
+    let mut occupied = 0usize;
+    for slot in 0..m {
+        let b = bucket_at(slot).ok_or_else(|| corrupt("name_buckets short".into()))?;
+        empties[slot + 1] = empties[slot] + usize::from(b == EMPTY_BUCKET);
+        if b == EMPTY_BUCKET {
+            continue;
+        }
+        let idx = b as usize;
+        if idx >= n {
+            return Err(corrupt(format!(
+                "name_buckets slot {slot} holds idx {idx} >= N={n}"
+            )));
+        }
+        if seen[idx] {
+            return Err(corrupt(format!(
+                "name_buckets maps idx {idx} more than once"
+            )));
+        }
+        seen[idx] = true;
+        slot_of[idx] = slot;
+        occupied += 1;
+    }
+    if occupied != n {
+        return Err(corrupt(format!(
+            "name_buckets has {occupied} entries != node count {n}"
+        )));
+    }
+    // (c) reachability: idx_of(name[i]) must resolve to i. For an
+    // insertion-only linear-probe table this is EXACTLY "no EMPTY slot on the
+    // cyclic path [home(i), slot(i))": the probe walks forward from
+    // `home = fnv1a(name) & mask` through occupied slots and stops at the first
+    // EMPTY, and no earlier slot can answer the lookup first because names are
+    // unique (strict-sort check above) and every hit is name-confirmed.
+    // `build_name_buckets` gives the property by construction — an insertion
+    // lands on the first EMPTY after its home, and later insertions only fill
+    // slots, never empty them — so ANY self-written table passes, including
+    // pathologically FNV-clustered names (an earlier cumulative probe BUDGET
+    // here rejected exactly such tables that the write path had just produced:
+    // write/validate asymmetry). Checked in O(1) per node against the EMPTY
+    // prefix sum, so hostile clustering cannot inflate validation cost either.
+    // (FNV-1a is not collision-resistant; collisions only cost probe locality,
+    // never correctness — matching §5.1's "structural safety, not
+    // hash-flooding".)
+    for (i, &slot) in slot_of.iter().enumerate() {
+        let name = a
+            .nodes
+            .get(i)
+            .ok_or_else(|| corrupt("nodes short (reachability)".into()))?
+            .name
+            .as_str();
+        let home = (fnv1a(name.as_bytes()) & mask) as usize;
+        let empties_on_path = if home <= slot {
+            empties[slot] - empties[home]
+        } else {
+            // Wrapped probe: home..M-1, then 0..slot.
+            (empties[m] - empties[home]) + empties[slot]
+        };
+        if empties_on_path != 0 {
+            return Err(corrupt(format!(
+                "node {i} ({name:?}) is unreachable by its own hash probe: \
+                 {empties_on_path} EMPTY slot(s) on the path from its hash home"
+            )));
+        }
+    }
 
     // --- edge endpoints in range ---
     for (i, edge) in a.edges.iter().enumerate() {
@@ -415,7 +666,7 @@ fn validate_csr(a: &ArchivedSerializableGraphV1) -> Result<(), PersistError> {
 // ArchivedCsrView — mmap-backed zero-copy accessor
 // ---------------------------------------------------------------------------
 
-/// Zero-copy `O(degree)` accessor over a memory-mapped V1 CSR snapshot.
+/// Zero-copy `O(degree)` accessor over a memory-mapped V2 CSR snapshot.
 ///
 /// # Soundness of the `unsafe` Send/Sync + self-referential pointer
 /// * The mapping is **read-only** (no interior mutability, no writes ever), so
@@ -431,8 +682,7 @@ pub struct ArchivedCsrView {
     // Owns the mapped bytes; must outlive `archived`. Kept first so it is
     // dropped last (though drop order does not affect the raw pointer here).
     _mmap: memmap2::Mmap,
-    archived: *const ArchivedSerializableGraphV1,
-    name_index: HashMap<String, u32>,
+    archived: *const ArchivedSerializableGraphV2,
 }
 
 // SAFETY: read-only mapping, pointer stable across moves (see type docs).
@@ -440,7 +690,7 @@ unsafe impl Send for ArchivedCsrView {}
 unsafe impl Sync for ArchivedCsrView {}
 
 impl ArchivedCsrView {
-    fn archived(&self) -> &ArchivedSerializableGraphV1 {
+    fn archived(&self) -> &ArchivedSerializableGraphV2 {
         // SAFETY: `_mmap` is alive as long as `self`; the pointer was derived
         // from a validated archive over that same mapping and is stable.
         unsafe { &*self.archived }
@@ -460,6 +710,37 @@ impl ArchivedCsrView {
     fn off(v: &rkyv::vec::ArchivedVec<rkyv::Archived<u32>>, i: usize) -> Option<usize> {
         v.get(i).map(|x| x.to_native() as usize)
     }
+
+    /// Resolve `name` to its node index via the persisted open-addressing table
+    /// (`name_buckets`). Zero-copy `O(1)` expected over the mapped bytes: hash the
+    /// query, probe from that slot, and confirm the real node name matches (so a
+    /// hash collision resolves to the correct node, never a false hit). Touches
+    /// only the probed bucket page and the one matching node — unlike an eager
+    /// `name -> idx` HashMap, which at open faulted EVERY node into RAM and
+    /// allocated a `String` per name, defeating the mmap's larger-than-RAM
+    /// purpose. Probing is bounded to `M` steps so even a malformed (fully
+    /// occupied) table cannot loop; every access is `.get()`-checked, never UB.
+    fn idx_of(&self, name: &str) -> Option<usize> {
+        let a = self.archived();
+        let m = a.name_buckets.len();
+        if m == 0 {
+            return None;
+        }
+        let mask = (m - 1) as u64; // M is a power of two (checked at open)
+        let mut slot = (fnv1a(name.as_bytes()) & mask) as usize;
+        for _ in 0..m {
+            let bucket = a.name_buckets.get(slot)?.to_native();
+            if bucket == EMPTY_BUCKET {
+                return None; // empty slot ends the probe: not present
+            }
+            let idx = bucket as usize;
+            if a.nodes.get(idx)?.name.as_str() == name {
+                return Some(idx);
+            }
+            slot = (slot + 1) & (mask as usize);
+        }
+        None
+    }
 }
 
 impl GraphAccessor for ArchivedCsrView {
@@ -472,8 +753,8 @@ impl GraphAccessor for ArchivedCsrView {
     }
 
     fn get_node(&self, name: &str) -> Option<NodeView> {
-        let &idx = self.name_index.get(name)?;
-        let node = self.archived().nodes.get(idx as usize)?;
+        let idx = self.idx_of(name)?;
+        let node = self.archived().nodes.get(idx)?;
         Some(NodeView {
             name: node.name.to_string(),
             kind: node.kind.to_string(),
@@ -483,17 +764,16 @@ impl GraphAccessor for ArchivedCsrView {
             metadata: node
                 .metadata
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|entry| (entry.0.to_string(), entry.1.to_string()))
                 .collect(),
         })
     }
 
     fn outgoing_neighbors(&self, name: &str) -> Vec<NeighborView> {
-        let Some(&idx) = self.name_index.get(name) else {
+        let Some(idx) = self.idx_of(name) else {
             return vec![];
         };
         let a = self.archived();
-        let idx = idx as usize;
         // `.get()` everywhere: even a `none`-validated hostile file cannot panic.
         let (Some(lo), Some(hi)) = (
             Self::off(&a.node_offsets, idx),
@@ -518,11 +798,10 @@ impl GraphAccessor for ArchivedCsrView {
     }
 
     fn incoming_neighbors(&self, name: &str) -> Vec<NeighborView> {
-        let Some(&idx) = self.name_index.get(name) else {
+        let Some(idx) = self.idx_of(name) else {
             return vec![];
         };
         let a = self.archived();
-        let idx = idx as usize;
         let (Some(lo), Some(hi)) = (
             Self::off(&a.in_offsets, idx),
             Self::off(&a.in_offsets, idx + 1),
@@ -553,10 +832,10 @@ impl GraphAccessor for ArchivedCsrView {
 // open_snapshot — the mmap / owned open path
 // ---------------------------------------------------------------------------
 
-/// Open a V1 CSR snapshot at `path` and return a [`BaseGraph`].
+/// Open a V2 CSR snapshot at `path` and return a [`BaseGraph`].
 ///
 /// * `mode = Owned`: read + validate the bytes up front and materialize an
-///   owned petgraph (`from_rkyv_rebuild_v1`). No lazy faulting — safe for
+///   owned petgraph (`from_rkyv_rebuild_v2`). No lazy faulting — safe for
 ///   network / larger-than-RAM-under-pressure callers (§4.5 SIGBUS precondition).
 /// * `mode = Mmap`: map the file read-only, validate per `validate`, derive the
 ///   stable archive pointer, build the `name → idx` index, and (if `prefault`)
@@ -575,8 +854,8 @@ pub fn open_snapshot(
     match mode {
         BaseMode::Owned => {
             let bytes = std::fs::read(path)?;
-            validate_v1(&bytes, validate, expected_crc)?;
-            let inner = from_rkyv_rebuild_v1(&bytes).map_err(PersistError::Corrupt)?;
+            validate_v2(&bytes, validate, expected_crc)?;
+            let inner = from_rkyv_rebuild_v2(&bytes).map_err(PersistError::Corrupt)?;
             Ok(BaseGraph::Owned(inner))
         }
         BaseMode::Mmap => {
@@ -585,17 +864,17 @@ pub fn open_snapshot(
             // mapped (rename-only + unlink-safe discipline, §4.5).
             let mmap = unsafe { memmap2::Mmap::map(&file)? };
 
-            validate_v1(&mmap[..], validate, expected_crc)?;
+            validate_v2(&mmap[..], validate, expected_crc)?;
 
             // Obtain the archive pointer. full/crc => structural (checked);
             // none => access_unchecked (trusted self-written file only).
-            let archived: *const ArchivedSerializableGraphV1 = match validate {
+            let archived: *const ArchivedSerializableGraphV2 = match validate {
                 Validate::None => {
                     // SAFETY: `none` is only ever passed for a file this process
                     // wrote this run (post-compaction re-mmap); its structure is
                     // known-valid, so `access_unchecked` has no UB.
                     let a =
-                        unsafe { rkyv::access_unchecked::<ArchivedSerializableGraphV1>(&mmap[..]) };
+                        unsafe { rkyv::access_unchecked::<ArchivedSerializableGraphV2>(&mmap[..]) };
                     a as *const _
                 }
                 _ => {
@@ -604,16 +883,12 @@ pub fn open_snapshot(
                 }
             };
 
-            // Build the name index (O(N); the only per-open build cost).
-            // SAFETY: `mmap` is live for the duration of this block.
-            let name_index = {
-                let a = unsafe { &*archived };
-                let mut map = HashMap::with_capacity(a.nodes.len());
-                for (i, node) in a.nodes.iter().enumerate() {
-                    map.insert(node.name.to_string(), i as u32);
-                }
-                map
-            };
+            // No per-open name-index BUILD: name resolution probes the persisted
+            // `name_buckets` hash table on demand (`ArchivedCsrView::idx_of`, an
+            // FNV-1a + open-addressing probe), so open does not fault every node
+            // into RAM to build an index — preserving the mmap's larger-than-RAM
+            // lazy paging. (The index-build cost is O(1); a `Validate::Crc`/`Full`
+            // open still pays an O(file) crc / O(N+E) sweep separately.)
 
             if prefault {
                 // madvise(WILLNEED): warm all pages up front (matches the V0
@@ -628,7 +903,6 @@ pub fn open_snapshot(
             Ok(BaseGraph::Archived(ArchivedCsrView {
                 _mmap: mmap,
                 archived,
-                name_index,
             }))
         }
     }
@@ -738,7 +1012,7 @@ mod tests {
     #[test]
     fn v1_round_trip_matches_owned() {
         let owned = sample();
-        let bytes = to_rkyv_v1(&owned);
+        let bytes = to_rkyv_v2(&owned);
         let base = open_csr(&bytes, Validate::Full).unwrap();
         let view = base.as_accessor();
 
@@ -771,7 +1045,7 @@ mod tests {
 
     #[test]
     fn csr_structure_is_well_formed() {
-        let bytes = to_rkyv_v1(&sample());
+        let bytes = to_rkyv_v2(&sample());
         let a = access_checked(&bytes).unwrap();
         let n = a.nodes.len();
         let e = a.edges.len();
@@ -799,15 +1073,110 @@ mod tests {
     fn v1_serialization_is_byte_identical() {
         let g1 = sample();
         let g2 = sample();
-        assert_eq!(to_rkyv_v1(&g1), to_rkyv_v1(&g2));
+        assert_eq!(to_rkyv_v2(&g1), to_rkyv_v2(&g2));
     }
+
+    #[test]
+    fn v2_bytes_identical_across_source_insertion_order() {
+        // Same logical graph as `sample()`, but nodes and edges are handed to
+        // `inner()`/`build_graph` in a different order. The persisted
+        // `name_buckets` table is built from the name-SORTED node list with a
+        // fixed hash, so ITS contribution to the byte stream does
+        // canonicalize regardless of source insertion order (verified: only
+        // `pagerank_weight` bytes differ between `forward`/`backward` below,
+        // never `name_buckets`).
+        //
+        // This once exposed a real determinism bug (now FIXED): `compute_pagerank`
+        // in `src/builder.rs` accumulated `new_scores[..] += share` in petgraph
+        // insertion order, and non-associative `f32` addition made a different
+        // input order yield a ~ULP-different `pagerank_weight` that leaked into
+        // these bytes. `build_graph` now sorts nodes by name before insertion, so
+        // the summation order is canonical for the same logical graph and these
+        // two serializations are byte-identical.
+        let forward = sample();
+        let backward = inner(
+            vec![
+                ("D", "model"),
+                ("C", "field"),
+                ("B", "model"),
+                ("A", "model"),
+            ],
+            vec![
+                ("A", "A", "self"),
+                ("D", "A", "rel"),
+                ("B", "C", "contains"),
+                ("A", "C", "contains"),
+                ("A", "B", "rel"),
+            ],
+        );
+        assert_eq!(to_rkyv_v2(&forward), to_rkyv_v2(&backward));
+    }
+
+    #[test]
+    fn v2_bytes_identical_with_metadata_across_map_order() {
+        // Node metadata is a HashMap (random-seeded iteration order). The snapshot
+        // stores it as a key-sorted `CsrNode.metadata` Vec, so the same logical
+        // metadata handed in two different HashMap insertion orders must still
+        // serialize to identical bytes (rkyv would otherwise archive the HashMap
+        // in its per-instance order -> non-deterministic bytes).
+        let build = |pairs: &[(&str, &str)]| {
+            let mut md = HashMap::new();
+            for (k, v) in pairs {
+                md.insert(k.to_string(), v.to_string());
+            }
+            let nodes = vec![crate::types::NodeInput {
+                name: "n".into(),
+                kind: "model".into(),
+                metadata: md,
+                base_weight: 1.0,
+                noise_penalty: 0.0,
+            }];
+            let (g, m) = crate::builder::build_graph(nodes, vec![]);
+            to_rkyv_v2(&OrpheusGraphInner::new(g, m))
+        };
+        let a = build(&[("z", "1"), ("a", "2"), ("m", "3")]);
+        let b = build(&[("a", "2"), ("m", "3"), ("z", "1")]);
+        assert_eq!(a, b, "metadata map order must not affect snapshot bytes");
+    }
+
+    #[test]
+    fn v2_metadata_round_trips_through_mmap_open() {
+        // A metadata-bearing node must read its exact keys/values back after
+        // serialize + mmap open — `CsrNode` stores metadata as a sorted Vec and
+        // `get_node` rebuilds the HashMap. (Prior round-trip tests all used empty
+        // metadata, so this path was untested.)
+        let mut md = HashMap::new();
+        md.insert("owner".to_string(), "alice".to_string());
+        md.insert("zone".to_string(), "eu".to_string());
+        md.insert("tier".to_string(), "gold".to_string());
+        let nodes = vec![crate::types::NodeInput {
+            name: "acct".into(),
+            kind: "model".into(),
+            metadata: md.clone(),
+            base_weight: 1.0,
+            noise_penalty: 0.0,
+        }];
+        let (g, m) = build_graph(nodes, vec![]);
+        let bytes = to_rkyv_v2(&OrpheusGraphInner::new(g, m));
+        let base = open_csr(&bytes, Validate::Full).unwrap();
+        let node = base.as_accessor().get_node("acct").expect("node present");
+        assert_eq!(node.metadata, md, "metadata must round-trip exactly");
+    }
+
+    // NOTE: ephemeral traversal-result determinism is covered TRANSITIVELY by the
+    // byte-identity tests above (`v2_bytes_identical_across_source_insertion_order`,
+    // which is mutation-verified to fail if the `build_graph` name-sort is removed):
+    // identical snapshot bytes imply an identical graph, hence identical traversal.
+    // A dedicated traversal test on a symmetric fixture was removed as vacuous — a
+    // star graph sums N identical PageRank shares, which is order-invariant even
+    // WITHOUT the fix, so it could never catch the regression it claimed to guard.
 
     // ---- owned open path -----------------------------------------------
 
     #[test]
     fn owned_open_matches_mmap_open() {
         let owned = sample();
-        let bytes = to_rkyv_v1(&owned);
+        let bytes = to_rkyv_v2(&owned);
         let crc = crc32fast::hash(&bytes);
         let (_dir, path) = write_temp(&bytes);
 
@@ -831,7 +1200,7 @@ mod tests {
     #[test]
     fn prefault_open_is_transparent() {
         let owned = sample();
-        let bytes = to_rkyv_v1(&owned);
+        let bytes = to_rkyv_v2(&owned);
         let crc = crc32fast::hash(&bytes);
         let (_dir, path) = write_temp(&bytes);
         std::mem::forget(_dir);
@@ -842,11 +1211,11 @@ mod tests {
 
     // ---- validate rejects hostile bytes (no panic) ---------------------
 
-    fn hostile(mutate: impl FnOnce(&mut SerializableGraphV1)) -> Vec<u8> {
+    fn hostile(mutate: impl FnOnce(&mut SerializableGraphV2)) -> Vec<u8> {
         // Start from a valid graph, then corrupt one invariant.
         let owned = inner(vec![("A", "m"), ("B", "m")], vec![("A", "B", "r")]);
-        let good = to_rkyv_v1(&owned);
-        let mut sg = rkyv::from_bytes::<SerializableGraphV1, rkyv::rancor::Error>(&good).unwrap();
+        let good = to_rkyv_v2(&owned);
+        let mut sg = rkyv::from_bytes::<SerializableGraphV2, rkyv::rancor::Error>(&good).unwrap();
         mutate(&mut sg);
         rkyv::to_bytes::<rkyv::rancor::Error>(&sg).unwrap().to_vec()
     }
@@ -855,7 +1224,7 @@ mod tests {
     fn full_rejects_oob_edge_index() {
         let bytes = hostile(|sg| sg.edges[0].to_idx = 99);
         let crc = crc32fast::hash(&bytes);
-        let err = validate_v1(&bytes, Validate::Full, crc).unwrap_err();
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
         assert!(matches!(err, PersistError::Corrupt(_)));
     }
 
@@ -870,7 +1239,7 @@ mod tests {
             sg.node_offsets[n] = 1;
         });
         let crc = crc32fast::hash(&bytes);
-        let err = validate_v1(&bytes, Validate::Full, crc).unwrap_err();
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
         assert!(matches!(err, PersistError::Corrupt(_)));
     }
 
@@ -882,7 +1251,7 @@ mod tests {
             sg.node_offsets = vec![0; n + 1];
         });
         let crc = crc32fast::hash(&bytes);
-        let err = validate_v1(&bytes, Validate::Full, crc).unwrap_err();
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
         assert!(matches!(err, PersistError::Corrupt(_)));
     }
 
@@ -892,7 +1261,7 @@ mod tests {
             sg.node_offsets.pop(); // now len n, not n+1
         });
         let crc = crc32fast::hash(&bytes);
-        let err = validate_v1(&bytes, Validate::Full, crc).unwrap_err();
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
         assert!(matches!(err, PersistError::Corrupt(_)));
     }
 
@@ -904,7 +1273,7 @@ mod tests {
             }
         });
         let crc = crc32fast::hash(&bytes);
-        let err = validate_v1(&bytes, Validate::Full, crc).unwrap_err();
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
         assert!(matches!(err, PersistError::Corrupt(_)));
     }
 
@@ -915,14 +1284,14 @@ mod tests {
         let bytes = hostile(|sg| sg.node_offsets[0] = 1);
         let crc = crc32fast::hash(&bytes);
         assert!(matches!(
-            validate_v1(&bytes, Validate::Full, crc),
+            validate_v2(&bytes, Validate::Full, crc),
             Err(PersistError::Corrupt(_))
         ));
         // Symmetric for in_offsets (incoming traversal).
         let bytes2 = hostile(|sg| sg.in_offsets[0] = 1);
         let crc2 = crc32fast::hash(&bytes2);
         assert!(matches!(
-            validate_v1(&bytes2, Validate::Full, crc2),
+            validate_v2(&bytes2, Validate::Full, crc2),
             Err(PersistError::Corrupt(_))
         ));
     }
@@ -934,14 +1303,276 @@ mod tests {
             vec![("A", "m"), ("B", "m")],
             vec![("A", "B", "r"), ("B", "A", "r")],
         );
-        let good = to_rkyv_v1(&owned);
-        let mut sg = rkyv::from_bytes::<SerializableGraphV1, rkyv::rancor::Error>(&good).unwrap();
+        let good = to_rkyv_v2(&owned);
+        let mut sg = rkyv::from_bytes::<SerializableGraphV2, rkyv::rancor::Error>(&good).unwrap();
         // Force a duplicate (0,0) — no longer a permutation.
         sg.in_mirror = vec![0, 0];
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&sg).unwrap().to_vec();
         let crc = crc32fast::hash(&bytes);
-        let err = validate_v1(&bytes, Validate::Full, crc).unwrap_err();
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
         assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    // ---- name_buckets (persisted open-addressing name index) -----------
+
+    /// Build `total` distinct candidate names such that at least two of them
+    /// land in the SAME `name_buckets` slot for a table sized for `total`
+    /// entries — a deliberately engineered FNV-1a collision rather than a hope
+    /// that enough nodes produce one by chance. Exercises the name-confirm-on-
+    /// probe branch of `ArchivedCsrView::idx_of` (a hash hit that is NOT the
+    /// right node, so probing must continue).
+    fn names_with_forced_collision(total: usize) -> Vec<String> {
+        let mask = (bucket_capacity(total) - 1) as u64;
+        let pool: Vec<String> = (0..total * 50).map(|i| format!("node{i:05}")).collect();
+        let mut by_bucket: Map<u64, Vec<usize>> = Map::new();
+        for (i, name) in pool.iter().enumerate() {
+            by_bucket
+                .entry(fnv1a(name.as_bytes()) & mask)
+                .or_default()
+                .push(i);
+        }
+        let collide = by_bucket
+            .values()
+            .find(|v| v.len() >= 2)
+            .expect("pool large enough to contain a same-bucket collision");
+        let mut chosen: Vec<usize> = vec![collide[0], collide[1]];
+        for i in 0..pool.len() {
+            if chosen.len() == total {
+                break;
+            }
+            if !chosen.contains(&i) {
+                chosen.push(i);
+            }
+        }
+        chosen.truncate(total);
+        chosen.into_iter().map(|i| pool[i].clone()).collect()
+    }
+
+    #[test]
+    fn v2_lookup_resolves_all_nodes_with_forced_hash_collision() {
+        const N: usize = 40;
+        let names = names_with_forced_collision(N);
+        assert_eq!(names.len(), N);
+
+        // Confirm the setup really forces a collision — this is the point of
+        // the test, not an incidental fact about `idx_of`'s probe.
+        let mask = (bucket_capacity(N) - 1) as u64;
+        let mut by_bucket: Map<u64, usize> = Map::new();
+        let mut collided = false;
+        for name in &names {
+            let b = fnv1a(name.as_bytes()) & mask;
+            let count = by_bucket.entry(b).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                collided = true;
+            }
+        }
+        assert!(collided, "test setup must force a name_buckets collision");
+
+        // Ring graph: node i -> node (i+1 mod N), "next". Exercises out+in.
+        let node_pairs: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "model")).collect();
+        let edge_triples: Vec<(&str, &str, &str)> = (0..N)
+            .map(|i| (names[i].as_str(), names[(i + 1) % N].as_str(), "next"))
+            .collect();
+        let owned = inner(node_pairs, edge_triples);
+
+        let bytes = to_rkyv_v2(&owned);
+        let base = open_csr(&bytes, Validate::Full).unwrap();
+        let view = base.as_accessor();
+
+        assert_eq!(view.node_count(), N);
+        for i in 0..N {
+            let name = &names[i];
+            let next = &names[(i + 1) % N];
+            let got = view.get_node(name).unwrap();
+            assert_eq!(&got.name, name);
+            assert_eq!(got.kind, "model");
+
+            let out = nbrs(view, name, true);
+            assert_eq!(
+                out,
+                vec![(
+                    next.clone(),
+                    "next".to_string(),
+                    format!("{name}_{next}"),
+                    0.7f32.to_bits(),
+                )],
+                "outgoing for {name}"
+            );
+
+            let prev = &names[(i + N - 1) % N];
+            let inc = nbrs(view, name, false);
+            assert_eq!(
+                inc,
+                vec![(
+                    prev.clone(),
+                    "next".to_string(),
+                    format!("{prev}_{name}"),
+                    0.7f32.to_bits(),
+                )],
+                "incoming for {name}"
+            );
+        }
+        assert!(view.get_node("definitely-not-present").is_none());
+        assert!(view.outgoing_neighbors("definitely-not-present").is_empty());
+        assert!(view.incoming_neighbors("definitely-not-present").is_empty());
+    }
+
+    #[test]
+    fn full_rejects_name_buckets_non_power_of_two_length() {
+        let bytes = hostile(|sg| sg.name_buckets.push(EMPTY_BUCKET));
+        let crc = crc32fast::hash(&bytes);
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
+        assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    #[test]
+    fn full_rejects_name_buckets_too_short_for_empty_slot() {
+        // Power-of-two length equal to N leaves no EMPTY_BUCKET.
+        let bytes = hostile(|sg| {
+            let n = sg.nodes.len();
+            sg.name_buckets.truncate(n);
+        });
+        let crc = crc32fast::hash(&bytes);
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
+        assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    #[test]
+    fn full_rejects_name_bucket_index_out_of_range() {
+        let bytes = hostile(|sg| {
+            let slot = sg
+                .name_buckets
+                .iter()
+                .position(|&b| b != EMPTY_BUCKET)
+                .expect("at least one occupied slot");
+            sg.name_buckets[slot] = sg.nodes.len() as u32; // == N, out of range
+        });
+        let crc = crc32fast::hash(&bytes);
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
+        assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    #[test]
+    fn full_rejects_name_bucket_duplicate_index() {
+        let bytes = hostile(|sg| {
+            let occupied: Vec<usize> = (0..sg.name_buckets.len())
+                .filter(|&i| sg.name_buckets[i] != EMPTY_BUCKET)
+                .collect();
+            assert!(occupied.len() >= 2, "test needs >= 2 occupied slots");
+            let dup_value = sg.name_buckets[occupied[0]];
+            sg.name_buckets[occupied[1]] = dup_value;
+        });
+        let crc = crc32fast::hash(&bytes);
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
+        assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    #[test]
+    fn full_accepts_pathologically_clustered_names() {
+        // Write/validate consistency guard: names mined to share ONE hash home
+        // produce the worst-case linear-probe cluster `build_name_buckets` can
+        // emit. 17 same-bucket names = 153 cumulative probes, which exceeded
+        // the old `8N+16 = 152` reachability probe budget — a freshly-written
+        // store failed its own default `Validate::Full` reopen as Corrupt. The
+        // prefix-sum reachability check must accept ANY self-written table,
+        // clustering included.
+        let target_n = 17usize;
+        let m = bucket_capacity(target_n);
+        let mask = (m - 1) as u64;
+        let mut names: Vec<String> = Vec::new();
+        let mut i = 0u64;
+        while names.len() < target_n {
+            let cand = format!("collide{i}");
+            if fnv1a(cand.as_bytes()) & mask == 0 {
+                names.push(cand);
+            }
+            i += 1;
+        }
+        let nodes: Vec<(&str, &str)> = names.iter().map(|s| (s.as_str(), "m")).collect();
+        let owned = inner(nodes, vec![]);
+        let bytes = to_rkyv_v2(&owned);
+        let crc = crc32fast::hash(&bytes);
+        validate_v2(&bytes, Validate::Full, crc)
+            .expect("a self-written clustered table must pass Full validation");
+    }
+
+    #[test]
+    fn full_rejects_unreachable_node_behind_empty_gap() {
+        // The critical (c) reachability case: a table that is a perfectly
+        // valid bijection (every node index appears exactly once, in range)
+        // can still strand a node behind an EMPTY_BUCKET slot planted between
+        // its hash home and where it actually sits — `idx_of`'s linear probe
+        // stops at the first EMPTY it sees, so it would silently MISS the
+        // node. Constructed deliberately (not by chance): node 0 is placed two
+        // slots past its own hash home, with its home's immediate successor
+        // left EMPTY, so a probe starting at home dies at the gap.
+        let bytes = hostile(|sg| {
+            let m = sg.name_buckets.len();
+            assert!(m.is_power_of_two() && m >= 4, "test assumes room for a gap");
+            let mask = (m - 1) as u64;
+            let home = (fnv1a(sg.nodes[0].name.as_bytes()) & mask) as usize;
+            let gap = (home + 1) % m;
+            let placed = (home + 2) % m;
+            assert_ne!(gap, placed);
+
+            let mut buckets = vec![EMPTY_BUCKET; m];
+            buckets[placed] = 0; // node 0, two slots past its home
+                                 // `gap` stays EMPTY_BUCKET: probing from `home` sees the gap and
+                                 // stops before ever reaching `placed`.
+            let mut free_slots = (0..m).filter(|&s| s != gap && s != placed);
+            for idx in 1..sg.nodes.len() as u32 {
+                let slot = free_slots
+                    .next()
+                    .expect("enough free slots for the remaining nodes");
+                buckets[slot] = idx;
+            }
+            sg.name_buckets = buckets;
+        });
+        let crc = crc32fast::hash(&bytes);
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
+        assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    #[test]
+    fn full_rejects_all_empty_name_buckets_when_n_positive() {
+        let bytes = hostile(|sg| {
+            let m = sg.name_buckets.len();
+            sg.name_buckets = vec![EMPTY_BUCKET; m];
+        });
+        let crc = crc32fast::hash(&bytes);
+        let err = validate_v2(&bytes, Validate::Full, crc).unwrap_err();
+        assert!(matches!(err, PersistError::Corrupt(_)));
+    }
+
+    #[test]
+    fn v2_round_trip_single_node_graph() {
+        let owned = inner(vec![("Solo", "model")], vec![]);
+        let bytes = to_rkyv_v2(&owned);
+        let base = open_csr(&bytes, Validate::Full).unwrap();
+        let view = base.as_accessor();
+
+        assert_eq!(view.node_count(), 1);
+        assert_eq!(view.edge_count(), 0);
+        let node = view.get_node("Solo").unwrap();
+        assert_eq!(node.name, "Solo");
+        assert!(view.outgoing_neighbors("Solo").is_empty());
+        assert!(view.incoming_neighbors("Solo").is_empty());
+        assert!(view.get_node("Other").is_none());
+    }
+
+    #[test]
+    fn v2_round_trip_empty_graph() {
+        let owned = inner(vec![], vec![]);
+        let bytes = to_rkyv_v2(&owned);
+        let base = open_csr(&bytes, Validate::Full).unwrap();
+        let view = base.as_accessor();
+
+        assert_eq!(view.node_count(), 0);
+        assert_eq!(view.edge_count(), 0);
+        assert!(view.get_node("anything").is_none());
+        assert!(view.outgoing_neighbors("anything").is_empty());
+        assert!(view.incoming_neighbors("anything").is_empty());
     }
 
     // ---- crc vs none ----------------------------------------------------
@@ -949,16 +1580,16 @@ mod tests {
     #[test]
     fn crc_rejects_bitflip_none_skips() {
         let owned = sample();
-        let mut bytes = to_rkyv_v1(&owned);
+        let mut bytes = to_rkyv_v2(&owned);
         let good_crc = crc32fast::hash(&bytes);
         // Flip a byte: crc mode must reject.
         bytes[16] ^= 0xFF;
         assert!(matches!(
-            validate_v1(&bytes, Validate::Crc, good_crc),
+            validate_v2(&bytes, Validate::Crc, good_crc),
             Err(PersistError::Corrupt(_))
         ));
         // none mode skips all checks (documents the trust contract).
-        assert!(validate_v1(&bytes, Validate::None, good_crc).is_ok());
+        assert!(validate_v2(&bytes, Validate::None, good_crc).is_ok());
     }
 
     #[test]
@@ -970,5 +1601,31 @@ mod tests {
         let _crc = crc32fast::hash(&bytes); // matching crc (self-written); unused under Validate::None
         let base = open_csr(&bytes, Validate::None).unwrap();
         assert_eq!(base.as_accessor().node_count(), 2);
+    }
+
+    #[test]
+    fn crc_and_none_modes_still_resolve_lookups_correctly() {
+        // §5.1: `Crc`/`None` skip the semantic sweep (incl. name_buckets
+        // reachability) but the table is trusted for a file this process
+        // wrote — lookups must still resolve correctly through it.
+        let owned = sample();
+        let bytes = to_rkyv_v2(&owned);
+        for mode in [Validate::Crc, Validate::None] {
+            let base = open_csr(&bytes, mode).unwrap();
+            let view = base.as_accessor();
+            for name in ["A", "B", "C", "D"] {
+                assert_eq!(
+                    nbrs(view, name, true),
+                    nbrs(&owned, name, true),
+                    "{mode:?} out {name}"
+                );
+                assert_eq!(
+                    nbrs(view, name, false),
+                    nbrs(&owned, name, false),
+                    "{mode:?} in {name}"
+                );
+            }
+            assert!(view.get_node("nonexistent").is_none(), "{mode:?}");
+        }
     }
 }
