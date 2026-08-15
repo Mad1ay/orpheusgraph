@@ -276,7 +276,7 @@ loss" bug.
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "snapshot_file": "snapshot-00000000000000000042.og",
   "snapshot_seq": 42,
   "snapshot_crc32": 3735928559,
@@ -477,10 +477,19 @@ that the snapshot is "the existing format", that "`ArchivedGraph` already
 exists — only new code is the mmap open path", and that "`to_rkyv`/`from_rkyv`
 remain untouched" apply **only to the legacy ephemeral Redis path** (which
 stays exactly as-is, tagged `format_version: 0`). The persistent store adds
-`to_rkyv_v1`/archived-CSR-accessor as genuinely new code; `open()`/`compact()`
-read and write V1. Both formats coexist behind the version tag; V0 is never
-mmap-traversed (it lacks the CSR index). This supersedes the "untouched /
-already exists" wording in §4.1, §4.5, §4.6.
+the archived-CSR-accessor as genuinely new code. Both formats coexist behind
+the version tag; V0 is never mmap-traversed (it lacks the CSR index). This
+supersedes the "untouched / already exists" wording in §4.1, §4.5, §4.6.
+
+> **Amendment (implemented as V2 — see `persistence_impl_log.md` §6):** the
+> shipped CSR format additionally persists the `name -> idx` index itself
+> (`name_buckets`: FNV-1a open-addressing table, zero-copy probed), so `open()`
+> builds NOTHING — the eager O(N) name-index build this section still assumed
+> was measured to dominate warm open and was removed. `format_version` is `2`;
+> `open()`/`compact()` read and write V2 only, and pre-release legacy tags
+> `0`/`1` are rejected at open (recreate the store to migrate). Everything else
+> in this section (CSR layout, sorted edges, offsets, `in_mirror`) is unchanged
+> and carried into V2.
 
 ### 4.5 mmap and larger-than-RAM
 

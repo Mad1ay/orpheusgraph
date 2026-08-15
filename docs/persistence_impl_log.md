@@ -519,3 +519,139 @@ now incl. out-of-contract weights across compaction).
   not-durable under an fsync error; reconcile via `(epoch, seq)` on reopen).
 - **Power-loss harness** (`dm-flakey`/VM) — the `kill -9` harness proves process-death
   durability; power-loss (page-cache loss) is the spec's separately-scoped case.
+
+---
+
+## §6 Benchmarks + name-index redesign (Phase 3 follow-up)
+
+**Scope:** spec §6 (the phase-plan's `X` row — crash harness, property tests, benches —
+still had no benches after Phase 3). Added `benches/bench_persist.rs` (criterion) to
+measure the perf claims the persistent store was designed around: `apply(batch=100)`,
+warm `open()` (mmap V1 vs the legacy V0 `from_rkyv` zero-copy view), `DeltaAccessor`
+traversal overhead at delta 0/1/10%, and CSR-mmap-beam vs owned petgraph vs the legacy
+V0 archived O(E) scan. Writing the benchmark surfaced two real findings, both fixed; the
+second led to an on-disk format redesign.
+
+**Files:** `benches/bench_persist.rs` (new); `src/delta.rs` (DeltaAccessor allocation
+fix); `src/persist/snapshot.rs` (V1 → V2 format: persisted name index); `src/persist/mod.rs`
+(V2 wiring, legacy-format rejection); `src/persist/manifest.rs` (`FORMAT_VERSION` 1 → 2);
+`Cargo.toml` (bench target registration).
+
+### Decisions (with justification)
+
+- **`DeltaAccessor` allocation fix.** `outgoing_neighbors`/`incoming_neighbors` built a
+  3-`String` tuple key (`(from, to, kind)`) per base edge to probe `removed_edges` —
+  unconditionally, even when `removed_edges`/`removed_nodes` were EMPTY, which is the
+  common case for an additive (no-removal) delta. Changed both to reuse the base
+  `Vec<NeighborView>` in place and `retain()` it, running the tuple-key mask check only
+  when the relevant tombstone set is actually non-empty (`get_node`'s shadow/tombstone
+  checks got the same empty-set short-circuit). An additive delta now pays no incremental
+  allocation on this path beyond the base call itself. **Measured:** beam traversal over a
+  10%-delta dropped from **1.44× to 1.33×** vs the plain owned accessor (target ≤1.3×;
+  1.33× lands at-target within benchmark noise).
+- **Warm-open index redesign.** The bench exposed that warm `open()` was dominated by an
+  eager O(N) `name -> idx` `HashMap` build performed on every open — walking every node and
+  allocating a `String` per name, which faults every node into RAM. That defeats the entire
+  point of the mmap base (larger-than-RAM lazy paging, §4.5): an open that touches all N
+  nodes up front is no better than loading the whole file.
+  - **First attempt — binary search — tried and discarded.** `nodes` is already
+    name-sorted (§4.4b), so binary-searching it directly on lookup removes the O(N)
+    open-time build with no format change. This fixed open, but every `idx_of` call became
+    `O(log N)` string comparisons against archived bytes, and CSR-beam calls `idx_of` on
+    every expansion — traversal regressed from the ≤1.5× target to **1.69× owned
+    petgraph**. Trading a one-time open cost for a per-lookup cost paid on every traversal
+    is the wrong trade for a hot-path-first library.
+  - **Chosen: persist the index in the snapshot itself.** Moved `name -> idx` resolution
+    into the on-disk format as `name_buckets`: an open-addressing hash table (FNV-1a,
+    linear probing, `M` = next power of two `> N`), built once at write time (deterministic:
+    fixed hash + name-sorted insertion order → byte-identical output across two
+    serializations of the same graph) and read as a zero-copy, `O(1)`-expected probe over
+    the mapped bytes. This is the only option that wins on BOTH axes at once: open no longer
+    walks every node (`idx_of` touches only the probed bucket page + the one matching node),
+    and lookup during traversal stays O(1) instead of O(log N).
+- **Format bump to V2** (`SerializableGraphV2`, `FORMAT_VERSION = 2`). `name_buckets` is a
+  new persisted field, so it changes the on-disk layout — a V1 reader can't interpret V2
+  bytes. `open()`'s legacy branch (`0 | 1`) now returns `PersistError::Corrupt` instead of
+  attempting to read/upgrade: this is pre-release with no shipped V1 stores to preserve, so
+  silent migration isn't worth the complexity. The fix for a stale store is "recreate it."
+  (V0 was already never-mmap'd/owned-only; V1 is now equally unsupported, not just
+  downgraded.)
+- **Trust-boundary addition for `name_buckets`** (`validate_csr`, extends the §5.1 sweep).
+  A hostile/bit-rotted table can never cause UB — every access is `.get()`-bounded and
+  probing is capped at `M` steps — but it could make lookups silently MISS an existing
+  node, which `Validate::Full` must catch for untrusted/shared snapshots. Three checks, all
+  required together: **(a)** `M` is a power of two and `> N` (mask arithmetic valid, and at
+  least one `EMPTY_BUCKET` exists so every probe terminates); **(b)** occupied slots form a
+  bijection with `0..N` (no duplicate/out-of-range index, no phantom entries); **(c)**
+  reachability — probing from `fnv1a(name[i])` reaches bucket `i` before hitting an
+  `EMPTY_BUCKET`, for every node `i` (implemented as an O(1)-per-node EMPTY-prefix-sum
+  check of the equivalent linear-probe invariant "no EMPTY slot on the cyclic path
+  `[home(i), slot(i))`" — see the verification pass below for why NOT a probe walk with a
+  budget). (a)+(b) alone do not imply (c): a table can be a valid
+  bijection and still strand a node behind an empty slot reachable only from a different
+  probe start. A table built by `build_name_buckets` satisfies all three by construction.
+  Noted in-code: FNV-1a is not collision-resistant, so adversarially-collided names are out
+  of the integrity threat model — consistent with the rest of §5.1 (structural safety, not
+  hash-flooding resistance).
+
+### Measured results (50K nodes, release build)
+
+- `apply(batch=100)`: **~27.7 µs**.
+- **Warm open** (mmap V2, `Validate::Crc`): **2.15 ms** — vs the old eager-`HashMap`-build
+  path **6.51 ms** (−67%; measured BEFORE that path was deleted — the committed bench can
+  no longer reproduce this baseline, only the V2/V0 rows) and vs V0 `from_rkyv` **4.70 ms**
+  (V2 is **~2.2×** faster than V0). `Validate::Full` open: **3.57 ms** (adds the O(N+M)
+  `name_buckets` sweep on top of crc + the CSR §5.1 sweep — mandatory for untrusted
+  snapshots, optional for a self-written store).
+- **CSR-beam** (mmap V2): **7.47 µs = 1.24× owned petgraph** (under the ≤1.5× target); the
+  legacy V0 archived view's O(E) per-expansion scan is **697 µs (~94× slower)** — confirms
+  the CSR layout + persisted index together fix the §4.4b motivating defect. (The discarded
+  binary-search variant measured 1.69×, for comparison.)
+- Delta overhead: empty delta ≈**1.03×** (~0 overhead, as designed); 10% delta **1.33×**
+  (the allocation fix above).
+
+**Outcome:** the persisted `name_buckets` table delivers O(1) open + O(1)-expected lookup +
+byte-determinism (fixed FNV-1a + name-sorted order) simultaneously — the combination the
+binary-search attempt could not get in one structure. Larger-than-RAM lazy paging is
+preserved for `Validate::None` opens and for post-open lookups/traversal; `Crc`/`Full`
+opens crc-hash the whole file and therefore fault every page by design (stated accurately
+in the in-code `Validate` docs — the win is that no O(N) index build runs on ANY open).
+All four §6 targets (apply, warm-open improvement, delta-overhead ≤1.3×, CSR-beam ≤1.5×)
+are met or at-target within noise.
+
+### Verification pass (pre-commit, 2 independent adversarial reviewers)
+
+One P1 and four P2s, all fixed before commit:
+
+- **P1 — write/validate asymmetry on `name_buckets` (CONFIRMED with a 17-name repro).**
+  `build_name_buckets` bounds nothing at write time (any probe-cluster length succeeds),
+  but reachability check (c) enforced a cumulative probe budget of `8N+16` at read time.
+  Names clustering into one hash home (17 same-bucket names = 153 cumulative probes > 152
+  budget) produced a store that `create()`/`compact()` wrote successfully and the DEFAULT
+  `open()` (`Validate::Full`) then rejected as `Corrupt` — durably-written data that
+  cannot be read back, and a violation of the `Validate::Crc` soundness comment's "we only
+  ever write semantically-valid V2" invariant. **Fix:** replaced the budgeted probe walk
+  with an exact check of the linear-probe invariant — node `i` is reachable iff the cyclic
+  path `[home(i), slot(i))` contains no `EMPTY_BUCKET` — computed in O(1) per node from an
+  EMPTY-slot prefix sum built during the (b) bijection pass. This is equivalence, not
+  approximation (names are unique per the strict-sort check, hits are name-confirmed), it
+  accepts every table `build_name_buckets` can emit by construction (insertions land on
+  the first EMPTY after home and slots are never emptied), and it hard-bounds validation
+  at O(N+M) so hostile clustering cannot DoS it — no budget needed on either side.
+  Regression test: `full_accepts_pathologically_clustered_names` (mines 17 FNV-colliding
+  names, asserts a self-written store passes `Validate::Full`).
+- **P2** — check (a) asserted only `M == bucket_capacity(N)`; the power-of-two/`> N` mask
+  precondition held transitively through `bucket_capacity`'s internals. Now asserted
+  independently so a future load-factor change cannot silently break the `& (M-1)` mask.
+- **P2** — `bench_apply_batch` timed the 100-op batch `.clone()` inside `b.iter`; moved to
+  `iter_batched` setup so the apply figure measures the durable-write path only
+  (re-measured post-fix: **~27.6 µs**, statistically unchanged — the clone was noise).
+- **P2** — stale-doc sweep: bench comments still describing the deleted O(N) open-time
+  name-index build; `Cargo.toml`'s memmap2 rationale saying "V1"; the spec's §4.4b
+  compatibility section + MANIFEST example still normatively describing V1 (amended to V2
+  with a pointer here); the lazy-paging outcome overstatement above (reworded).
+- Clean bill otherwise: byte-determinism (no HashMap order leaks; metadata key-sorted;
+  PageRank summation order canonicalized by the builder name-sort), no wrong-node return
+  possible from a hostile table (name-confirmed hits + uniqueness), legacy 0|1 rejection,
+  mmap bounds-checking, delta.rs retain-masking equivalence, and zero Cyrillic across the
+  diff and all branch commits were verified explicitly.
