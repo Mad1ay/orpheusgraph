@@ -30,11 +30,18 @@ def node(name, kind="model", base_weight=0.5, noise_penalty=0.0, **md):
     return op
 
 
-def edge(frm, to, kind="relates_to", base_weight=0.8, field=None):
+def edge(frm, to, kind="relates_to", base_weight=0.8, field=None,
+         valid_from=None, valid_to=None, acl=None):
     op = {"op": "add_edge", "from": frm, "to": to, "kind": kind,
           "base_weight": base_weight}
     if field is not None:
         op["field"] = field
+    if valid_from is not None:
+        op["valid_from"] = valid_from
+    if valid_to is not None:
+        op["valid_to"] = valid_to
+    if acl is not None:
+        op["acl"] = acl
     return op
 
 
@@ -423,3 +430,144 @@ def test_concurrent_readers_during_writes(tmp_path):
 
     assert not errors, f"reader errors: {errors[:3]}"
     g.close()
+
+
+# --------------------------------------------------------------------------
+# Temporal validity + edge-level ACL (query-time only)
+# --------------------------------------------------------------------------
+
+def test_add_edge_temporal_and_acl_fields_round_trip(store):
+    store.apply([node("a"), node("b")])
+    store.apply([edge("a", "b", valid_from=100, valid_to=200,
+                       acl=["team-x", "team-x", "team-y"])])
+
+    edges = store.outgoing_edges("a")
+    assert len(edges) == 1
+    e = edges[0]
+    assert e.valid_from == 100
+    assert e.valid_to == 200
+    # normalized: sorted + deduped, regardless of input order/duplicates
+    assert e.acl == ["team-x", "team-y"]
+
+    inc = store.incoming_edges("b")
+    assert len(inc) == 1
+    assert inc[0].valid_from == 100
+    assert inc[0].valid_to == 200
+    assert inc[0].acl == ["team-x", "team-y"]
+
+
+def test_add_edge_missing_temporal_acl_defaults_unbounded_public(store):
+    # Backward compatibility: omitting valid_from/valid_to/acl entirely must
+    # not change behavior for existing callers.
+    store.apply([node("a"), node("b")])
+    store.apply([edge("a", "b")])
+    e = store.outgoing_edges("a")[0]
+    assert e.valid_from is None
+    assert e.valid_to is None
+    assert e.acl == []
+
+
+def test_add_edge_invalid_validity_range_raises_and_rejects_whole_batch(store):
+    store.apply([node("a"), node("b")])
+    seq_before = store.seq
+    with pytest.raises(ValueError):
+        store.apply([node("orphan"), edge("a", "b", valid_from=10, valid_to=5)])
+    # all-or-nothing: neither the node nor the edge landed, seq unchanged
+    assert store.seq == seq_before
+    assert store.get_node("orphan") is None
+    assert store.outgoing_edges("a") == []
+
+
+def test_dynamic_context_as_of_and_principals_defaults():
+    ctx = og.DynamicContext()
+    assert ctx.as_of is None
+    assert ctx.principals == []
+    ctx2 = og.DynamicContext(as_of=42, principals=["ops"])
+    assert ctx2.as_of == 42
+    assert ctx2.principals == ["ops"]
+
+
+def test_temporal_filtering_half_open_window_boundaries(store):
+    store.apply([node("a"), node("b")])
+    store.apply([edge("a", "b", valid_from=100, valid_to=200)])
+
+    # t == valid_from passes (inclusive lower bound)
+    assert store.find_path("a", "b", og.DynamicContext(as_of=100)) is not None
+    # inside the window
+    assert store.find_path("a", "b", og.DynamicContext(as_of=150)) is not None
+    # t == valid_to fails (exclusive upper bound)
+    assert store.find_path("a", "b", og.DynamicContext(as_of=200)) is None
+    # before valid_from
+    assert store.find_path("a", "b", og.DynamicContext(as_of=99)) is None
+    # after valid_to
+    assert store.find_path("a", "b", og.DynamicContext(as_of=201)) is None
+    # as_of=None -> no temporal filtering at all
+    assert store.find_path("a", "b", og.DynamicContext()) is not None
+
+
+def test_acl_filtering_fails_closed_without_matching_principal(store):
+    store.apply([node("a"), node("b")])
+    store.apply([edge("a", "b", acl=["secret"])])
+
+    # No principals at all -> a tagged edge is never visible.
+    assert store.find_path("a", "b", og.DynamicContext()) is None
+    # Wrong principal -> still invisible.
+    assert store.find_path("a", "b", og.DynamicContext(principals=["other"])) is None
+    # Matching principal -> visible.
+    assert store.find_path("a", "b", og.DynamicContext(principals=["secret"])) is not None
+
+
+def test_acl_empty_is_always_public(store):
+    store.apply([node("a"), node("b")])
+    store.apply([edge("a", "b")])  # no acl -> public
+    assert store.find_path("a", "b", og.DynamicContext()) is not None
+    assert store.find_path("a", "b", og.DynamicContext(principals=["anything"])) is not None
+
+
+def test_beam_traverse_excludes_invisible_edges(store):
+    store.apply([node("a"), node("b"), node("c")])
+    store.apply([
+        edge("a", "b"),  # always visible
+        edge("b", "c", acl=["restricted"]),
+    ])
+
+    visible = og.DynamicContext(principals=["restricted"])
+    hidden = og.DynamicContext()
+
+    names_visible = {n.name for n in store.beam_traverse("a", k=5, depth=2, ctx=visible)}
+    names_hidden = {n.name for n in store.beam_traverse("a", k=5, depth=2, ctx=hidden)}
+
+    assert "c" in names_visible
+    assert "c" not in names_hidden
+    assert "b" in names_visible and "b" in names_hidden  # b->c is restricted, a->b is not
+
+
+def test_base_metrics_unaffected_by_context_filters(store):
+    # node_count()/edge_count() take no ctx at all — base metrics are always
+    # computed over the FULL graph, never filtered.
+    store.apply([node("a"), node("b")])
+    store.apply([edge("a", "b", acl=["secret"], valid_from=1000, valid_to=1001)])
+    assert store.node_count() == 2
+    assert store.edge_count() == 1
+
+
+def test_filtered_traversal_identical_after_reopen(tmp_path):
+    p = str(tmp_path / "s")
+    g = og.open(p, create=True)
+    g.apply([node("a"), node("b"), node("c")])
+    g.apply([
+        edge("a", "b"),
+        edge("b", "c", valid_from=10, valid_to=20, acl=["team-x"]),
+    ])
+    g.flush()
+    g.close()
+
+    ctx_visible = og.DynamicContext(as_of=15, principals=["team-x"])
+    ctx_hidden = og.DynamicContext(as_of=15)
+
+    g2 = og.open(p, create=False)
+    names_visible = {n.name for n in g2.beam_traverse("a", k=5, depth=2, ctx=ctx_visible)}
+    names_hidden = {n.name for n in g2.beam_traverse("a", k=5, depth=2, ctx=ctx_hidden)}
+    assert "c" in names_visible
+    assert "c" not in names_hidden
+    g2.close()

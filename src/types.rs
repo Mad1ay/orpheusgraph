@@ -44,6 +44,32 @@ pub struct EdgeData {
     pub field_name: Option<String>,
     /// Static edge strength. Normalized to [0.0, 1.0].
     pub base_weight: f32,
+    /// Opaque caller-defined valid-time instant: the edge is valid from this
+    /// point on (inclusive). `None` = unbounded on this side. Half-open
+    /// interval together with `valid_to`: `[valid_from, valid_to)`. Query-time
+    /// only — never affects PageRank/base metrics, only `DynamicContext`-aware
+    /// traversal (`DynamicContext::is_edge_visible`).
+    pub valid_from: Option<u64>,
+    /// Opaque caller-defined valid-time instant: the edge stops being valid at
+    /// this point (exclusive). `None` = unbounded on this side.
+    pub valid_to: Option<u64>,
+    /// ACL tags. Empty = public (always visible). Non-empty = visible only to
+    /// a `DynamicContext` whose `principals` intersect this set. Normalized
+    /// (sorted + deduped) at every ingestion boundary — see [`normalize_acl`].
+    pub acl: Vec<String>,
+}
+
+/// Canonicalize an edge ACL tag list: sort + dedup in place.
+///
+/// Required at every edge ingestion boundary (builder + persistent `apply`) so
+/// that two logically-identical edges whose caller supplied `acl` in a
+/// different order produce byte-identical snapshots (mirrors why `CsrNode`
+/// stores metadata as a sorted `Vec` instead of archiving the `HashMap`
+/// as-is). Idempotent, so re-normalizing already-canonical data (e.g. on WAL
+/// replay of a previously-applied op) is a cheap no-op.
+pub fn normalize_acl(acl: &mut Vec<String>) {
+    acl.sort();
+    acl.dedup();
 }
 
 /// Lightweight edge result returned by inspection API.
@@ -54,6 +80,9 @@ pub struct EdgeResult {
     pub kind: String,
     pub field_name: Option<String>,
     pub weight: f32,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub acl: Vec<String>,
 }
 
 /// Result of scoring a node. Carries total weight + breakdown per component.
@@ -122,6 +151,20 @@ pub struct DynamicContext {
 
     /// Degree cutoff for "God Object" nodes (e.g. res.partner with 1000+ edges)
     pub max_fan_out: Option<usize>,
+
+    /// Valid-time instant for temporal filtering. `None` = no temporal
+    /// filtering (every edge passes regardless of `valid_from`/`valid_to`).
+    /// `Some(t)` filters to edges whose `[valid_from, valid_to)` window
+    /// contains `t` (see [`DynamicContext::is_edge_visible`]).
+    pub as_of: Option<u64>,
+
+    /// ACL principals held by the caller. An edge with a non-empty `acl` is
+    /// visible only if it intersects this set; an empty `acl` is always
+    /// public. An empty `principals` therefore fails CLOSED for any
+    /// ACL-tagged edge (no tag can ever match). Callers should normalize
+    /// (sort + dedup) at construction; [`crate::pybridge`]'s FFI boundary does
+    /// this for Python callers.
+    pub principals: Vec<String>,
 }
 
 impl Default for DynamicContext {
@@ -137,7 +180,51 @@ impl Default for DynamicContext {
             w_override: 1.0,
             noise_tags: HashSet::new(),
             max_fan_out: None,
+            as_of: None,
+            principals: Vec::new(),
         }
+    }
+}
+
+impl DynamicContext {
+    /// Query-time edge visibility: temporal validity AND edge-level ACL. Both
+    /// checks must pass. This is the ONE shared helper every expansion/read
+    /// site in the traversal/query layer calls — accessors themselves stay
+    /// ctx-free (see `crate::accessor` / `crate::persist::snapshot` module docs).
+    ///
+    /// **Temporal** (`[valid_from, valid_to)`, half-open): `ctx.as_of == None`
+    /// disables temporal filtering entirely (every edge passes). `Some(t)`
+    /// passes iff `(valid_from.is_none() || t >= valid_from) &&
+    /// (valid_to.is_none() || t < valid_to)` — `t == valid_from` passes,
+    /// `t == valid_to` fails (exclusive upper bound).
+    ///
+    /// **ACL**: an edge with an empty `acl` is public and always passes.
+    /// A non-empty `acl` passes iff it intersects `ctx.principals`. An empty
+    /// `ctx.principals` therefore fails CLOSED for any tagged edge — this is
+    /// deliberate (unauthenticated/anonymous context sees no tagged data,
+    /// never "sees everything because nothing was checked").
+    ///
+    /// Base metrics (PageRank, node/edge counts, etc.) are computed over the
+    /// FULL untouched graph — this helper is consulted ONLY by the query
+    /// layer (`beam_traverse`, `find_path`, `contextual_subgraph`,
+    /// `multi_beam_intersection`), never by scoring or storage.
+    pub fn is_edge_visible(
+        &self,
+        valid_from: Option<u64>,
+        valid_to: Option<u64>,
+        acl: &[String],
+    ) -> bool {
+        let temporal_ok = match self.as_of {
+            None => true,
+            Some(t) => valid_from.is_none_or(|vf| t >= vf) && valid_to.is_none_or(|vt| t < vt),
+        };
+        if !temporal_ok {
+            return false;
+        }
+        acl.is_empty()
+            || acl
+                .iter()
+                .any(|tag| self.principals.iter().any(|p| p == tag))
     }
 }
 
@@ -166,4 +253,7 @@ pub struct EdgeInput {
     pub kind: String,
     pub field_name: Option<String>,
     pub base_weight: f32,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub acl: Vec<String>,
 }

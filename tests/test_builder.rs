@@ -21,6 +21,9 @@ fn make_edge(from: &str, to: &str, kind: &str, field: Option<&str>) -> EdgeInput
         kind: kind.to_string(),
         field_name: field.map(|s| s.to_string()),
         base_weight: 1.0,
+        valid_from: None,
+        valid_to: None,
+        acl: Vec::new(),
     }
 }
 
@@ -162,6 +165,9 @@ fn test_large_graph() {
                 kind: "relates_to".to_string(),
                 field_name: None,
                 base_weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             });
         }
     }

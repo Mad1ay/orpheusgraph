@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::accessor::{GraphAccessor, NeighborView, NodeView};
-use crate::types::{EdgeData, EdgeInput, NodeData, NodeInput};
+use crate::types::{normalize_acl, EdgeData, EdgeInput, NodeData, NodeInput};
 
 /// A single mutation. Also the future WAL op enum (§3.3/§4.2) — the `serde`
 /// derive is free because `NodeData`/`EdgeData` already derive it and is inert
@@ -68,6 +68,20 @@ pub enum DeltaError {
         endpoint: String,
         tombstoned: bool,
     },
+    /// An `AddEdge` whose `valid_from > valid_to` (both `Some`) — an empty,
+    /// unsatisfiable half-open window. Apply-time validation's established
+    /// style (matching `MissingEndpoint`): hard error, whole batch rejected,
+    /// `self` left untouched (§3.3 rule 4). Contrast with `build_graph`, whose
+    /// established style for malformed edge input is a silent skip — apply
+    /// instead rejects the WHOLE BATCH, since a partial commit of a
+    /// multi-op batch would violate the all-or-nothing contract.
+    InvalidEdgeValidity {
+        op_index: usize,
+        from: String,
+        to: String,
+        valid_from: u64,
+        valid_to: u64,
+    },
 }
 
 impl std::fmt::Display for DeltaError {
@@ -87,6 +101,17 @@ impl std::fmt::Display for DeltaError {
                 } else {
                     "does not exist"
                 }
+            ),
+            DeltaError::InvalidEdgeValidity {
+                op_index,
+                from,
+                to,
+                valid_from,
+                valid_to,
+            } => write!(
+                f,
+                "AddEdge {from:?}->{to:?} at op {op_index}: valid_from {valid_from} > \
+                 valid_to {valid_to} (empty, unsatisfiable validity window)"
             ),
         }
     }
@@ -168,7 +193,18 @@ impl GraphDelta {
                 Op::RemoveNode { name } => {
                     scratch.insert(name.clone(), false);
                 }
-                Op::AddEdge { from, to, .. } => {
+                Op::AddEdge { from, to, edge } => {
+                    if let (Some(vf), Some(vt)) = (edge.valid_from, edge.valid_to) {
+                        if vf > vt {
+                            return Err(DeltaError::InvalidEdgeValidity {
+                                op_index: i,
+                                from: from.clone(),
+                                to: to.clone(),
+                                valid_from: vf,
+                                valid_to: vt,
+                            });
+                        }
+                    }
                     if !self.is_present(&scratch, base, from) {
                         return Err(DeltaError::MissingEndpoint {
                             op_index: i,
@@ -323,8 +359,22 @@ impl GraphDelta {
         }
     }
 
-    fn add_edge(&mut self, from: String, to: String, edge: EdgeData) {
-        // Endpoints already validated. Always a NEW (parallel) edge.
+    fn add_edge(&mut self, from: String, to: String, mut edge: EdgeData) {
+        // Endpoints (and, for a fresh `apply`, valid_from<=valid_to) already
+        // validated in PASS 1. `replay` skips PASS 1 (already-committed data),
+        // so acl is re-normalized here unconditionally rather than assumed —
+        // idempotent (sort+dedup of already-canonical data is a cheap no-op),
+        // and it is the single ingestion point both `apply`'s PASS 2 and
+        // `replay` funnel through, so this is where the acl
+        // sort+dedup-determinism contract is actually enforced for the delta
+        // layer (mirrors build_graph_inner's edge-insertion normalization).
+        normalize_acl(&mut edge.acl);
+        // Always a NEW (parallel) edge — an add never mutates an existing edge's
+        // fields. SECURITY NOTE: this means `add_edge(a->b, acl=[secret])` over a
+        // PUBLIC base a->b leaves BOTH edges live, so a no-credential query still
+        // reaches b via the public one. To TIGHTEN an existing edge's visibility,
+        // `remove_edge(a,b,kind)` first (the tombstone masks the base in both
+        // directions), then `add_edge` with the restrictive acl.
         let p = self.added_edges.len() as u32;
         self.out_index.entry(from.clone()).or_default().push(p);
         self.in_index.entry(to.clone()).or_default().push(p);
@@ -611,6 +661,9 @@ impl GraphAccessor for DeltaAccessor<'_> {
                     edge_kind: e.edge.kind.clone(),
                     field_name: e.edge.field_name.clone(),
                     edge_weight: e.edge.base_weight,
+                    valid_from: e.edge.valid_from,
+                    valid_to: e.edge.valid_to,
+                    acl: e.edge.acl.clone(),
                 });
             }
         }
@@ -659,6 +712,9 @@ impl GraphAccessor for DeltaAccessor<'_> {
                     edge_kind: e.edge.kind.clone(),
                     field_name: e.edge.field_name.clone(),
                     edge_weight: e.edge.base_weight,
+                    valid_from: e.edge.valid_from,
+                    valid_to: e.edge.valid_to,
+                    acl: e.edge.acl.clone(),
                 });
             }
         }
@@ -722,6 +778,9 @@ pub fn materialize(
                 kind: nb.edge_kind,
                 field_name: nb.field_name,
                 base_weight: nb.edge_weight,
+                valid_from: nb.valid_from,
+                valid_to: nb.valid_to,
+                acl: nb.acl,
             });
         }
     }
@@ -759,6 +818,9 @@ mod tests {
                 kind: k.to_string(),
                 field_name: None,
                 base_weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             })
             .collect();
         let (g, idx) = build_graph(n, e);
@@ -787,6 +849,9 @@ mod tests {
             kind: kind.into(),
             field_name: None,
             base_weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+            acl: Vec::new(),
         }
     }
 
@@ -801,6 +866,15 @@ mod tests {
             from: from.into(),
             to: to.into(),
             edge: edata(kind),
+        }
+    }
+    /// Like `addedge` but with a caller-supplied `EdgeData` (for tests that
+    /// need non-default `valid_from`/`valid_to`/`acl`).
+    fn addedge_full(from: &str, to: &str, edge: EdgeData) -> Op {
+        Op::AddEdge {
+            from: from.into(),
+            to: to.into(),
+            edge,
         }
     }
     fn rmedge(from: &str, to: &str, kind: &str) -> Op {
@@ -1286,6 +1360,7 @@ mod tests {
                 assert_eq!(endpoint, "a");
                 assert!(tombstoned);
             }
+            other => panic!("expected MissingEndpoint, got {other:?}"),
         }
         assert!(d.is_empty(), "rejected batch leaves delta untouched");
     }
@@ -1306,8 +1381,126 @@ mod tests {
                 assert_eq!(endpoint, "ghost");
                 assert!(!tombstoned, "never existed, not tombstoned");
             }
+            other => panic!("expected MissingEndpoint, got {other:?}"),
         }
         assert!(d.is_empty());
+    }
+
+    // ---- temporal validity + ACL (edges) --------------------------------
+
+    #[test]
+    fn batch_reject_invalid_validity_range() {
+        let base = base_graph(vec![("a", "m"), ("b", "m")], vec![]);
+        let mut d = GraphDelta::new();
+        let mut bad = edata("rel");
+        bad.valid_from = Some(10);
+        bad.valid_to = Some(5);
+        let err = d
+            .apply(&base, vec![addedge_full("a", "b", bad)])
+            .unwrap_err();
+        match err {
+            DeltaError::InvalidEdgeValidity {
+                valid_from,
+                valid_to,
+                ..
+            } => {
+                assert_eq!(valid_from, 10);
+                assert_eq!(valid_to, 5);
+            }
+            other => panic!("expected InvalidEdgeValidity, got {other:?}"),
+        }
+        assert!(d.is_empty(), "rejected batch leaves delta untouched");
+    }
+
+    #[test]
+    fn batch_invalid_validity_range_rejects_whole_batch_atomically() {
+        // A valid op followed by a bad-range AddEdge must leave NOTHING
+        // applied (§3.3 rule 4), same guarantee as MissingEndpoint.
+        let base = base_graph(vec![("a", "m"), ("b", "m")], vec![]);
+        let mut d = GraphDelta::new();
+        let mut bad = edata("rel");
+        bad.valid_from = Some(10);
+        bad.valid_to = Some(5);
+        let err = d
+            .apply(
+                &base,
+                vec![upsert(node("x", "m")), addedge_full("a", "b", bad)],
+            )
+            .unwrap_err();
+        assert!(matches!(err, DeltaError::InvalidEdgeValidity { .. }));
+        assert!(d.is_empty());
+        assert!(DeltaAccessor::new(&base, &d).get_node("x").is_none());
+    }
+
+    #[test]
+    fn add_edge_valid_from_equals_valid_to_accepted() {
+        let base = base_graph(vec![("a", "m"), ("b", "m")], vec![]);
+        let mut d = GraphDelta::new();
+        let mut e = edata("rel");
+        e.valid_from = Some(5);
+        e.valid_to = Some(5);
+        d.apply(&base, vec![addedge_full("a", "b", e)]).unwrap();
+        assert_eq!(DeltaAccessor::new(&base, &d).edge_count(), 1);
+    }
+
+    #[test]
+    fn add_edge_acl_normalized_sorted_deduped() {
+        let base = base_graph(vec![("a", "m"), ("b", "m")], vec![]);
+        let mut d = GraphDelta::new();
+        let mut e = edata("rel");
+        e.acl = vec!["z".into(), "a".into(), "z".into(), "m".into()];
+        d.apply(&base, vec![addedge_full("a", "b", e)]).unwrap();
+        let acc = DeltaAccessor::new(&base, &d);
+        let nb = &acc.outgoing_neighbors("a")[0];
+        assert_eq!(
+            nb.acl,
+            vec!["a".to_string(), "m".to_string(), "z".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_edge_temporal_and_acl_fields_carried_through_both_directions() {
+        let base = base_graph(vec![("a", "m"), ("b", "m")], vec![]);
+        let mut d = GraphDelta::new();
+        let mut e = edata("rel");
+        e.valid_from = Some(100);
+        e.valid_to = Some(200);
+        e.acl = vec!["team-x".into()];
+        d.apply(&base, vec![addedge_full("a", "b", e)]).unwrap();
+        let acc = DeltaAccessor::new(&base, &d);
+
+        let out = &acc.outgoing_neighbors("a")[0];
+        assert_eq!(out.valid_from, Some(100));
+        assert_eq!(out.valid_to, Some(200));
+        assert_eq!(out.acl, vec!["team-x".to_string()]);
+
+        let inc = &acc.incoming_neighbors("b")[0];
+        assert_eq!(inc.valid_from, Some(100));
+        assert_eq!(inc.valid_to, Some(200));
+        assert_eq!(inc.acl, vec!["team-x".to_string()]);
+    }
+
+    #[test]
+    fn materialize_preserves_temporal_and_acl_fields() {
+        // Compaction's flatten step (materialize -> build_graph_prenormalized)
+        // must not silently drop valid_from/valid_to/acl.
+        let base = base_graph(vec![("a", "m"), ("b", "m")], vec![]);
+        let base_names: Vec<String> = vec!["a".into(), "b".into()];
+        let mut d = GraphDelta::new();
+        let mut e = edata("rel");
+        e.valid_from = Some(7);
+        e.valid_to = Some(9);
+        e.acl = vec!["ops".into()];
+        d.apply(&base, vec![addedge_full("a", "b", e)]).unwrap();
+
+        let (_, edges_out) = materialize(&base, &base_names, &d);
+        let ei = edges_out
+            .iter()
+            .find(|e| e.from == "a" && e.to == "b")
+            .expect("materialized edge present");
+        assert_eq!(ei.valid_from, Some(7));
+        assert_eq!(ei.valid_to, Some(9));
+        assert_eq!(ei.acl, vec!["ops".to_string()]);
     }
 
     #[test]

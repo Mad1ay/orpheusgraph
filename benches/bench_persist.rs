@@ -54,6 +54,9 @@ fn build_inputs(n: usize) -> (Vec<NodeInput>, Vec<EdgeInput>) {
                 kind: "relates_to".to_string(),
                 field_name: None,
                 base_weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             });
         }
         if i > 10 {
@@ -63,6 +66,9 @@ fn build_inputs(n: usize) -> (Vec<NodeInput>, Vec<EdgeInput>) {
                 kind: "relates_to".to_string(),
                 field_name: None,
                 base_weight: 0.5,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             });
         }
         if i > 100 {
@@ -72,6 +78,9 @@ fn build_inputs(n: usize) -> (Vec<NodeInput>, Vec<EdgeInput>) {
                 kind: "depends_on".to_string(),
                 field_name: None,
                 base_weight: 0.3,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             });
         }
     }
@@ -111,6 +120,9 @@ fn build_delta(base: &OrpheusGraphInner, count: usize) -> GraphDelta {
                 kind: "relates_to".to_string(),
                 field_name: None,
                 base_weight: 0.7,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             },
         });
     }

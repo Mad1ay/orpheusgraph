@@ -4,7 +4,7 @@ use pyo3::exceptions::{PyFileNotFoundError, PyKeyError, PyOSError, PyRuntimeErro
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
-use crate::types::{EdgeData, NodeData};
+use crate::types::{normalize_acl, EdgeData, NodeData};
 
 use crate::accessor::GraphAccessor;
 use crate::builder::build_graph;
@@ -110,6 +110,17 @@ impl PyOrpheusGraph {
 fn resolve_dynamic_context(ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
     let (overlay_nodes, overlay_edges) = ctx.parse_overlays()?;
 
+    // Normalize principals (sort + dedup) at this construction boundary — the
+    // actual "construction" funnel for real (Python) callers building a
+    // context from external input. Pure-Rust callers building `DynamicContext`
+    // via struct-literal syntax are not funneled through any single point (no
+    // other field is normalized either, e.g. `noise_tags` dedups structurally
+    // via its `HashSet` type), so this is where the spec's "normalize:
+    // sort+dedup at construction" is actually enforced.
+    let mut principals = ctx.principals.clone();
+    principals.sort();
+    principals.dedup();
+
     Ok(DynamicContext {
         semantic_boosts: ctx.semantic_boosts.clone(),
         weight_overrides: ctx.weight_overrides.clone(),
@@ -121,6 +132,8 @@ fn resolve_dynamic_context(ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
         w_override: ctx.w_override,
         overlay_nodes,
         overlay_edges,
+        as_of: ctx.as_of,
+        principals,
     })
 }
 
@@ -154,6 +167,9 @@ impl PyOrpheusGraph {
                 kind: n.edge_kind.clone(),
                 field_name: n.field_name.clone(),
                 weight: n.edge_weight,
+                valid_from: n.valid_from,
+                valid_to: n.valid_to,
+                acl: n.acl.clone(),
             })
             .collect())
     }
@@ -169,6 +185,9 @@ impl PyOrpheusGraph {
                 kind: n.edge_kind.clone(),
                 field_name: n.field_name.clone(),
                 weight: n.edge_weight,
+                valid_from: n.valid_from,
+                valid_to: n.valid_to,
+                acl: n.acl.clone(),
             })
             .collect())
     }
@@ -344,9 +363,27 @@ pub struct PyDynamicContext {
     pub w_noise: f32,
     #[pyo3(get, set)]
     pub w_override: f32,
+    /// Valid-time instant for temporal edge filtering. `None` = no temporal
+    /// filtering.
+    #[pyo3(get, set)]
+    pub as_of: Option<u64>,
+    /// ACL principals held by the caller. Normalized (sorted + deduped) when
+    /// resolved into a Rust `DynamicContext` (see `resolve_dynamic_context`).
+    #[pyo3(get, set)]
+    pub principals: Vec<String>,
     /// Virtual overlay nodes (per-tenant customization).
     pub overlay_nodes_raw: Vec<HashMap<String, String>>,
     /// Virtual overlay edges: [{"from": ..., "to": ..., "kind": ...}].
+    ///
+    /// NOTE: overlay edges do NOT currently support `valid_from`/`valid_to`/
+    /// `acl` via this dict API — `overlay_edges_raw` is `Vec<HashMap<String,
+    /// String>>` (every value is a string, e.g. `"base_weight": "1.0"`), and
+    /// `acl` is a list, not a scalar string, so it does not fit this schema
+    /// without a breaking change to it. Overlay edges therefore always
+    /// resolve to `valid_from=None, valid_to=None, acl=[]` (unbounded/public)
+    /// — a safe default, never silently over- or under-filtered. Rust-native
+    /// callers constructing `EdgeData` directly for `ctx.overlay_edges` DO
+    /// get full support (see `overlay.rs` tests).
     pub overlay_edges_raw: Vec<HashMap<String, String>>,
 }
 
@@ -363,7 +400,9 @@ impl PyDynamicContext {
         w_noise = 1.0,
         w_override = 1.0,
         overlay_nodes = None,
-        overlay_edges = None
+        overlay_edges = None,
+        as_of = None,
+        principals = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -377,6 +416,8 @@ impl PyDynamicContext {
         w_override: f32,
         overlay_nodes: Option<Vec<HashMap<String, String>>>,
         overlay_edges: Option<Vec<HashMap<String, String>>>,
+        as_of: Option<u64>,
+        principals: Option<Vec<String>>,
     ) -> Self {
         Self {
             semantic_boosts: semantic_boosts.unwrap_or_default(),
@@ -387,6 +428,8 @@ impl PyDynamicContext {
             w_semantic,
             w_noise,
             w_override,
+            as_of,
+            principals: principals.unwrap_or_default(),
             overlay_nodes_raw: overlay_nodes.unwrap_or_default(),
             overlay_edges_raw: overlay_edges.unwrap_or_default(),
         }
@@ -412,11 +455,14 @@ impl PyDynamicContext {
 
     fn __repr__(&self) -> String {
         format!(
-            "DynamicContext(boosts={}, overrides={}, noise_tags={}, max_fan_out={:?})",
+            "DynamicContext(boosts={}, overrides={}, noise_tags={}, max_fan_out={:?}, \
+             as_of={:?}, principals={})",
             self.semantic_boosts.len(),
             self.weight_overrides.len(),
             self.noise_tags.len(),
             self.max_fan_out,
+            self.as_of,
+            self.principals.len(),
         )
     }
 }
@@ -455,10 +501,16 @@ impl PyDynamicContext {
             let to = require_overlay_field(m, "to", "edge")?;
             let kind = require_overlay_field(m, "kind", "edge")?;
             let base_weight = parse_overlay_f32(m, "base_weight", 1.0, &format!("{from}->{to}"))?;
+            // valid_from/valid_to/acl are not exposed via this string-only
+            // dict schema (see the `overlay_edges_raw` doc comment) — always
+            // unbounded/public, never silently mis-filtered.
             let edge = EdgeData {
                 kind,
                 field_name: m.get("field").cloned(),
                 base_weight,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             };
             overlay_edges.push((from, to, edge));
         }
@@ -565,6 +617,12 @@ pub struct PyEdgeResult {
     pub field_name: Option<String>,
     #[pyo3(get)]
     pub weight: f32,
+    #[pyo3(get)]
+    pub valid_from: Option<u64>,
+    #[pyo3(get)]
+    pub valid_to: Option<u64>,
+    #[pyo3(get)]
+    pub acl: Vec<String>,
 }
 
 impl PyEdgeResult {
@@ -575,6 +633,9 @@ impl PyEdgeResult {
             kind: er.kind,
             field_name: er.field_name,
             weight: er.weight,
+            valid_from: er.valid_from,
+            valid_to: er.valid_to,
+            acl: er.acl,
         }
     }
 }
@@ -680,6 +741,24 @@ fn parse_node_inputs(nodes: &Bound<'_, PyList>) -> PyResult<Vec<NodeInput>> {
     Ok(rust_nodes)
 }
 
+/// Optional u64 dict field (absent -> None). A present-but-non-u64 value is a
+/// hard error rather than a silent default.
+fn optional_dict_u64(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
+    d.get_item(key)?.map(|v| v.extract::<u64>()).transpose()
+}
+
+/// Optional list[str] dict field; absent -> empty `Vec`. Normalized (sorted +
+/// deduped) here — see `normalize_acl` — so `acl` is canonical from the
+/// moment it enters Rust, matching the ingest-time-normalization contract.
+fn optional_dict_acl(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<String>> {
+    let mut acl: Vec<String> = match d.get_item(key)? {
+        Some(v) => v.extract()?,
+        None => Vec::new(),
+    };
+    normalize_acl(&mut acl);
+    Ok(acl)
+}
+
 /// Parse a Python list of edge dicts into `EdgeInput`s.
 fn parse_edge_inputs(edges: &Bound<'_, PyList>) -> PyResult<Vec<EdgeInput>> {
     let mut rust_edges: Vec<EdgeInput> = Vec::with_capacity(edges.len());
@@ -704,6 +783,15 @@ fn parse_edge_inputs(edges: &Bound<'_, PyList>) -> PyResult<Vec<EdgeInput>> {
                 .map(|v| v.extract::<f32>())
                 .transpose()?
                 .unwrap_or(1.0),
+            // Missing keys default to unbounded/public (backward-compatible
+            // with pre-existing callers that never pass these). A malformed
+            // valid_from > valid_to range is NOT rejected here — build_graph's
+            // established error style for bad edge input is a silent skip
+            // (matches "skip edges referencing unknown nodes"); see
+            // `builder.rs::build_graph_inner`.
+            valid_from: optional_dict_u64(dict, "valid_from")?,
+            valid_to: optional_dict_u64(dict, "valid_to")?,
+            acl: optional_dict_acl(dict, "acl")?,
         });
     }
     Ok(rust_edges)
@@ -831,6 +919,18 @@ fn parse_ops(ops: &Bound<'_, PyList>) -> PyResult<Vec<Op>> {
                 let base_weight = op_f32(d, "base_weight", 1.0)?;
                 require_unit(base_weight, "base_weight", &format!("{from}->{to}"))?;
                 let field_name = optional_op_str(d, "field")?;
+                // Missing valid_from/valid_to/acl default to unbounded/public
+                // (backward-compatible). A malformed valid_from > valid_to
+                // range is NOT rejected here — it is deferred to
+                // `GraphDelta::apply`'s PASS-1 validation
+                // (`DeltaError::InvalidEdgeValidity`, mapped to `PyValueError`
+                // by `map_persist_err`), matching how AddEdge endpoint
+                // existence is ALSO deferred there rather than checked in this
+                // parser — apply's established error style, not the FFI
+                // parse-time style `require_unit` uses for weights.
+                let valid_from = optional_dict_u64(d, "valid_from")?;
+                let valid_to = optional_dict_u64(d, "valid_to")?;
+                let acl = optional_dict_acl(d, "acl")?;
                 out.push(Op::AddEdge {
                     from,
                     to,
@@ -838,6 +938,9 @@ fn parse_ops(ops: &Bound<'_, PyList>) -> PyResult<Vec<Op>> {
                         kind,
                         field_name,
                         base_weight,
+                        valid_from,
+                        valid_to,
+                        acl,
                     },
                 });
             }
@@ -911,6 +1014,15 @@ impl PyPersistentGraph {
     /// `expected_seq` gives optimistic CAS: if the store moved past it, a
     /// `ConflictError` is raised and nothing is written — re-read and retry.
     /// The GIL is released across the durable append (fsync may block).
+    ///
+    /// Durability: a returned seq (Ok) means the batch is durable (WAL frame +
+    /// a covering COMMIT marker both fsync'd) — it survives process death and
+    /// power loss. A raised error means durability is INDETERMINATE: a COMMIT
+    /// fsync can fail while its slot still persists, so the batch MAY be visible
+    /// or invisible after a reopen. Recovery always reopens to a consistent
+    /// committed prefix and never loses an acked batch; reconcile an error by
+    /// re-opening the store and reading `seq` (the recovered committed prefix),
+    /// NOT by blindly retrying (a non-idempotent batch could double-apply).
     #[pyo3(signature = (ops, expected_seq = None))]
     fn apply(
         &self,
@@ -960,6 +1072,9 @@ impl PyPersistentGraph {
                 kind: n.edge_kind.clone(),
                 field_name: n.field_name.clone(),
                 weight: n.edge_weight,
+                valid_from: n.valid_from,
+                valid_to: n.valid_to,
+                acl: n.acl.clone(),
             })
             .collect())
     }
@@ -977,6 +1092,9 @@ impl PyPersistentGraph {
                 kind: n.edge_kind.clone(),
                 field_name: n.field_name.clone(),
                 weight: n.edge_weight,
+                valid_from: n.valid_from,
+                valid_to: n.valid_to,
+                acl: n.acl.clone(),
             })
             .collect())
     }

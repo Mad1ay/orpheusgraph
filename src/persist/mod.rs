@@ -18,9 +18,11 @@
 //!   timeline fork (§4.3). No recovery path panics on disk bytes.
 //!
 //! ## Phase 2b (this module + [`snapshot`])
-//! `create()` writes the **V2 CSR** snapshot (`format_version` 2); `open()`
-//! reads ONLY V2 (mmap-traversed [`BaseGraph::Archived`], honoring
-//! [`BaseMode`]/[`Validate`]/`prefault`) and REJECTS legacy formats 0 and 1 as
+//! `create()` writes the CSR snapshot at the current `format_version` (3; the
+//! CSR byte layout is still named "V2" — see [`manifest`] — with the COMMIT
+//! sidecar the addition that bumped the store version to 3); `open()` mmap-
+//! traverses it ([`BaseGraph::Archived`], honoring [`BaseMode`]/[`Validate`]/
+//! `prefault`) and REJECTS legacy formats 0, 1 and 2 as
 //! [`PersistError::Corrupt`] — pre-release, no in-place migration; recreate
 //! the store instead. Added: crash-safe [`compact`] +
 //! auto-compaction (fold the delta into a fresh base), a two-tier snapshot GC
@@ -41,19 +43,23 @@ use crate::builder::{build_graph, build_graph_prenormalized};
 use crate::delta::{materialize, GraphDelta, Op};
 use crate::graph::OrpheusGraphInner;
 
+mod commit;
 mod error;
 mod lock;
 mod manifest;
 mod snapshot;
+pub mod vfs;
 mod wal;
 
 pub use error::PersistError;
 pub use snapshot::{ArchivedCsrView, Validate};
+pub use vfs::{RealVfs, Vfs, VfsFile};
 
+use commit::CommitFile;
 use lock::DirLock;
 use manifest::{
-    fsync_dir, mint_epoch, read_manifest, write_file_atomic, write_manifest_atomic, Manifest,
-    CREATED_BY, FORMAT_VERSION,
+    mint_epoch, read_manifest, write_file_atomic, write_manifest_atomic, Manifest, CREATED_BY,
+    FORMAT_VERSION,
 };
 use snapshot::{open_snapshot, to_rkyv_v2};
 use wal::{read_and_scan, WalRecord, WalWriter};
@@ -120,9 +126,34 @@ pub struct GraphState {
     pub epoch: u128,
 }
 
+/// What the last `open()`/`create()` recovery did — surfaced so a caller can
+/// observe the fsync-failure ambiguity being resolved (§4.3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// crc-valid WAL frames found BEYOND the durable COMMIT marker: the
+    /// fsync-failure / never-fsync'd "lucky tail" ambiguity artifact. These are
+    /// NOT replayed (recovery trusts the marker, not surviving crc-valid bytes)
+    /// and the WAL was physically truncated back to the committed boundary. 0 on
+    /// a store closed cleanly (or one whose whole tail was committed).
+    pub uncommitted_tail_frames: usize,
+    /// Frames dropped as a torn tail (crc-bad/short/over-long LAST frame — a
+    /// classic power-loss artifact, distinct from the ambiguity tail above).
+    pub torn_tail_frames: usize,
+}
+
 /// Everything mutated only under the writer `Mutex`.
 struct Writer {
+    /// The filesystem seam every durability write goes through. [`RealVfs`] in
+    /// production (zero overhead); a fault FS in the power-loss harness. Held
+    /// here so `compact`/`flush`/`close` reuse the same instance the store was
+    /// opened with. Never touched by the reader path.
+    vfs: Arc<dyn Vfs>,
     wal: WalWriter,
+    /// The durable-commit high-water marker (COMMIT sidecar). Advanced in
+    /// lock-step with `durable_seq`: every fsync point that makes new WAL frames
+    /// durable also stamps them into this marker, and recovery replays ONLY up
+    /// to the marker. Its `committed_seq` and `durable_seq` are kept equal.
+    commit: CommitFile,
     /// Commit counter — mirror of the last appended WAL frame's seq. Advanced
     /// after every accepted append, even under `OnFlush` where the frame is only
     /// write-through (not yet fsync'd) (§4.2).
@@ -148,7 +179,7 @@ struct Writer {
     /// per-writer rather than just reading the FORMAT_VERSION constant so this
     /// field stays faithful to what's actually on disk (relevant if a future
     /// format bump adds a live in-place upgrade path). Today `open()` rejects
-    /// any format below FORMAT_VERSION outright (legacy 0/1 -> `Corrupt`), so
+    /// any format below FORMAT_VERSION outright (legacy 0/1/2 -> `Corrupt`), so
     /// this is always FORMAT_VERSION for any store that opened successfully.
     format_version: u32,
     /// Monotonic compaction id; the current snapshot's cid (§4.4b).
@@ -165,6 +196,23 @@ struct Writer {
 }
 
 impl Writer {
+    /// Advance the durable COMMIT marker to `committed_seq` in the current epoch,
+    /// then — only if that write+fsync SUCCEEDED — advance `durable_seq` to match.
+    /// Called at every fsync point (per §4.2 policy). Keeping `durable_seq` and
+    /// the marker in lock-step (both moved here, both only on success) means the
+    /// MANIFEST high_seq (derived from `durable_seq`) can never claim durability
+    /// the marker doesn't back — so a reopen's `commit_hw >= high_seq` check
+    /// never false-bricks. A failure poisons the WAL writer (the store's single
+    /// "durability broke" signal) and propagates.
+    fn advance_commit(&mut self, committed_seq: u64) -> Result<(), PersistError> {
+        if let Err(e) = self.commit.advance(self.epoch, committed_seq) {
+            self.wal.poisoned = true;
+            return Err(e);
+        }
+        self.durable_seq = committed_seq;
+        Ok(())
+    }
+
     fn build_manifest(&self, clean_shutdown: bool) -> Manifest {
         Manifest {
             format_version: self.format_version,
@@ -195,6 +243,9 @@ pub struct PersistentGraph {
     writer: Mutex<Writer>,
     /// flock held for the process lifetime (§4.1). Released on drop.
     _lock: DirLock,
+    /// What the `open()`/`create()` that produced this handle recovered (the
+    /// fsync-failure ambiguity resolution). Immutable for the handle's life.
+    recovery: RecoveryReport,
 }
 
 // ArcSwap/Mutex/DirLock don't derive Debug; a minimal manual impl is enough for
@@ -245,8 +296,8 @@ fn snapshot_v2_name(seq: u64, cid: u64) -> String {
 /// file fails; we swallow that error and DEFER the reclaim to the next
 /// open()-time GC sweep (which runs before the file is re-mapped). Every removal
 /// (and every deferral) is logged.
-fn remove_snapshot_file(path: &Path) {
-    match std::fs::remove_file(path) {
+fn remove_snapshot_file(vfs: &dyn Vfs, path: &Path) {
+    match vfs.remove_file(path) {
         Ok(()) => eprintln!("orpheusgraph: GC removed snapshot {}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
@@ -266,7 +317,7 @@ fn remove_snapshot_file(path: &Path) {
 /// never touches `.tmp` files (there is no concurrent writer — this runs under
 /// the writer path, single-writer). Best-effort: a `read_dir` error is logged,
 /// not fatal.
-fn gc_orphan_snapshots(dir: &Path, keep: &str) {
+fn gc_orphan_snapshots(vfs: &dyn Vfs, dir: &Path, keep: &str) {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
@@ -288,7 +339,7 @@ fn gc_orphan_snapshots(dir: &Path, keep: &str) {
             name.starts_with("snapshot-") && (name.ends_with(".og") || name.ends_with(".og.tmp"));
         let is_stray_tmp = name == "MANIFEST.json.tmp";
         if is_orphan_snapshot || is_stray_tmp {
-            remove_snapshot_file(&entry.path());
+            remove_snapshot_file(vfs, &entry.path());
         }
     }
 }
@@ -298,6 +349,18 @@ impl PersistentGraph {
     /// existing MANIFEST. Writes snapshot + empty WAL + MANIFEST with the
     /// tmp+fsync+rename+fsync(dir) discipline; `clean_shutdown` starts `false`.
     pub fn create(
+        dir: impl AsRef<Path>,
+        base_graph: OrpheusGraphInner,
+    ) -> Result<Self, PersistError> {
+        Self::create_with_vfs(Arc::new(RealVfs), dir, base_graph)
+    }
+
+    /// [`create`](Self::create) with an explicit [`Vfs`]. `#[doc(hidden)]`: the
+    /// only caller besides `create` is the power-loss fault-injection harness,
+    /// which supplies a fault FS. Production always passes [`RealVfs`].
+    #[doc(hidden)]
+    pub fn create_with_vfs(
+        vfs: Arc<dyn Vfs>,
         dir: impl AsRef<Path>,
         base_graph: OrpheusGraphInner,
     ) -> Result<Self, PersistError> {
@@ -318,17 +381,24 @@ impl PersistentGraph {
         let snapshot_crc32 = crc32fast::hash(&bytes);
         let compaction_id = 0u64;
         let snapshot_file = snapshot_v2_name(0, compaction_id);
-        write_file_atomic(&dir, &snapshot_file, &bytes)?;
+        write_file_atomic(&*vfs, &dir, &snapshot_file, &bytes)?;
 
         // Empty WAL, durably created.
         let wal_path = dir.join("wal.log");
         {
-            let f = std::fs::File::create(&wal_path)?;
+            let mut f = vfs.create(&wal_path)?;
             f.sync_all()?;
         }
-        fsync_dir(&dir)?;
+        vfs.fsync_dir(&dir)?;
 
         let epoch = mint_epoch()?;
+
+        // COMMIT sidecar BEFORE the MANIFEST (the root pointer): a present
+        // MANIFEST then always implies a present COMMIT, so open() can hard-fail
+        // a MANIFEST-without-COMMIT store as Corrupt. Initial committed_seq = 0
+        // (the fresh store's seq).
+        let commit = CommitFile::create(&*vfs, &dir, epoch, 0)?;
+
         let manifest = Manifest {
             format_version: FORMAT_VERSION,
             snapshot_file: snapshot_file.clone(),
@@ -341,12 +411,9 @@ impl PersistentGraph {
             created_by: CREATED_BY.to_string(),
             checksum: 0,
         };
-        write_manifest_atomic(&dir, &manifest)?;
+        write_manifest_atomic(&*vfs, &dir, &manifest)?;
 
-        let wal_file = std::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&wal_path)?;
+        let wal_file = vfs.open_append(&wal_path)?;
         let wal = WalWriter::new(wal_file, FsyncPolicy::default(), 0);
 
         let base = Arc::new(BaseGraph::Owned(base_graph));
@@ -358,7 +425,9 @@ impl PersistentGraph {
             epoch,
         }));
         let writer = Mutex::new(Writer {
+            vfs,
             wal,
+            commit,
             seq: 0,
             durable_seq: 0, // fresh store: empty WAL fsync'd, nothing acked yet
             epoch,
@@ -380,6 +449,7 @@ impl PersistentGraph {
             state,
             writer,
             _lock,
+            recovery: RecoveryReport::default(),
         })
     }
 
@@ -394,10 +464,27 @@ impl PersistentGraph {
     }
 
     /// [`open`](Self::open) with explicit base [`BaseMode`], [`Validate`] mode
-    /// and `prefault` (madvise WILLNEED), applied to the V2 CSR path — the only
-    /// format `open()` accepts. Legacy formats 0 and 1 are rejected before any
+    /// and `prefault` (madvise WILLNEED), applied to the CSR path — the only
+    /// format `open()` accepts. Legacy formats 0, 1 and 2 are rejected before any
     /// of these options are consulted (see the `format_version` match below).
     pub fn open_with(
+        dir: impl AsRef<Path>,
+        create: bool,
+        mode: BaseMode,
+        validate: Validate,
+        prefault: bool,
+    ) -> Result<Self, PersistError> {
+        Self::open_with_vfs(Arc::new(RealVfs), dir, create, mode, validate, prefault)
+    }
+
+    /// [`open_with`](Self::open_with) with an explicit [`Vfs`]. `#[doc(hidden)]`:
+    /// used by the power-loss fault-injection harness to route all recovery-time
+    /// durability writes (WAL truncate, COMMIT re-stamp, MANIFEST rewrite) through
+    /// a fault FS. Production always passes [`RealVfs`]. The snapshot mmap read is
+    /// deliberately NOT routed here (see the `vfs` module docs).
+    #[doc(hidden)]
+    pub fn open_with_vfs(
+        vfs: Arc<dyn Vfs>,
         dir: impl AsRef<Path>,
         create: bool,
         mode: BaseMode,
@@ -420,7 +507,7 @@ impl PersistentGraph {
 
         if !manifest_path.exists() {
             if create {
-                return Self::create(&dir, empty_inner());
+                return Self::create_with_vfs(vfs, &dir, empty_inner());
             }
             return Err(PersistError::NotFound(dir));
         }
@@ -439,25 +526,28 @@ impl PersistentGraph {
         let clean_shutdown = manifest.clean_shutdown;
         let snapshot_seq = manifest.snapshot_seq;
 
-        // 2. Load + integrity-check the snapshot. Only format_version 2 (V2 CSR)
-        //    is accepted below (legacy 0/1 are rejected, see the match arm's own
+        // 2. Load + integrity-check the snapshot. Only format_version 3 is
+        //    accepted below (legacy 0/1/2 are rejected, see the match arm's own
         //    comment); the accepted path honors mode/validate/prefault via
         //    open_snapshot, whose full/crc modes do the crc check internally.
+        //    (The SNAPSHOT byte layout is unchanged from format 2 — it is the
+        //    required COMMIT sidecar that distinguishes format 3 from 2.)
         let snap_path = dir.join(&manifest.snapshot_file);
         let base = match manifest.format_version {
-            // V0 (flat) and V1 (CSR without the persisted name index) are legacy
-            // on-disk formats this build no longer reads. They are REJECTED, not
-            // silently upgraded, so a stale store fails loudly instead of feeding
-            // a mislabelled snapshot to the V2 reader. Recreate the store to
-            // migrate (pre-release: no in-place migration path).
-            0 | 1 => {
+            // V0 (flat), V1 (CSR without the persisted name index) and V2 (CSR +
+            // index but NO COMMIT sidecar) are legacy on-disk formats this build
+            // no longer reads. They are REJECTED, not silently upgraded, so a
+            // stale store fails loudly instead of running without the durable
+            // commit marker. Recreate the store to migrate (pre-release: no
+            // in-place migration path — same precedent as the V1->V2 bump).
+            0..=2 => {
                 return Err(PersistError::Corrupt(format!(
-                    "legacy snapshot format_version {} is no longer supported \
+                    "legacy store format_version {} is no longer supported \
                      (recreate the store; current format is {FORMAT_VERSION})",
                     manifest.format_version
                 )))
             }
-            2 => Arc::new(open_snapshot(
+            3 => Arc::new(open_snapshot(
                 &snap_path,
                 mode,
                 validate,
@@ -478,28 +568,68 @@ impl PersistentGraph {
         // "corruption -> raise, never auto-heal by discarding data"). Only
         // create() mints a fresh WAL.
         let wal_path = dir.join("wal.log");
-        let mut wal_file = std::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&wal_path)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    PersistError::Corrupt(format!(
-                        "MANIFEST present but wal.log missing at {}",
-                        wal_path.display()
-                    ))
-                } else {
-                    PersistError::Io(e)
-                }
-            })?;
-        let scan = read_and_scan(&mut wal_file)?;
+        let mut wal_file = vfs.open_append(&wal_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                PersistError::Corrupt(format!(
+                    "MANIFEST present but wal.log missing at {}",
+                    wal_path.display()
+                ))
+            } else {
+                PersistError::Io(e)
+            }
+        })?;
+        let scan = read_and_scan(&mut *wal_file)?;
 
+        // 3a. The authoritative durable-commit high-water: the COMMIT sidecar
+        //     (required for a format-3 store; missing/both-slots-corrupt is
+        //     Corrupt, handled inside CommitFile::open). `snapshot_seq` is a floor
+        //     because it is durable-by-construction (folded into a fsync'd,
+        //     renamed snapshot), covering a compaction that committed the MANIFEST
+        //     but crashed before advancing the marker.
+        let (commit_record, mut commit_file) = CommitFile::open(&*vfs, &dir)?;
+        let commit_hw = commit_record.committed_seq.max(snapshot_seq);
+
+        // Consistency: the COMMIT marker is advanced on every fsync and the
+        // MANIFEST's high_seq only at the (rarer) close/compaction/recovery
+        // points, both from `durable_seq` — so committed_seq is always >=
+        // high_seq for a consistent store. A marker BEHIND the MANIFEST means an
+        // inconsistent/corrupt pair, not a normal state: hard-error.
+        if commit_hw < manifest.high_seq {
+            return Err(PersistError::Corrupt(format!(
+                "COMMIT marker committed_seq {commit_hw} is behind MANIFEST high_seq {} \
+                 (inconsistent durable pointers)",
+                manifest.high_seq
+            )));
+        }
+
+        // 3b. Replay ONLY the committed prefix (frame.seq <= commit_hw) while the
+        //     crc-valid-prefix rule holds. Recovery trusts the MARKER, not
+        //     "whatever crc-valid frames survived": crc-valid frames BEYOND the
+        //     marker are the fsync-failure / never-fsync'd ("lucky tail")
+        //     ambiguity artifact — counted, NOT replayed, and physically
+        //     truncated below. `committed_end` tracks the byte offset just past
+        //     the last committed frame (re-encoding is byte-identical to disk —
+        //     postcard is deterministic) so the WAL can be truncated to match the
+        //     logical committed state exactly.
         let mut delta = GraphDelta::new();
         let mut expected_next = snapshot_seq + 1;
         let mut last_applied = snapshot_seq;
+        let mut committed_end: u64 = 0;
+        let mut uncommitted_tail_frames: usize = 0;
         for rec in &scan.records {
+            if rec.seq > commit_hw {
+                // Beyond the durable marker: the ambiguity artifact. Do NOT
+                // replay; count it. (Writer poisoning guarantees frames stay
+                // in-order, so everything after the first over-marker frame is
+                // equally uncommitted.)
+                uncommitted_tail_frames += 1;
+                continue;
+            }
+            // Within the committed range: this frame's bytes stay in the WAL.
+            committed_end += wal::encode_frame(rec)?.len() as u64;
             if rec.seq <= snapshot_seq {
-                // Already folded into the snapshot (compaction crash window). Skip.
+                // Already folded into the snapshot (compaction crash window). Skip
+                // replay, but its bytes still count toward committed_end.
                 continue;
             }
             if rec.seq != expected_next {
@@ -516,51 +646,72 @@ impl PersistentGraph {
             expected_next += 1;
         }
 
-        // 3b. Durable high-water check (§7). `high_seq` is the seq durably
-        //     recorded at the last close/compaction (MANIFEST rewrite points).
-        //     If replay yielded LESS, the WAL lost acked data (external truncation
-        //     / whole-frame suffix loss that lands on a boundary, so it isn't seen
-        //     as a torn tail) — raise rather than silently open a regressed store.
-        //     Closes the asymmetry where `rm wal.log` was Corrupt but
-        //     `truncate -s0 wal.log` was silently accepted.
-        //
-        //     GRANULARITY (documented limitation, audit #6): this is
-        //     defense-in-depth against EXTERNAL FS faults, and its floor is the
-        //     last MANIFEST high-water, NOT the last fsync. Frames fsync'd under
-        //     EveryBatch AFTER the last close/compaction are durable but not yet
-        //     reflected in `high_seq`, so an external truncation of ONLY those
-        //     frames would not be detected here (it opens at the earlier seq).
-        //     The core durability guarantees are unaffected — process death and
-        //     power-loss of the un-fsync'd tail are handled exactly; this check
-        //     only widens detection of a rarer external-corruption class.
-        //     Persisting high_seq per-fsync would need a MANIFEST rewrite per
-        //     batch (rejected: it burdens the durability hot path for a
-        //     defense-in-depth check).
-        if last_applied < manifest.high_seq {
+        // 3c. Committed data must be fully present. If the crc-valid prefix ended
+        //     before commit_hw (a torn/lost frame WITHIN the committed range, or
+        //     an external truncation below the marker), acked-and-committed data
+        //     is gone — raise rather than silently open a regressed store (§7).
+        //     This is the tighter successor to the old MANIFEST-high_seq check:
+        //     commit_hw >= high_seq and it advances per fsync, so it catches the
+        //     `truncate -s0 wal.log` class exactly at the committed boundary.
+        if last_applied < commit_hw {
             return Err(PersistError::Corrupt(format!(
-                "WAL lost acked data: recovered seq {last_applied} < durable high-water {} \
-                 (external WAL truncation/suffix loss)",
-                manifest.high_seq
+                "WAL lost committed data: recovered seq {last_applied} < durable commit \
+                 marker {commit_hw} (torn/truncated committed frame)"
             )));
         }
 
-        // 4. Truncate a torn tail (guaranteed the last frame by poisoning).
-        let tail_truncated = scan.tail_truncated;
-        if tail_truncated {
-            wal_file.set_len(scan.valid_end)?;
+        // Invariant guard: the committed frames are a byte PREFIX of the crc-valid
+        // frames, so the recomputed committed boundary can never exceed the scan's
+        // valid end. A violation would mean a re-encode disagreed with the on-disk
+        // bytes (postcard non-determinism) — hard-error rather than truncate wrong.
+        if committed_end > scan.valid_end {
+            return Err(PersistError::Corrupt(format!(
+                "internal: committed boundary {committed_end} exceeds WAL valid end {}",
+                scan.valid_end
+            )));
+        }
+
+        // 4. Physically truncate everything past the committed boundary: the
+        //    uncommitted ambiguity tail AND/OR a torn tail (both live beyond
+        //    committed_end). After this the WAL file matches the logical
+        //    committed state and the next append lands at committed_end.
+        let file_len = wal_file.len()?;
+        let truncated = file_len > committed_end;
+        if truncated {
+            wal_file.set_len(committed_end)?;
             wal_file.sync_all()?;
-            fsync_dir(&dir)?;
+            vfs.fsync_dir(&dir)?;
             eprintln!(
-                "orpheusgraph: WAL torn tail at offset {}, dropped {} frame(s) during recovery",
-                scan.valid_end, scan.dropped
+                "orpheusgraph: WAL truncated to committed boundary {committed_end} \
+                 (dropped {uncommitted_tail_frames} uncommitted frame(s){})",
+                if scan.tail_truncated {
+                    " + torn tail"
+                } else {
+                    ""
+                }
             );
         }
 
-        // 5. Timeline-fork detection & epoch re-mint.
-        let epoch = if tail_truncated || !clean_shutdown {
+        // 5. Timeline-fork detection & epoch re-mint. Any physical truncation
+        //    reuses seqs on the next timeline (the discarded over-marker frames'
+        //    seqs get re-issued after reopen), so the ABA guard applies exactly
+        //    as for a torn tail — re-mint. `!clean_shutdown` catches an un-torn
+        //    un-fsync'd tail loss with no truncation to observe.
+        let epoch = if truncated || !clean_shutdown {
             mint_epoch()?
         } else {
             manifest.epoch
+        };
+
+        // 5b. Re-stamp the COMMIT marker into THIS incarnation: record the
+        //     (possibly re-minted) epoch and heal committed_seq up to commit_hw
+        //     (e.g. a compaction that advanced snapshot_seq past the old marker).
+        //     A failure here poisons the store the same as any durability write.
+        commit_file.advance(epoch, commit_hw)?;
+
+        let recovery = RecoveryReport {
+            uncommitted_tail_frames,
+            torn_tail_frames: if scan.tail_truncated { scan.dropped } else { 0 },
         };
 
         // 6. Persist clean_shutdown=false for this (now open) incarnation. This
@@ -577,18 +728,18 @@ impl PersistentGraph {
             snapshot_crc32: manifest.snapshot_crc32,
             compaction_id: manifest.compaction_id,
             epoch,
-            // Do NOT promote high_seq to last_applied: under OnFlush the replayed
-            // frames survived the crash in the page cache but were never fsync'd,
-            // so they are NOT durable — a later power-loss legitimately drops
-            // them. Promoting here would then false-brick the store on reopen
-            // (audit P1). Keep the last genuinely-durable high-water; new durable
-            // data re-advances it via the next flush/close/compaction.
-            high_seq: manifest.high_seq,
+            // Record the durable commit marker as the high-water. `commit_hw`
+            // only ever covers fsync'd frames (the COMMIT marker is fsync-gated)
+            // — the un-fsync'd "lucky tail" was already truncated in step 4 — so
+            // this never over-reports durability and cannot false-brick a reopen
+            // after a legitimate power-loss of un-fsync'd data (the old audit-P1
+            // trap, now structurally impossible: last_applied == commit_hw here).
+            high_seq: commit_hw,
             clean_shutdown: false,
             created_by: manifest.created_by.clone(),
             checksum: 0,
         };
-        write_manifest_atomic(&dir, &out_manifest)?;
+        write_manifest_atomic(&*vfs, &dir, &out_manifest)?;
 
         // 6b. Open-time GC backstop (§4.3 step 6 / §4.4b): reclaim crash-orphan
         //     snapshots (and any Windows-deferred deletes) left by a compaction
@@ -596,18 +747,21 @@ impl PersistentGraph {
         //     Runs under the writer lock, before priming; never touches the live
         //     file. For V2 mmap the live file is already mapped in `base` — on
         //     Linux unlinking OTHER snapshots is safe.
-        gc_orphan_snapshots(&dir, &manifest.snapshot_file);
+        gc_orphan_snapshots(&*vfs, &dir, &manifest.snapshot_file);
 
-        // 7. Prime the writer at end-of-valid-WAL.
-        let wal = WalWriter::new(wal_file, FsyncPolicy::default(), scan.valid_end);
+        // 7. Prime the writer at the committed boundary (the next append lands
+        //    there — the WAL was truncated to it in step 4).
+        let wal = WalWriter::new(wal_file, FsyncPolicy::default(), committed_end);
         let delta = Arc::new(delta);
         let writer = Mutex::new(Writer {
+            vfs,
             wal,
+            commit: commit_file,
             seq: last_applied,
-            // The genuinely-durable high-water is the on-disk MANIFEST's high_seq
-            // (recovery under OnFlush does not newly fsync the replayed frames).
-            // Never set this to last_applied — that would over-report durability.
-            durable_seq: manifest.high_seq,
+            // `commit_hw` is the authoritative durable high-water (the COMMIT
+            // marker). `last_applied == commit_hw` here (step 3c guarantees no
+            // shortfall), so seq and durable_seq coincide at the committed prefix.
+            durable_seq: commit_hw,
             epoch,
             base: base.clone(),
             delta: delta.clone(),
@@ -635,12 +789,31 @@ impl PersistentGraph {
             state,
             writer,
             _lock,
+            recovery,
         })
     }
 
     /// Apply an all-or-nothing batch. Optional `expected_seq` is an in-process
     /// CAS token checked atomically against the durable counter (§3.3.6).
     /// Returns the new durable seq on success.
+    ///
+    /// ## Durability contract
+    /// * **`Ok` ⇒ durable** (the honest, strong guarantee): the batch's WAL frame
+    ///   is fsync'd AND a COMMIT marker covering it is fsync'd, so it survives both
+    ///   process death and power loss. (Under `OnFlush` the marker instead advances
+    ///   at the next [`flush`](Self::flush)/[`close`](Self::close)/compaction; until
+    ///   then an applied batch is visible but only `> committed_seq()` — see that
+    ///   method — and is dropped on a crash before it is committed.)
+    /// * **`Err` ⇒ durability INDETERMINATE.** A COMMIT-slot fsync can return `Err`
+    ///   while its fully-written slot still persists via kernel writeback, advancing
+    ///   the on-disk marker — so an Err'd batch MAY be visible on reopen (or invisible
+    ///   on the WAL-fsync-fails path). This single-fsync ambiguity is irreducible
+    ///   (see [`crate::persist::commit`]). What recovery ALWAYS guarantees: the store
+    ///   opens to a CONSISTENT committed prefix (batches are all-or-nothing) and never
+    ///   loses an `Ok`-acked batch. Reconcile an `Err` by reopening and reading
+    ///   [`committed_seq`](Self::committed_seq) / [`recovery_report`](Self::recovery_report),
+    ///   NOT by blind retry (re-applying a non-idempotent batch on the persist path
+    ///   would double-apply).
     pub fn apply(&self, ops: Vec<Op>, expected_seq: Option<u64>) -> Result<u64, PersistError> {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -665,23 +838,32 @@ impl PersistentGraph {
         d.apply(w.base.as_accessor(), ops.clone())
             .map_err(PersistError::Delta)?;
 
-        // 4/5. Encode + append (the commit point). Append poisons on failure.
+        // 4/5. Encode + append (the WAL write). Append poisons on failure and
+        //      fsyncs per policy (EveryBatch always; EveryN on a boundary;
+        //      OnFlush never here).
         let new_seq = w.seq + 1;
         let rec = WalRecord { seq: new_seq, ops };
         let frame = wal::encode_frame(&rec)?;
-        let fsynced = w.wal.append(&frame)?; // fsync per policy happens inside append
+        let fsynced = w.wal.append(&frame)?;
 
-        // 7. Advance in-memory ONLY after a durable append.
-        w.seq = new_seq;
-        // Advance the durable high-water ONLY when the append actually fsync'd
-        // (EveryBatch always; EveryN on a boundary). Under OnFlush the frame is
-        // only write-through — durable_seq stays until flush()/close/compaction.
-        // high_seq is derived from durable_seq, so it never over-reports what is
-        // on stable storage (else a legitimate power-loss of the un-fsync'd tail
-        // would falsely brick the store).
+        // 6. Ack protocol (§4.2): ONLY once the WAL frame is actually on stable
+        //    storage do we advance the durable COMMIT marker (write slot + fsync
+        //    COMMIT), which also advances durable_seq. The batch is "committed"
+        //    exactly when the marker covers it — recovery replays nothing beyond
+        //    it. A COMMIT write/fsync failure poisons and returns Err here, so the
+        //    frame (durable in the WAL but NOT under the marker) is discarded as
+        //    the ambiguity artifact on the next reopen — apply-Err then strictly
+        //    means "not committed". Under OnFlush the frame is only write-through
+        //    (not fsync'd), so the marker does NOT advance per apply — it advances
+        //    at flush()/close(); the un-fsync'd tail is dropped on recovery.
         if fsynced {
-            w.durable_seq = new_seq;
+            w.advance_commit(new_seq)?;
         }
+
+        // 7. Reflect in memory + publish. For EveryBatch/EveryN-boundary this is
+        //    now durable; for OnFlush it is a write-through, not-yet-durable state
+        //    (visible to readers, dropped on a crash before flush).
+        w.seq = new_seq;
         let op_count = rec.ops.len();
         w.delta_ops += op_count;
         let new_delta = Arc::new(d);
@@ -782,7 +964,7 @@ impl PersistentGraph {
         let new_snapshot_file = snapshot_v2_name(fold_seq, new_cid);
 
         // 4. Write the new snapshot durably (tmp+fsync+rename+fsync(dir)).
-        write_file_atomic(&self.dir, &new_snapshot_file, &bytes)?;
+        write_file_atomic(&*w.vfs, &self.dir, &new_snapshot_file, &bytes)?;
 
         // 5. Commit point: rename the MANIFEST to point at the new V2 snapshot.
         let new_manifest = Manifest {
@@ -799,7 +981,7 @@ impl PersistentGraph {
             created_by: CREATED_BY.to_string(),
             checksum: 0,
         };
-        write_manifest_atomic(&self.dir, &new_manifest)?;
+        write_manifest_atomic(&*w.vfs, &self.dir, &new_manifest)?;
 
         // 5b. The MANIFEST above is the durable commit. Advance the in-memory
         //     snapshot pointer NOW, before the WAL-truncate/re-mmap steps that
@@ -813,9 +995,14 @@ impl PersistentGraph {
         w.snapshot_crc32 = new_crc;
         w.format_version = FORMAT_VERSION;
         w.compaction_id = new_cid;
-        // fold_seq is now durable IN THE SNAPSHOT (fsync'd + renamed above), so
-        // the durable high-water advances to it even under OnFlush.
-        w.durable_seq = w.durable_seq.max(fold_seq);
+        // fold_seq is now durable IN THE SNAPSHOT (its own tmp+fsync+rename path,
+        // NOT the WAL marker) even under OnFlush, so advance the COMMIT marker to
+        // keep the invariant committed_seq >= snapshot_seq. (Also advances
+        // durable_seq.) A stale marker after a crash here is still safe — recovery
+        // floors commit_hw at snapshot_seq — but a LIVE store must not regress
+        // below its own on-disk base.
+        let new_committed = w.durable_seq.max(fold_seq);
+        w.advance_commit(new_committed)?;
 
         // 6. Rotate the WAL: all frames <= fold_seq are now folded. A crash
         //    between step 5 and here leaves stale frames <= snapshot_seq that the
@@ -862,7 +1049,7 @@ impl PersistentGraph {
         //    Linux unlinking a still-mmap'd old file is safe (existing readers
         //    keep their mapping); on Windows remove_snapshot_file defers.
         if old_snapshot_file != new_snapshot_file {
-            remove_snapshot_file(&self.dir.join(&old_snapshot_file));
+            remove_snapshot_file(&*w.vfs, &self.dir.join(&old_snapshot_file));
         }
 
         Ok(())
@@ -889,6 +1076,26 @@ impl PersistentGraph {
         self.state.load().epoch
     }
 
+    /// The durable-commit high-water: the highest seq the COMMIT marker covers,
+    /// i.e. the seq up to which data is guaranteed to survive process death AND
+    /// power loss. Under `EveryBatch` this equals [`seq`](Self::seq); under
+    /// `OnFlush` it lags until the next `flush()`/`close()`/compaction. Everything
+    /// in `(committed_seq, seq]` is applied and visible but NOT yet durable and is
+    /// dropped on a crash before it is committed.
+    pub fn committed_seq(&self) -> u64 {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .durable_seq
+    }
+
+    /// What the `open()`/`create()` that produced this handle recovered — notably
+    /// the count of crc-valid WAL frames found beyond the durable commit marker
+    /// (the fsync-failure ambiguity artifact) that were discarded (§4.3).
+    pub fn recovery_report(&self) -> RecoveryReport {
+        self.recovery
+    }
+
     /// Set the WAL fsync policy (runtime knob; not persisted).
     pub fn set_fsync_policy(&self, policy: FsyncPolicy) {
         let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
@@ -912,8 +1119,11 @@ impl PersistentGraph {
             return Err(PersistError::Poisoned);
         }
         w.wal.flush()?;
-        // Everything appended so far is now on stable storage.
-        w.durable_seq = w.seq;
+        // The WAL frames are now on stable storage; advance the durable COMMIT
+        // marker (and durable_seq) to make them officially committed — under
+        // OnFlush this is the durability point the marker moves at.
+        let target = w.seq;
+        w.advance_commit(target)?;
         Ok(())
     }
 
@@ -926,28 +1136,30 @@ impl PersistentGraph {
     /// `clean_shutdown=false` and returns `Poisoned` — never `Ok` with a clean
     /// flag on a poisoned store.
     pub fn close(self) -> Result<(), PersistError> {
-        let (manifest, poisoned) = {
+        let (manifest, poisoned, vfs) = {
             let mut w = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            let vfs = w.vfs.clone();
             if w.wal.poisoned {
                 // Do NOT flush (would re-error); record an UNCLEAN shutdown so
                 // recovery re-mints the epoch.
-                (w.build_manifest(false), true)
+                (w.build_manifest(false), true, vfs)
             } else {
-                // Best-effort durability of everything acknowledged so far. A
-                // flush failure here poisons and is surfaced below.
-                match w.wal.flush() {
-                    Ok(()) => {
-                        // All appended frames are now durable.
-                        w.durable_seq = w.seq;
-                        (w.build_manifest(true), false)
-                    }
-                    // Flush failed: durable_seq stays at the last successful
-                    // fsync, so build_manifest(false) records only durable data.
-                    Err(_) => (w.build_manifest(false), true),
+                // Best-effort durability of everything acknowledged so far: fsync
+                // the WAL, then advance the COMMIT marker to seal it. A failure in
+                // EITHER step poisons and records an UNCLEAN shutdown so recovery
+                // re-mints the epoch and opens at the last genuinely-committed seq.
+                let target = w.seq;
+                match w.wal.flush().and_then(|()| w.advance_commit(target)) {
+                    // WAL + COMMIT both durable: build_manifest(true) records
+                    // high_seq = durable_seq (== seq), matching the marker.
+                    Ok(()) => (w.build_manifest(true), false, vfs),
+                    // durable_seq/marker stay at the last successful fsync, so
+                    // build_manifest(false) records only genuinely-durable data.
+                    Err(_) => (w.build_manifest(false), true, vfs),
                 }
             }
         };
-        write_manifest_atomic(&self.dir, &manifest)?;
+        write_manifest_atomic(&*vfs, &self.dir, &manifest)?;
         // self (and thus `_lock`) drops here, releasing the flock.
         if poisoned {
             Err(PersistError::Poisoned)
@@ -1022,7 +1234,8 @@ mod tests {
     use super::*;
     use crate::accessor::GraphAccessor;
     use crate::delta::{DeltaAccessor, DeltaError};
-    use crate::types::{EdgeData, EdgeInput, NodeData, NodeInput};
+    use crate::traversal::{beam_traverse, find_path};
+    use crate::types::{DynamicContext, EdgeData, EdgeInput, NodeData, NodeInput};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1042,6 +1255,9 @@ mod tests {
         let e: Vec<EdgeInput> = edges
             .iter()
             .map(|(f, t, k)| EdgeInput {
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
                 from: f.to_string(),
                 to: t.to_string(),
                 kind: k.to_string(),
@@ -1075,6 +1291,32 @@ mod tests {
                 kind: kind.into(),
                 field_name: None,
                 base_weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
+            },
+        }
+    }
+
+    /// Like `addedge` but with caller-supplied `valid_from`/`valid_to`/`acl`.
+    fn addedge_full(
+        from: &str,
+        to: &str,
+        kind: &str,
+        valid_from: Option<u64>,
+        valid_to: Option<u64>,
+        acl: Vec<&str>,
+    ) -> Op {
+        Op::AddEdge {
+            from: from.into(),
+            to: to.into(),
+            edge: EdgeData {
+                kind: kind.into(),
+                field_name: None,
+                base_weight: 1.0,
+                valid_from,
+                valid_to,
+                acl: acl.into_iter().map(String::from).collect(),
             },
         }
     }
@@ -1121,7 +1363,10 @@ mod tests {
                     .unwrap(),
                 2
             );
-            // drop without close -> crash-like; batches were write-through.
+            // flush() commits both batches (advances the durable COMMIT marker),
+            // then drop without close() is crash-like — the committed prefix must
+            // survive and replay in full.
+            pg.flush().unwrap();
         }
 
         let pg = PersistentGraph::open(dir.path(), false).unwrap();
@@ -1181,6 +1426,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pg = PersistentGraph::create(dir.path(), base_inner(vec![("a", "m")], vec![])).unwrap();
         pg.apply(vec![upsert("b", "m")], None).unwrap(); // seq 1
+        pg.flush().unwrap(); // commit the good batch so it survives the reopen
         let len_before = wal_len(dir.path());
         let seq_before = pg.seq();
 
@@ -1209,6 +1455,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pg = PersistentGraph::create(dir.path(), base_inner(vec![("a", "m")], vec![])).unwrap();
         pg.apply(vec![upsert("b", "m")], None).unwrap(); // seq 1 (good)
+        pg.flush().unwrap(); // commit the pre-poison prefix so the reopen recovers it
         let len_after_good = wal_len(dir.path());
 
         // Arm an injected append failure; the next apply fails and poisons.
@@ -1268,7 +1515,11 @@ mod tests {
         // Bump snapshot_seq to 2 in the MANIFEST (snapshot bytes/crc unchanged).
         let mut m = read_manifest(&dir.path().join("MANIFEST.json")).unwrap();
         m.snapshot_seq = 2;
-        write_manifest_atomic(dir.path(), &m).unwrap();
+        write_manifest_atomic(&RealVfs, dir.path(), &m).unwrap();
+        // The hand-crafted frames are "committed" for this test: set the COMMIT
+        // marker to cover through seq 3 so recovery replays frame 3 (rather than
+        // treating it as an over-marker ambiguity tail).
+        commit::CommitFile::create(&RealVfs, dir.path(), m.epoch, 3).unwrap();
 
         let pg = PersistentGraph::open(dir.path(), false).unwrap();
         assert_eq!(pg.seq(), 3, "only the > snapshot_seq frame replayed");
@@ -1334,6 +1585,11 @@ mod tests {
             );
         }
         std::fs::write(dir.path().join("wal.log"), &buf).unwrap();
+        // Mark all four seqs as committed so the gap is inside the replayed range
+        // (otherwise frames past the marker would be discarded before the gap is
+        // reached, masking the corruption we are testing for).
+        let m = read_manifest(&dir.path().join("MANIFEST.json")).unwrap();
+        commit::CommitFile::create(&RealVfs, dir.path(), m.epoch, 4).unwrap();
 
         let err = PersistentGraph::open(dir.path(), false).unwrap_err();
         match err {
@@ -1407,7 +1663,7 @@ mod tests {
         drop(pg);
         let mut m = read_manifest(&dir.path().join("MANIFEST.json")).unwrap();
         m.format_version = FORMAT_VERSION + 1;
-        write_manifest_atomic(dir.path(), &m).unwrap();
+        write_manifest_atomic(&RealVfs, dir.path(), &m).unwrap();
 
         let err = PersistentGraph::open(dir.path(), false).unwrap_err();
         match err {
@@ -1456,32 +1712,62 @@ mod tests {
         assert_eq!(pg2.seq(), 3);
     }
 
-    // ---- OnFlush process-death durability (in-process crash simulation) --
+    // ---- OnFlush strict marker semantics (in-process crash simulation) --
 
     #[test]
-    fn onflush_drop_without_close_loses_nothing() {
-        // Write-through (no fsync under OnFlush) still survives process death:
-        // simulate by dropping the handle WITHOUT close(), then reopening.
+    fn onflush_uncommitted_applies_dropped_but_flush_commits() {
+        // STRICT SEMANTICS (per-frame commit marker): under OnFlush an apply is
+        // write-through only (not fsync'd), so it is NOT below the durable COMMIT
+        // marker. Recovery trusts the marker, so un-flushed applies are the
+        // ambiguity artifact — counted and dropped — while everything up to the
+        // last flush() survives. (This intentionally replaces the pre-marker
+        // "OnFlush write-through survives process death" behavior: the surviving
+        // page-cache tail was durable against process death but NOT power loss —
+        // the marker makes the guarantee honest and uniform.)
         let dir = tempfile::tempdir().unwrap();
         {
             let pg = PersistentGraph::create(dir.path(), base_inner(vec![], vec![])).unwrap();
-            // default policy is OnFlush; no flush() calls.
-            for i in 0..5 {
+            // default policy is OnFlush.
+            for i in 0..3 {
                 pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
             }
-            // no close/flush
+            pg.flush().unwrap(); // commit seq 1..=3
+            assert_eq!(pg.committed_seq(), 3);
+            for i in 3..5 {
+                pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap(); // seq 4,5 UNCOMMITTED
+            }
+            assert_eq!(pg.seq(), 5);
+            assert_eq!(
+                pg.committed_seq(),
+                3,
+                "post-flush applies are not committed"
+            );
+            // drop without close/flush -> crash-like.
         }
-        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        {
+            let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+            assert_eq!(pg2.seq(), 3, "recovery caps at the committed prefix");
+            // The two uncommitted frames were counted and truncated.
+            assert_eq!(pg2.recovery_report().uncommitted_tail_frames, 2);
+            let s = pg2.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            for i in 0..3 {
+                assert!(
+                    acc.get_node(&format!("n{i}")).is_some(),
+                    "committed survives"
+                );
+            }
+            assert!(acc.get_node("n3").is_none(), "uncommitted dropped");
+            assert!(acc.get_node("n4").is_none(), "uncommitted dropped");
+        }
+        // WAL was physically truncated back to the committed boundary: a second
+        // reopen finds no over-marker tail to drop.
+        let pg3 = PersistentGraph::open(dir.path(), false).unwrap();
         assert_eq!(
-            pg2.seq(),
-            5,
-            "all acknowledged batches present after crash-like drop"
+            pg3.recovery_report().uncommitted_tail_frames,
+            0,
+            "already truncated"
         );
-        let s = pg2.snapshot();
-        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
-        for i in 0..5 {
-            assert!(acc.get_node(&format!("n{i}")).is_some());
-        }
     }
 
     // ---- concurrent readers during apply -------------------------------
@@ -1806,33 +2092,36 @@ mod tests {
         }
     }
 
-    // The mirror of the test above (audit P1 regressions): under OnFlush, frames
-    // that were only WRITE-THROUGH (never fsync'd) are not durable, so losing
-    // them on power-off is contractual — reopen must NOT hard-error. high_seq
-    // must never cover un-fsync'd frames.
-
+    // STRICT MARKER SEMANTICS: under OnFlush, write-through frames are NOT below
+    // the durable COMMIT marker, so recovery discards them at the FIRST reopen
+    // already (not "kept in page cache, then lost on power loss"). No brick, no
+    // Corrupt across the whole crash sequence — the store simply opens at the
+    // committed prefix each time.
     #[test]
     fn onflush_crash_recover_then_powerloss_reopens_gracefully() {
         let dir = tempfile::tempdir().unwrap();
         {
             let pg = PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![]))
                 .unwrap();
-            // OnFlush (default): applies are write-through only, never fsync'd.
+            // OnFlush (default): applies are write-through only, never fsync'd, so
+            // the COMMIT marker stays at 0.
             pg.apply(vec![upsert("a", "m")], None).unwrap();
             pg.apply(vec![upsert("b", "m")], None).unwrap();
             pg.apply(vec![upsert("c", "m")], None).unwrap();
             assert_eq!(pg.seq(), 3);
-            drop(pg); // kill -9 model: no close; page-cache WAL survives
+            assert_eq!(pg.committed_seq(), 0, "nothing fsync'd under OnFlush");
+            drop(pg); // kill -9 model: no close/flush
         }
         {
-            // Crash-recovery reopen. Must NOT durably promote high_seq to 3.
+            // Crash-recovery reopen: uncommitted tail dropped, opens at 0. The
+            // three frames are counted and the WAL truncated to empty.
             let pg = PersistentGraph::open(dir.path(), false).unwrap();
-            assert_eq!(pg.seq(), 3);
-            drop(pg); // second crash, still no flush/close
+            assert_eq!(pg.seq(), 0);
+            assert_eq!(pg.recovery_report().uncommitted_tail_frames, 3);
+            drop(pg); // second crash
         }
-        // Power loss drops the never-fsync'd WAL tail (reverts to durable = empty).
+        // Power loss on an already-committed-empty store: still opens at 0.
         truncate_wal(dir.path());
-        // Must reopen at the last DURABLE seq (0), not Corrupt-brick.
         let pg = PersistentGraph::open(dir.path(), false)
             .expect("OnFlush power-loss after a crash-recovery reopen must open, not brick");
         assert_eq!(pg.seq(), 0);
@@ -1917,14 +2206,14 @@ mod tests {
         // MANIFEST rename, but DO NOT truncate the WAL — simulating a crash in
         // that window. The WAL keeps frames 1..=seq (all <= new snapshot_seq).
         let (bytes, crc, file, fold_seq, cid) = pg.test_fold_bytes();
-        write_file_atomic(dir.path(), &file, &bytes).unwrap();
+        write_file_atomic(&RealVfs, dir.path(), &file, &bytes).unwrap();
         let mut m = read_manifest(&dir.path().join("MANIFEST.json")).unwrap();
         m.format_version = FORMAT_VERSION;
         m.snapshot_file = file.clone();
         m.snapshot_seq = fold_seq;
         m.snapshot_crc32 = crc;
         m.compaction_id = cid;
-        write_manifest_atomic(dir.path(), &m).unwrap();
+        write_manifest_atomic(&RealVfs, dir.path(), &m).unwrap();
         drop(pg); // "crash": no truncate, no clean close
 
         // Reopen: frames <= snapshot_seq are skipped (already folded), state is
@@ -1943,6 +2232,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pg =
             PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        pg.set_fsync_policy(FsyncPolicy::EveryBatch); // commit each batch so it survives the crash
         for i in 0..6 {
             pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
         }
@@ -1954,7 +2244,7 @@ mod tests {
         // Write ONLY the new snapshot; DO NOT update the MANIFEST — a crash
         // before the commit point. The new file is an orphan.
         let (bytes, _crc, orphan_file, _fs, _cid) = pg.test_fold_bytes();
-        write_file_atomic(dir.path(), &orphan_file, &bytes).unwrap();
+        write_file_atomic(&RealVfs, dir.path(), &orphan_file, &bytes).unwrap();
         drop(pg);
         assert!(dir.path().join(&orphan_file).exists());
         assert_ne!(orphan_file, live_file);
@@ -2019,6 +2309,102 @@ mod tests {
             (full_topology(&acc, &names), acc.node_count())
         };
         assert_eq!(t_mmap, t_owned);
+    }
+
+    // ---- temporal validity + ACL survive apply / reopen / compaction ----
+
+    #[test]
+    fn temporal_and_acl_fields_survive_reopen_mmap_and_owned_and_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let pg = PersistentGraph::create(
+                dir.path(),
+                base_inner(vec![("a", "m"), ("b", "m")], vec![]),
+            )
+            .unwrap();
+            pg.apply(
+                vec![addedge_full(
+                    "a",
+                    "b",
+                    "rel",
+                    Some(100),
+                    Some(200),
+                    vec!["team-x"],
+                )],
+                None,
+            )
+            .unwrap();
+            pg.flush().unwrap();
+            pg.close().unwrap();
+        }
+
+        let assert_fields = |pg: &PersistentGraph| {
+            let s = pg.snapshot();
+            let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+            let nb = acc
+                .outgoing_neighbors("a")
+                .into_iter()
+                .find(|n| n.target_name == "b")
+                .expect("edge a->b present");
+            assert_eq!(nb.valid_from, Some(100));
+            assert_eq!(nb.valid_to, Some(200));
+            assert_eq!(nb.acl, vec!["team-x".to_string()]);
+
+            // Filtered traversal: as_of before valid_to -> b reachable.
+            let ctx_visible = DynamicContext {
+                as_of: Some(150),
+                principals: vec!["team-x".into()],
+                ..DynamicContext::default()
+            };
+            assert!(find_path(&acc, &ctx_visible, "a", "b").is_some());
+            assert!(beam_traverse(&acc, &ctx_visible, "a", 5, 1)
+                .iter()
+                .any(|r| r.name == "b"));
+
+            // Filtered traversal: no principals -> fail closed, b unreachable.
+            let ctx_hidden = DynamicContext {
+                as_of: Some(150),
+                ..DynamicContext::default()
+            };
+            assert!(find_path(&acc, &ctx_hidden, "a", "b").is_none());
+            assert!(!beam_traverse(&acc, &ctx_hidden, "a", 5, 1)
+                .iter()
+                .any(|r| r.name == "b"));
+
+            // Filtered traversal: as_of past valid_to -> b unreachable even with
+            // the right principal.
+            let ctx_expired = DynamicContext {
+                as_of: Some(300),
+                principals: vec!["team-x".into()],
+                ..DynamicContext::default()
+            };
+            assert!(find_path(&acc, &ctx_expired, "a", "b").is_none());
+        };
+
+        // Reopen Mmap.
+        let mmap =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false)
+                .unwrap();
+        assert_fields(&mmap);
+        drop(mmap); // release the flock before the next open (single-writer)
+
+        // Reopen Owned.
+        let owned =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Owned, Validate::Full, false)
+                .unwrap();
+        assert_fields(&owned);
+
+        // Compaction (folds the delta-added edge into a fresh base) must
+        // preserve the fields too.
+        owned.compact().unwrap();
+        assert_fields(&owned);
+        owned.close().unwrap();
+
+        // And after a further reopen post-compaction.
+        let reopened =
+            PersistentGraph::open_with(dir.path(), false, BaseMode::Mmap, Validate::Full, false)
+                .unwrap();
+        assert_fields(&reopened);
     }
 
     // ---- prefault open --------------------------------------------------
@@ -2147,21 +2533,22 @@ mod tests {
         assert!(acc.get_node("n11").is_some());
     }
 
-    // ---- legacy format_version 0 / 1 are rejected ----------------------
+    // ---- legacy format_version 0 / 1 / 2 are rejected ------------------
 
     #[test]
     fn legacy_format_versions_are_rejected() {
         // A legacy store (flat V0 rkyv snapshot + a MANIFEST tagging it) must be
-        // rejected as Corrupt, not silently opened by the V2 reader. Same for a
-        // MANIFEST claiming V1. Both are `< FORMAT_VERSION`, so they slip past the
-        // `> FORMAT_VERSION` gate and are caught by the explicit legacy arm.
-        for legacy in [0u32, 1u32] {
+        // rejected as Corrupt, not silently opened by the current reader. Same for
+        // a MANIFEST claiming V1 or V2 (V2 = CSR + index but NO COMMIT sidecar,
+        // rejected by the format-3 bump). All three are `< FORMAT_VERSION`, so they
+        // slip past the `> FORMAT_VERSION` gate and are caught by the legacy arm.
+        for legacy in [0u32, 1u32, 2u32] {
             let dir = tempfile::tempdir().unwrap();
             let base = base_inner(vec![("a", "m"), ("b", "m")], vec![("a", "b", "rel")]);
             let bytes = to_rkyv(&base);
             let crc = crc32fast::hash(&bytes);
             let file = snapshot_name(0);
-            write_file_atomic(dir.path(), &file, &bytes).unwrap();
+            write_file_atomic(&RealVfs, dir.path(), &file, &bytes).unwrap();
             {
                 let f = std::fs::File::create(dir.path().join("wal.log")).unwrap();
                 f.sync_all().unwrap();
@@ -2178,7 +2565,7 @@ mod tests {
                 created_by: "test-legacy".into(),
                 checksum: 0,
             };
-            write_manifest_atomic(dir.path(), &m).unwrap();
+            write_manifest_atomic(&RealVfs, dir.path(), &m).unwrap();
 
             let err = PersistentGraph::open(dir.path(), false).unwrap_err();
             assert!(
@@ -2186,6 +2573,260 @@ mod tests {
                 "legacy format_version {legacy} must be rejected as Corrupt, got {err:?}"
             );
         }
+    }
+
+    // =======================================================================
+    // COMMIT sidecar / durable-commit marker (the fsync-failure ambiguity fix)
+    // =======================================================================
+
+    /// Append a raw, crc-valid WAL frame directly to wal.log (file surgery) —
+    /// used to inject the ambiguity artifact: a frame that is byte-complete and
+    /// crc-valid (as an fsync-failed page-cache frame would be) but was NEVER
+    /// committed under the marker.
+    fn append_raw_frame(dir: &Path, seq: u64, name: &str) {
+        use std::io::Write;
+        let frame = wal::encode_frame(&WalRecord {
+            seq,
+            ops: vec![upsert(name, "m")],
+        })
+        .unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("wal.log"))
+            .unwrap();
+        f.write_all(&frame).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // ---- marker advances per policy, observable via reopen -------------
+
+    #[test]
+    fn every_batch_marker_covers_all_applies_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![], vec![])).unwrap();
+        pg.set_fsync_policy(FsyncPolicy::EveryBatch);
+        for i in 0..3 {
+            pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
+        }
+        assert_eq!(pg.committed_seq(), 3, "EveryBatch commits every apply");
+        drop(pg); // crash-like
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), 3, "all committed under EveryBatch survive");
+        assert_eq!(pg2.recovery_report().uncommitted_tail_frames, 0);
+    }
+
+    #[test]
+    fn every_n_marker_caps_at_last_fsync_boundary_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![], vec![])).unwrap();
+        pg.set_fsync_policy(FsyncPolicy::EveryN(2));
+        for i in 0..3 {
+            pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
+        }
+        // frame 2 fsync'd (boundary), frame 3 write-through only.
+        assert_eq!(
+            pg.committed_seq(),
+            2,
+            "marker at the last EveryN fsync boundary"
+        );
+        assert_eq!(pg.seq(), 3);
+        drop(pg);
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), 2, "recovery caps at the last fsync boundary");
+        assert_eq!(pg2.recovery_report().uncommitted_tail_frames, 1);
+    }
+
+    // ---- THE ambiguity scenario: an fsync-failed crc-valid frame -------
+
+    #[test]
+    fn crc_valid_frame_past_marker_is_not_replayed_counted_and_truncated() {
+        // Model the fsync-failure ambiguity directly: a complete, crc-valid WAL
+        // frame beyond the durable COMMIT marker (as an fsync that FAILED but left
+        // the frame in the page cache would produce). Recovery must trust the
+        // marker, NOT the surviving crc-valid bytes: do not replay it, count it,
+        // and physically truncate the WAL back to the committed boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![], vec![])).unwrap();
+        pg.set_fsync_policy(FsyncPolicy::EveryBatch);
+        pg.apply(vec![upsert("a", "m")], None).unwrap(); // seq 1, committed
+        pg.apply(vec![upsert("b", "m")], None).unwrap(); // seq 2, committed
+        pg.close().unwrap(); // marker = 2, clean
+        let committed_len = wal_len(dir.path());
+
+        // Inject the ambiguity artifact: a crc-valid frame seq 3 the marker never
+        // covered (its "fsync" is imagined to have failed after write_all).
+        append_raw_frame(dir.path(), 3, "ghost");
+        assert!(wal_len(dir.path()) > committed_len);
+
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), 2, "frame past the marker must NOT be replayed");
+        assert_eq!(
+            pg2.recovery_report().uncommitted_tail_frames,
+            1,
+            "the over-marker frame must be counted"
+        );
+        let s = pg2.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert!(acc.get_node("ghost").is_none(), "ambiguity frame leaked in");
+        assert!(acc.get_node("a").is_some());
+        assert!(acc.get_node("b").is_some());
+        drop(s);
+        assert_eq!(
+            wal_len(dir.path()),
+            committed_len,
+            "WAL must be truncated back to the committed boundary"
+        );
+    }
+
+    // ---- torn / one-corrupt-slot COMMIT recovery -----------------------
+
+    #[test]
+    fn open_recovers_when_one_commit_slot_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![], vec![])).unwrap();
+        pg.set_fsync_policy(FsyncPolicy::EveryBatch);
+        pg.apply(vec![upsert("a", "m")], None).unwrap(); // seq 1 -> slot1 gen1
+        pg.apply(vec![upsert("b", "m")], None).unwrap(); // seq 2 -> slot0 gen2 (newest)
+        drop(pg);
+        // Corrupt the OLDER slot (slot1, the second half): the reader must still
+        // pick the newest crc-valid slot and recover the full committed prefix.
+        let path = dir.path().join(commit::COMMIT_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let half = bytes.len() / 2;
+        bytes[half + 20] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), 2, "newest valid COMMIT slot wins; nothing lost");
+    }
+
+    #[test]
+    fn open_with_both_commit_slots_corrupt_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("a", "m")], vec![])).unwrap();
+        pg.apply(vec![upsert("b", "m")], None).unwrap();
+        pg.close().unwrap();
+        let path = dir.path().join(commit::COMMIT_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        for b in bytes.iter_mut() {
+            *b ^= 0xFF; // destroy BOTH slots
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        match PersistentGraph::open(dir.path(), false) {
+            Err(PersistError::Corrupt(_)) => {}
+            other => panic!("expected Corrupt on both-slots-corrupt COMMIT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_with_missing_commit_file_is_corrupt() {
+        // A current-format store MUST have a COMMIT sidecar; a missing one is
+        // Corrupt (never "treat as seq 0" — that would silently discard data).
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("a", "m")], vec![])).unwrap();
+        pg.apply(vec![upsert("b", "m")], None).unwrap();
+        pg.close().unwrap();
+        std::fs::remove_file(dir.path().join(commit::COMMIT_FILE)).unwrap();
+        match PersistentGraph::open(dir.path(), false) {
+            Err(PersistError::Corrupt(m)) if m.contains("COMMIT") => {}
+            other => panic!("expected Corrupt on missing COMMIT, got {other:?}"),
+        }
+    }
+
+    // ---- fresh create() -> open round-trip -----------------------------
+
+    #[test]
+    fn fresh_create_open_round_trip_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![("a", "m")], vec![])).unwrap();
+        assert_eq!(pg.committed_seq(), 0, "fresh store: marker at 0");
+        assert_eq!(pg.recovery_report(), RecoveryReport::default());
+        pg.apply(vec![upsert("b", "m")], None).unwrap();
+        pg.flush().unwrap();
+        assert_eq!(pg.committed_seq(), 1);
+        pg.close().unwrap();
+
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), 1);
+        assert_eq!(
+            pg2.committed_seq(),
+            1,
+            "marker round-trips through close/open"
+        );
+        assert_eq!(pg2.recovery_report().uncommitted_tail_frames, 0);
+    }
+
+    // ---- compaction keeps the marker >= snapshot_seq -------------------
+
+    #[test]
+    fn compaction_then_reopen_keeps_marker_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        // OnFlush so applies alone never advance the marker — only the compaction
+        // does. This proves compaction advances the marker to >= snapshot_seq.
+        let pg =
+            PersistentGraph::create(dir.path(), base_inner(vec![("root", "m")], vec![])).unwrap();
+        for i in 0..10 {
+            pg.apply(vec![upsert(&format!("n{i}"), "m")], None).unwrap();
+        }
+        assert_eq!(pg.committed_seq(), 0, "OnFlush: applies do not commit");
+        pg.compact().unwrap();
+        let seq = pg.seq();
+        assert_eq!(
+            pg.committed_seq(),
+            seq,
+            "compaction advances the marker to the folded seq"
+        );
+        assert_eq!(pg.snapshot_seq(), seq);
+        drop(pg); // crash-like right after compaction
+
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(
+            pg2.seq(),
+            seq,
+            "folded state survives; marker >= snapshot_seq"
+        );
+        assert_eq!(pg2.committed_seq(), seq);
+        assert_eq!(pg2.recovery_report().uncommitted_tail_frames, 0);
+        let s = pg2.snapshot();
+        let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
+        assert!(acc.get_node("n0").is_some());
+        assert!(acc.get_node("n9").is_some());
+    }
+
+    // ---- COMMIT epoch mismatch is tolerated (durable data is fork-invariant) ----
+
+    #[test]
+    fn commit_epoch_mismatch_honors_committed_seq_and_restamps() {
+        // A COMMIT slot stamped with a FOREIGN epoch but a consistent
+        // committed_seq must NOT brick the store: committed_seq is fork-invariant
+        // (a timeline fork only drops UN-fsync'd data, and the marker only ever
+        // records fsync'd data), so recovery honors it and re-stamps the marker
+        // into the authoritative epoch.
+        let dir = tempfile::tempdir().unwrap();
+        let pg = PersistentGraph::create(dir.path(), base_inner(vec![], vec![])).unwrap();
+        pg.set_fsync_policy(FsyncPolicy::EveryBatch);
+        pg.apply(vec![upsert("a", "m")], None).unwrap();
+        pg.apply(vec![upsert("b", "m")], None).unwrap();
+        pg.close().unwrap(); // clean; marker epoch == manifest epoch, committed 2
+        let manifest_epoch = read_manifest(&dir.path().join("MANIFEST.json"))
+            .unwrap()
+            .epoch;
+
+        // Overwrite the COMMIT with a DIFFERENT epoch, same committed_seq.
+        let foreign = manifest_epoch ^ 0xFFFF_FFFF_FFFF_FFFF;
+        assert_ne!(foreign, manifest_epoch);
+        commit::CommitFile::create(&RealVfs, dir.path(), foreign, 2).unwrap();
+
+        let pg2 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg2.seq(), 2, "committed_seq honored despite epoch mismatch");
+        // Clean shutdown + no truncation => epoch NOT re-minted; the marker is
+        // re-stamped to the authoritative (manifest) epoch on open.
+        assert_eq!(pg2.epoch(), manifest_epoch);
+        pg2.close().unwrap();
+        // The re-stamp healed the foreign epoch: a clean reopen keeps the epoch.
+        let pg3 = PersistentGraph::open(dir.path(), false).unwrap();
+        assert_eq!(pg3.epoch(), manifest_epoch);
+        assert_eq!(pg3.seq(), 2);
     }
 
     // ---- property: compaction preserves the logical graph --------------

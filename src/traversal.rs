@@ -297,6 +297,9 @@ pub fn contextual_subgraph(graph: &dyn GraphAccessor, ctx: &DynamicContext, k: u
                 kind: neighbor.edge_kind.clone(),
                 field_name: neighbor.field_name.clone(),
                 weight: neighbor.edge_weight,
+                valid_from: neighbor.valid_from,
+                valid_to: neighbor.valid_to,
+                acl: neighbor.acl.clone(),
             });
 
             if node_set.insert(neighbor.name.clone()) {
@@ -449,8 +452,14 @@ pub fn multi_beam_intersection(
     let mut seen_edges: HashSet<(String, String, String)> = HashSet::new();
 
     for node_name in &filtered_set {
-        // Base graph outgoing edges
+        // Base graph outgoing edges. This bypasses `neighbors_with_overlay`
+        // (the beam-launch phase already went through it), so temporal/ACL
+        // visibility must be re-applied here directly via the shared helper —
+        // this is a SEPARATE expansion/read site from beam_traverse's.
         for neighbor in graph.outgoing_neighbors(node_name) {
+            if !ctx.is_edge_visible(neighbor.valid_from, neighbor.valid_to, &neighbor.acl) {
+                continue;
+            }
             if filtered_set.contains(&neighbor.target_name) {
                 let key = (
                     node_name.clone(),
@@ -464,6 +473,9 @@ pub fn multi_beam_intersection(
                         kind: neighbor.edge_kind,
                         field_name: neighbor.field_name,
                         weight: neighbor.edge_weight,
+                        valid_from: neighbor.valid_from,
+                        valid_to: neighbor.valid_to,
+                        acl: neighbor.acl,
                     });
                 }
             }
@@ -471,6 +483,9 @@ pub fn multi_beam_intersection(
 
         // Overlay edges
         for (from, to, edge) in &ctx.overlay_edges {
+            if !ctx.is_edge_visible(edge.valid_from, edge.valid_to, &edge.acl) {
+                continue;
+            }
             if from == node_name && filtered_set.contains(to) {
                 let key = (from.clone(), to.clone(), edge.kind.clone());
                 if seen_edges.insert(key) {
@@ -480,6 +495,9 @@ pub fn multi_beam_intersection(
                         kind: edge.kind.clone(),
                         field_name: edge.field_name.clone(),
                         weight: edge.base_weight,
+                        valid_from: edge.valid_from,
+                        valid_to: edge.valid_to,
+                        acl: edge.acl.clone(),
                     });
                 }
             }
@@ -525,6 +543,30 @@ mod tests {
             kind: kind.to_string(),
             field_name: field.map(|s| s.to_string()),
             base_weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+            acl: Vec::new(),
+        }
+    }
+
+    /// Like `make_edge` but with caller-supplied `valid_from`/`valid_to`/`acl`.
+    fn make_edge_ext(
+        from: &str,
+        to: &str,
+        kind: &str,
+        valid_from: Option<u64>,
+        valid_to: Option<u64>,
+        acl: Vec<&str>,
+    ) -> EdgeInput {
+        EdgeInput {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: kind.to_string(),
+            field_name: None,
+            base_weight: 1.0,
+            valid_from,
+            valid_to,
+            acl: acl.into_iter().map(String::from).collect(),
         }
     }
 
@@ -740,6 +782,9 @@ mod tests {
                 kind: "relates_to".to_string(),
                 field_name: None,
                 base_weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             },
         ));
 
@@ -903,5 +948,313 @@ mod tests {
 
         // At minimum we expect B→D and C→D edges
         assert!(!sg.edges.is_empty(), "Should have reconstructed edges");
+    }
+
+    // =======================================================================
+    // Temporal validity + ACL visibility — per-op exclusion tests.
+    //
+    // NOTE on direction: none of the four query ops (beam_traverse, find_path,
+    // contextual_subgraph, multi_beam_intersection) ever call
+    // `GraphAccessor::incoming_neighbors` — they are outgoing-only forward
+    // traversals (verified by grep: the only `incoming_neighbors` call sites in
+    // the whole crate are the ctx-free inspection APIs in `pybridge`/`graph.rs`
+    // and persist tests). So "incoming direction included where the op uses
+    // it" is vacuously satisfied for all four; incoming-direction visibility
+    // is instead covered directly at the accessor/delta level (see
+    // `delta.rs::add_edge_temporal_and_acl_fields_carried_through_both_directions`
+    // and the V2 CSR round-trip tests in `persist::snapshot`).
+    // =======================================================================
+
+    fn build_two_edge_graph(
+        second_valid_from: Option<u64>,
+        second_valid_to: Option<u64>,
+        second_acl: Vec<&str>,
+    ) -> OrpheusGraphInner {
+        let nodes = vec![
+            make_node("A", 0.5),
+            make_node("B", 0.5),
+            make_node("C", 0.5),
+        ];
+        let edges = vec![
+            make_edge("A", "B", "relates_to", None),
+            make_edge_ext(
+                "B",
+                "C",
+                "relates_to",
+                second_valid_from,
+                second_valid_to,
+                second_acl,
+            ),
+        ];
+        let (g, m) = build_graph(nodes, edges);
+        OrpheusGraphInner::new(g, m)
+    }
+
+    #[test]
+    fn beam_traverse_excludes_temporally_invisible_edge() {
+        let graph = build_two_edge_graph(None, Some(100), vec![]);
+
+        let ctx_after = DynamicContext {
+            as_of: Some(200),
+            ..DynamicContext::default()
+        };
+        let results = beam_traverse(&graph, &ctx_after, "A", 5, 2);
+        assert!(
+            !results.iter().any(|r| r.name == "C"),
+            "B->C expired at valid_to=100, as_of=200 -> C unreachable"
+        );
+
+        let ctx_before = DynamicContext {
+            as_of: Some(50),
+            ..DynamicContext::default()
+        };
+        let results = beam_traverse(&graph, &ctx_before, "A", 5, 2);
+        assert!(
+            results.iter().any(|r| r.name == "C"),
+            "as_of=50 < valid_to=100 -> visible"
+        );
+    }
+
+    #[test]
+    fn beam_traverse_excludes_acl_invisible_edge() {
+        let graph = build_two_edge_graph(None, None, vec!["secret"]);
+
+        let ctx_none = DynamicContext::default();
+        let results = beam_traverse(&graph, &ctx_none, "A", 5, 2);
+        assert!(
+            !results.iter().any(|r| r.name == "C"),
+            "no principals -> fail closed for a tagged edge"
+        );
+
+        let ctx_match = DynamicContext {
+            principals: vec!["secret".into()],
+            ..DynamicContext::default()
+        };
+        let results = beam_traverse(&graph, &ctx_match, "A", 5, 2);
+        assert!(results.iter().any(|r| r.name == "C"));
+    }
+
+    #[test]
+    fn find_path_excludes_temporally_invisible_edge() {
+        let graph = build_two_edge_graph(None, Some(100), vec![]);
+        let ctx_after = DynamicContext {
+            as_of: Some(200),
+            ..DynamicContext::default()
+        };
+        assert!(find_path(&graph, &ctx_after, "A", "C").is_none());
+
+        let ctx_before = DynamicContext {
+            as_of: Some(50),
+            ..DynamicContext::default()
+        };
+        assert!(find_path(&graph, &ctx_before, "A", "C").is_some());
+    }
+
+    #[test]
+    fn find_path_excludes_acl_invisible_edge() {
+        let graph = build_two_edge_graph(None, None, vec!["secret"]);
+        let ctx_none = DynamicContext::default();
+        assert!(find_path(&graph, &ctx_none, "A", "C").is_none());
+
+        let ctx_match = DynamicContext {
+            principals: vec!["secret".into()],
+            ..DynamicContext::default()
+        };
+        assert!(find_path(&graph, &ctx_match, "A", "C").is_some());
+    }
+
+    #[test]
+    fn contextual_subgraph_excludes_temporally_invisible_edge() {
+        let graph = build_two_edge_graph(None, Some(100), vec![]);
+
+        let mut ctx_after = DynamicContext {
+            as_of: Some(200),
+            ..DynamicContext::default()
+        };
+        ctx_after.semantic_boosts.insert("B".to_string(), 1.0);
+        let sg = contextual_subgraph(&graph, &ctx_after, 1);
+        assert!(!sg.nodes.iter().any(|n| n.name == "C"));
+
+        let mut ctx_before = DynamicContext {
+            as_of: Some(50),
+            ..DynamicContext::default()
+        };
+        ctx_before.semantic_boosts.insert("B".to_string(), 1.0);
+        let sg = contextual_subgraph(&graph, &ctx_before, 1);
+        assert!(sg.nodes.iter().any(|n| n.name == "C"));
+    }
+
+    #[test]
+    fn contextual_subgraph_excludes_acl_invisible_edge() {
+        let graph = build_two_edge_graph(None, None, vec!["secret"]);
+
+        let mut ctx_none = DynamicContext::default();
+        ctx_none.semantic_boosts.insert("B".to_string(), 1.0);
+        let sg = contextual_subgraph(&graph, &ctx_none, 1);
+        assert!(!sg.nodes.iter().any(|n| n.name == "C"));
+
+        let mut ctx_match = DynamicContext {
+            principals: vec!["secret".into()],
+            ..DynamicContext::default()
+        };
+        ctx_match.semantic_boosts.insert("B".to_string(), 1.0);
+        let sg = contextual_subgraph(&graph, &ctx_match, 1);
+        assert!(sg.nodes.iter().any(|n| n.name == "C"));
+    }
+
+    #[test]
+    fn multi_beam_intersection_excludes_temporally_invisible_edge() {
+        let graph = build_two_edge_graph(None, Some(100), vec![]);
+        let starts = vec!["A".to_string()];
+
+        let ctx_after = DynamicContext {
+            as_of: Some(200),
+            ..DynamicContext::default()
+        };
+        let sg = multi_beam_intersection(&graph, &ctx_after, &starts, 5, 2, 1);
+        assert!(!sg.nodes.iter().any(|n| n.name == "C"), "node reachability");
+        assert!(
+            !sg.edges.iter().any(|e| e.target == "C"),
+            "edge reconstruction"
+        );
+
+        let ctx_before = DynamicContext {
+            as_of: Some(50),
+            ..DynamicContext::default()
+        };
+        let sg = multi_beam_intersection(&graph, &ctx_before, &starts, 5, 2, 1);
+        assert!(sg.nodes.iter().any(|n| n.name == "C"));
+        assert!(sg.edges.iter().any(|e| e.target == "C"));
+    }
+
+    #[test]
+    fn multi_beam_intersection_excludes_acl_invisible_edge() {
+        let graph = build_two_edge_graph(None, None, vec!["secret"]);
+        let starts = vec!["A".to_string()];
+
+        let ctx_none = DynamicContext::default();
+        let sg = multi_beam_intersection(&graph, &ctx_none, &starts, 5, 2, 1);
+        assert!(!sg.nodes.iter().any(|n| n.name == "C"));
+        assert!(!sg.edges.iter().any(|e| e.target == "C"));
+
+        let ctx_match = DynamicContext {
+            principals: vec!["secret".into()],
+            ..DynamicContext::default()
+        };
+        let sg = multi_beam_intersection(&graph, &ctx_match, &starts, 5, 2, 1);
+        assert!(sg.nodes.iter().any(|n| n.name == "C"));
+        assert!(sg.edges.iter().any(|e| e.target == "C"));
+    }
+
+    // ---- PROPTEST: ctx-filtered traversal == traversal over a pre-filtered
+    //      graph (matches the delta.rs `prop_delta_topology_equals_rebuild`
+    //      style: build via `build_graph`, compare across two constructions of
+    //      "the same logical visible graph"). Node scoring (`compute_score`)
+    //      depends only on `base_weight`/`semantic_boosts`/etc — never on
+    //      `pagerank_weight` or edge presence — so identical node inputs give
+    //      bit-identical scores regardless of which edges are attached,
+    //      making this an exact (not approximate) equivalence. ------------
+
+    use proptest::prelude::*;
+
+    fn tag_strat() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["a", "b"]).prop_map(String::from)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn prop_ctx_filter_equals_prefiltered_graph(
+            raw_edges in prop::collection::vec(
+                (
+                    0usize..5,
+                    0usize..5,
+                    prop::option::of(0u64..20),
+                    prop::option::of(0u64..20),
+                    prop::collection::vec(tag_strat(), 0..=2),
+                ),
+                0..12,
+            ),
+            as_of in prop::option::of(0u64..20),
+            principals in prop::collection::vec(tag_strat(), 0..=2),
+        ) {
+            let names = ["n0", "n1", "n2", "n3", "n4"];
+            let nodes: Vec<NodeInput> = names.iter().map(|n| make_node(n, 0.5)).collect();
+
+            let mut edges: Vec<EdgeInput> = Vec::new();
+            for (fi, ti, vf, vt, acl) in raw_edges {
+                if fi == ti {
+                    continue; // self-loops are irrelevant to this property
+                }
+                if let (Some(a), Some(b)) = (vf, vt) {
+                    if a > b {
+                        continue; // build_graph silently skips these; exclude from
+                                  // both sides so the compared edge sets match
+                    }
+                }
+                edges.push(make_edge_ext(
+                    names[fi],
+                    names[ti],
+                    "rel",
+                    vf,
+                    vt,
+                    acl.iter().map(String::as_str).collect(),
+                ));
+            }
+
+            let ctx = DynamicContext {
+                as_of,
+                principals: principals.clone(),
+                ..DynamicContext::default()
+            };
+            let ctx_none = DynamicContext::default();
+
+            // Edges that pass `ctx`'s visibility check, with their
+            // valid_from/valid_to/acl STRIPPED (cleared to unbounded/public).
+            // ACL filtering (unlike temporal) is never "disabled" by ctx_none
+            // — an empty-principals ctx still fails-closed on ANY non-empty
+            // acl — so simply keeping the ORIGINAL acl on a kept edge would
+            // make ctx_none re-reject it downstream, which is not what this
+            // property is testing (it tests reachability equivalence, not
+            // "the filtered graph is also a legal persisted graph").
+            let visible_edges: Vec<EdgeInput> = edges
+                .iter()
+                .filter(|e| ctx.is_edge_visible(e.valid_from, e.valid_to, &e.acl))
+                .cloned()
+                .map(|mut e| {
+                    e.valid_from = None;
+                    e.valid_to = None;
+                    e.acl = Vec::new();
+                    e
+                })
+                .collect();
+
+            let (g_full, m_full) = build_graph(nodes.clone(), edges);
+            let full = OrpheusGraphInner::new(g_full, m_full);
+            let (g_vis, m_vis) = build_graph(nodes, visible_edges);
+            let visible = OrpheusGraphInner::new(g_vis, m_vis);
+
+            for start in names {
+                let a: Vec<(String, u32)> = beam_traverse(&full, &ctx, start, 5, 3)
+                    .into_iter()
+                    .map(|r| (r.name, r.weight.to_bits()))
+                    .collect();
+                let b: Vec<(String, u32)> = beam_traverse(&visible, &ctx_none, start, 5, 3)
+                    .into_iter()
+                    .map(|r| (r.name, r.weight.to_bits()))
+                    .collect();
+                prop_assert_eq!(a, b, "beam_traverse mismatch from {}", start);
+            }
+
+            for start in names {
+                for end in names {
+                    let pa = find_path(&full, &ctx, start, end)
+                        .map(|p| p.into_iter().map(|s| s.node).collect::<Vec<_>>());
+                    let pb = find_path(&visible, &ctx_none, start, end)
+                        .map(|p| p.into_iter().map(|s| s.node).collect::<Vec<_>>());
+                    prop_assert_eq!(pa, pb, "find_path mismatch {} -> {}", start, end);
+                }
+            }
+        }
     }
 }

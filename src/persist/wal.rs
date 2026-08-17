@@ -13,14 +13,14 @@
 //! arbitrary length up to 4 GiB) fails the crc instead of driving a giant
 //! read/alloc. `seq` strictly increases by exactly 1 per frame.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 
 use crc32fast::Hasher;
 
 use super::FsyncPolicy;
 use crate::delta::Op;
 use crate::persist::error::PersistError;
+use crate::persist::vfs::VfsFile;
 
 /// One durable batch: the commit seq plus the ops that were applied. `Op`
 /// already derives `serde`, so this needs no new derive work.
@@ -153,8 +153,9 @@ pub fn scan_wal_bytes(buf: &[u8]) -> Result<ScanResult, PersistError> {
 }
 
 /// Read the whole WAL file and scan it. The WAL is small in 2a; the read is
-/// bounded by the real file size (never by an on-disk length field).
-pub fn read_and_scan(file: &mut File) -> Result<ScanResult, PersistError> {
+/// bounded by the real file size (never by an on-disk length field). Takes a
+/// [`VfsFile`] so the recovery scan reads through the same seam the writer uses.
+pub fn read_and_scan(file: &mut dyn VfsFile) -> Result<ScanResult, PersistError> {
     file.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
@@ -165,7 +166,7 @@ pub fn read_and_scan(file: &mut File) -> Result<ScanResult, PersistError> {
 /// owning writer Mutex) — any append/fsync failure sets it, which is what makes
 /// a torn frame provably the LAST frame (§4.2).
 pub struct WalWriter {
-    file: File,
+    file: Box<dyn VfsFile>,
     policy: FsyncPolicy,
     since_fsync: u32,
     pub(crate) poisoned: bool,
@@ -178,7 +179,7 @@ pub struct WalWriter {
 
 impl WalWriter {
     /// Wrap an already-opened (append-mode) file positioned at `len` bytes.
-    pub fn new(file: File, policy: FsyncPolicy, len: u64) -> Self {
+    pub fn new(file: Box<dyn VfsFile>, policy: FsyncPolicy, len: u64) -> Self {
         Self {
             file,
             policy,
@@ -195,25 +196,22 @@ impl WalWriter {
         self.policy = policy;
     }
 
-    /// Append one frame. ANY failure poisons the writer. Append is the commit
-    /// point: the caller advances in-memory seq/delta only after this returns
-    /// `Ok`. fsync happens here per policy (`EveryBatch` always; `EveryN` on the
-    /// counter; `OnFlush` never here — durability then comes from `flush()`).
+    /// Append one frame. ANY failure poisons the writer. fsync happens here per
+    /// policy (`EveryBatch` always; `EveryN` on the counter; `OnFlush` never here
+    /// — durability then comes from `flush()`).
     ///
-    /// **fsync-failure caveat (honest limitation).** If `write_all` succeeds but
-    /// the subsequent `fsync` fails, this returns `Err` and the caller treats the
-    /// batch as *not committed* — yet a complete, crc-valid frame is already in
-    /// the OS page cache and the kernel MAY still write it back. So on the next
-    /// `open()` recovery can legitimately replay a frame whose `apply()` returned
-    /// `Err`. Consequence: **"apply returned Err" does NOT guarantee "not
-    /// durable" when the failure was an fsync error.** A caller that must know
-    /// the true committed state after a write error should reopen and read
-    /// `(epoch, seq)` to reconcile. Making `apply`-Err strictly equal
-    /// not-durable would need a per-frame commit/torn-write marker — deferred
-    /// (logged in docs/persistence_impl_log.md and the spec durability section).
-    /// Returns `true` iff this call fsync'd the log (so the caller can advance
-    /// its durable-seq high-water only when the frame is actually on stable
-    /// storage — critical: under `OnFlush` a write-through append is NOT durable).
+    /// **fsync-failure ambiguity — resolved by the COMMIT marker.** If `write_all`
+    /// succeeds but the subsequent `fsync` fails, this returns `Err` yet a
+    /// complete, crc-valid frame is already in the OS page cache the kernel MAY
+    /// still write back. This append is therefore NOT the durable commit point:
+    /// the caller (`PersistentGraph::apply`) advances the authoritative durable
+    /// COMMIT marker (the `commit` sidecar) ONLY after this fsync succeeds, and
+    /// recovery replays nothing beyond that marker. So a crc-valid frame whose
+    /// `fsync` failed is BELOW no marker and is discarded (counted + truncated) on
+    /// the next `open()` — making `apply`-returned-`Err` strictly mean "not
+    /// committed". Returns `true` iff this call fsync'd the log, which is exactly
+    /// the signal the caller uses to decide whether to advance the marker (under
+    /// `OnFlush` a write-through append is NOT durable, so it returns `false`).
     pub fn append(&mut self, frame: &[u8]) -> Result<bool, PersistError> {
         #[cfg(test)]
         if self.fail_next {
@@ -335,6 +333,9 @@ mod tests {
                     kind: "rel".into(),
                     field_name: Some("f".into()),
                     base_weight: 1.0,
+                    valid_from: Some(10),
+                    valid_to: Some(20),
+                    acl: vec!["team-x".into()],
                 },
             },
             Op::RemoveNode { name: "c".into() },

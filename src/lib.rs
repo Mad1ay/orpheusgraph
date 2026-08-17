@@ -21,7 +21,7 @@ pub use builder::build_graph;
 pub use delta::{DeltaAccessor, DeltaError, GraphDelta, Op};
 pub use graph::OrpheusGraphInner;
 pub use overlay::{neighbors_with_overlay, resolve_overlay_node, NeighborEntry};
-pub use persist::{BaseMode, FsyncPolicy, PersistError, PersistentGraph, Validate};
+pub use persist::{BaseMode, FsyncPolicy, PersistError, PersistentGraph, RecoveryReport, Validate};
 pub use scoring::compute_score;
 pub use traversal::{beam_traverse, contextual_subgraph, find_path, multi_beam_intersection};
 pub use types::*;

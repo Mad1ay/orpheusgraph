@@ -59,6 +59,9 @@ impl OrpheusGraphInner {
                     kind: edge_data.kind.clone(),
                     field_name: edge_data.field_name.clone(),
                     weight: edge_data.base_weight,
+                    valid_from: edge_data.valid_from,
+                    valid_to: edge_data.valid_to,
+                    acl: edge_data.acl.clone(),
                 }
             })
             .collect()
@@ -83,6 +86,9 @@ impl OrpheusGraphInner {
                     kind: edge_data.kind.clone(),
                     field_name: edge_data.field_name.clone(),
                     weight: edge_data.base_weight,
+                    valid_from: edge_data.valid_from,
+                    valid_to: edge_data.valid_to,
+                    acl: edge_data.acl.clone(),
                 }
             })
             .collect()

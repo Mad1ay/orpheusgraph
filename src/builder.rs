@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::graph::OrpheusGraphInner;
-use crate::types::{EdgeData, EdgeInput, NodeData, NodeInput};
+use crate::types::{normalize_acl, EdgeData, EdgeInput, NodeData, NodeInput};
 
 /// Rebuild a graph from already-serialized data (nodes with pagerank, indexed edges).
 /// No normalization or PageRank recomputation — data is already processed.
@@ -164,10 +164,29 @@ fn build_graph_inner(
             Some(idx) => *idx,
             None => continue,
         };
+        // Malformed temporal range: valid_from > valid_to (both Some) can
+        // never be satisfied by any `as_of` (the half-open window is empty),
+        // so the edge would be permanently invisible whenever temporal
+        // filtering is active anyway. `build_graph` has no `Result` return
+        // (matches the existing "skip edges referencing unknown nodes"
+        // precedent immediately above, rather than the apply-time hard-Err
+        // style used by `GraphDelta::apply`, which DOES return `Result` and
+        // is the batch-atomic ingestion boundary) — reject by SKIPPING the
+        // edge, the builder's established error style for malformed input.
+        if let (Some(vf), Some(vt)) = (edge.valid_from, edge.valid_to) {
+            if vf > vt {
+                continue;
+            }
+        }
+        let mut acl = edge.acl.clone();
+        normalize_acl(&mut acl);
         let edge_data = EdgeData {
             kind: edge.kind.clone(),
             field_name: edge.field_name.clone(),
             base_weight: edge.base_weight,
+            valid_from: edge.valid_from,
+            valid_to: edge.valid_to,
+            acl,
         };
         graph.add_edge(from_idx, to_idx, edge_data);
     }
@@ -271,6 +290,9 @@ mod tests {
             kind: kind.to_string(),
             field_name: None,
             base_weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+            acl: Vec::new(),
         }
     }
 
@@ -475,6 +497,63 @@ mod tests {
         assert_eq!(index_map.len(), 2);
         // Last write wins: dup's base_weight came from 300.0 (the max), so 1.0.
         assert!((graph[index_map["dup"]].base_weight - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_edge_invalid_validity_range_skipped() {
+        // valid_from > valid_to (both Some) is malformed and never
+        // satisfiable — build_graph's established error style for bad edge
+        // input is a silent skip (matches "skip edges referencing unknown
+        // nodes" immediately above it in build_graph_inner).
+        let nodes = vec![make_node("a", "m", 1.0), make_node("b", "m", 1.0)];
+        let mut bad = make_edge("a", "b", "rel");
+        bad.valid_from = Some(10);
+        bad.valid_to = Some(5);
+        let (graph, _) = build_graph(nodes, vec![bad]);
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "malformed-range edge must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_edge_valid_from_equals_valid_to_accepted() {
+        // valid_from == valid_to is a legal (empty but well-formed) window —
+        // only vf > vt is rejected.
+        let nodes = vec![make_node("a", "m", 1.0), make_node("b", "m", 1.0)];
+        let mut edge = make_edge("a", "b", "rel");
+        edge.valid_from = Some(5);
+        edge.valid_to = Some(5);
+        let (graph, _) = build_graph(nodes, vec![edge]);
+        assert_eq!(graph.edge_count(), 1);
+    }
+
+    #[test]
+    fn test_edge_acl_normalized_sorted_deduped() {
+        let nodes = vec![make_node("a", "m", 1.0), make_node("b", "m", 1.0)];
+        let mut edge = make_edge("a", "b", "rel");
+        edge.acl = vec!["z".into(), "a".into(), "z".into(), "m".into()];
+        let (graph, _) = build_graph(nodes, vec![edge]);
+        let e = graph.edge_weights().next().expect("one edge");
+        assert_eq!(
+            e.acl,
+            vec!["a".to_string(), "m".to_string(), "z".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_edge_fields_pass_through() {
+        let nodes = vec![make_node("a", "m", 1.0), make_node("b", "m", 1.0)];
+        let mut edge = make_edge("a", "b", "rel");
+        edge.valid_from = Some(100);
+        edge.valid_to = Some(200);
+        edge.acl = vec!["team-x".into()];
+        let (graph, _) = build_graph(nodes, vec![edge]);
+        let e = graph.edge_weights().next().expect("one edge");
+        assert_eq!(e.valid_from, Some(100));
+        assert_eq!(e.valid_to, Some(200));
+        assert_eq!(e.acl, vec!["team-x".to_string()]);
     }
 
     #[test]

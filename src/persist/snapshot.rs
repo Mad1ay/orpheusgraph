@@ -35,6 +35,11 @@ use crate::graph::OrpheusGraphInner;
 use crate::persist::error::PersistError;
 use crate::types::{EdgeData, NodeData};
 
+// Note: acl is normalized (sorted+deduped) at INGEST time (builder + delta
+// `apply`), not here — by the time an OrpheusGraphInner reaches `to_rkyv_v2`
+// every edge.acl is already canonical, so this module trusts (and does not
+// re-derive) that invariant.
+
 use super::BaseGraph;
 use super::BaseMode;
 
@@ -180,6 +185,9 @@ pub struct CsrEdge {
     pub kind: String,
     pub field_name: Option<String>,
     pub base_weight: f32,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub acl: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,10 +229,22 @@ pub fn to_rkyv_v2(graph: &OrpheusGraphInner) -> Vec<u8> {
             kind: ed.kind.clone(),
             field_name: ed.field_name.clone(),
             base_weight: ed.base_weight,
+            valid_from: ed.valid_from,
+            valid_to: ed.valid_to,
+            acl: ed.acl.clone(),
         });
     }
 
     // 3. Total-order sort. Primary key `from_idx` groups outgoing CSR runs.
+    // valid_from/valid_to/acl participate in the sort key too: `sort_by` is
+    // STABLE, so without them two parallel edges tying on every other key
+    // (from_idx, to_idx, kind, field_name, base_weight) but differing only in
+    // acl/temporal validity would keep their PRE-sort (petgraph insertion)
+    // relative order — reintroducing exactly the source-insertion-order
+    // determinism bug `build_graph`'s node-name sort was fixed for (see
+    // `v2_bytes_identical_across_source_insertion_order`). `Option<u64>` and
+    // `Vec<String>` are both `Ord` (lexicographic for the Vec), so this stays
+    // a total order.
     edges.sort_by(|a, b| {
         a.from_idx
             .cmp(&b.from_idx)
@@ -232,6 +252,9 @@ pub fn to_rkyv_v2(graph: &OrpheusGraphInner) -> Vec<u8> {
             .then(a.kind.cmp(&b.kind))
             .then(a.field_name.cmp(&b.field_name))
             .then(a.base_weight.total_cmp(&b.base_weight))
+            .then(a.valid_from.cmp(&b.valid_from))
+            .then(a.valid_to.cmp(&b.valid_to))
+            .then(a.acl.cmp(&b.acl))
     });
     let e = edges.len();
 
@@ -300,6 +323,9 @@ pub fn from_rkyv_rebuild_v2(data: &[u8]) -> Result<OrpheusGraphInner, String> {
                     kind: e.kind,
                     field_name: e.field_name,
                     base_weight: e.base_weight,
+                    valid_from: e.valid_from,
+                    valid_to: e.valid_to,
+                    acl: e.acl,
                 },
             )
         })
@@ -792,6 +818,9 @@ impl GraphAccessor for ArchivedCsrView {
                 edge_kind: edge.kind.to_string(),
                 field_name: edge.field_name.as_ref().map(|s| s.to_string()),
                 edge_weight: edge.base_weight.to_native(),
+                valid_from: edge.valid_from.as_ref().map(|v| v.to_native()),
+                valid_to: edge.valid_to.as_ref().map(|v| v.to_native()),
+                acl: edge.acl.iter().map(|s| s.to_string()).collect(),
             });
         }
         out
@@ -822,6 +851,9 @@ impl GraphAccessor for ArchivedCsrView {
                 edge_kind: edge.kind.to_string(),
                 field_name: edge.field_name.as_ref().map(|s| s.to_string()),
                 edge_weight: edge.base_weight.to_native(),
+                valid_from: edge.valid_from.as_ref().map(|v| v.to_native()),
+                valid_to: edge.valid_to.as_ref().map(|v| v.to_native()),
+                acl: edge.acl.iter().map(|s| s.to_string()).collect(),
             });
         }
         inc
@@ -940,6 +972,46 @@ mod tests {
                 kind: k.to_string(),
                 field_name: Some(format!("{f}_{t}")),
                 base_weight: 0.7,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
+            })
+            .collect();
+        let (g, m) = build_graph(n, e);
+        OrpheusGraphInner::new(g, m)
+    }
+
+    /// Like `inner()` but lets the caller attach `valid_from`/`valid_to`/`acl`
+    /// to every edge (same values on all edges — enough for the tests that
+    /// need it).
+    fn inner_with_edge_fields(
+        nodes: Vec<(&str, &str)>,
+        edges: Vec<(&str, &str, &str)>,
+        valid_from: Option<u64>,
+        valid_to: Option<u64>,
+        acl: Vec<&str>,
+    ) -> OrpheusGraphInner {
+        let n: Vec<NodeInput> = nodes
+            .iter()
+            .map(|(name, kind)| NodeInput {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                metadata: Map::new(),
+                base_weight: 0.5,
+                noise_penalty: 0.1,
+            })
+            .collect();
+        let e: Vec<EdgeInput> = edges
+            .iter()
+            .map(|(f, t, k)| EdgeInput {
+                from: f.to_string(),
+                to: t.to_string(),
+                kind: k.to_string(),
+                field_name: Some(format!("{f}_{t}")),
+                base_weight: 0.7,
+                valid_from,
+                valid_to,
+                acl: acl.iter().map(|s| s.to_string()).collect(),
             })
             .collect();
         let (g, m) = build_graph(n, e);
@@ -1137,6 +1209,122 @@ mod tests {
         let a = build(&[("z", "1"), ("a", "2"), ("m", "3")]);
         let b = build(&[("a", "2"), ("m", "3"), ("z", "1")]);
         assert_eq!(a, b, "metadata map order must not affect snapshot bytes");
+    }
+
+    #[test]
+    fn v2_bytes_identical_with_acl_across_input_order() {
+        // Same logical edge acl, supplied to EdgeInput in a different order —
+        // normalize_acl() sorts+dedups at builder ingest, so both must produce
+        // byte-identical snapshots regardless of caller-supplied tag order.
+        let build = |acl: &[&str]| {
+            let nodes = vec![("A", "m"), ("B", "m")]
+                .into_iter()
+                .map(|(name, kind)| crate::types::NodeInput {
+                    name: name.into(),
+                    kind: kind.into(),
+                    metadata: HashMap::new(),
+                    base_weight: 0.5,
+                    noise_penalty: 0.0,
+                })
+                .collect();
+            let edges = vec![crate::types::EdgeInput {
+                from: "A".into(),
+                to: "B".into(),
+                kind: "rel".into(),
+                field_name: None,
+                base_weight: 1.0,
+                valid_from: Some(1),
+                valid_to: Some(9),
+                acl: acl.iter().map(|s| s.to_string()).collect(),
+            }];
+            let (g, m) = crate::builder::build_graph(nodes, edges);
+            to_rkyv_v2(&OrpheusGraphInner::new(g, m))
+        };
+        let a = build(&["z", "a", "m", "a"]); // has a duplicate too
+        let b = build(&["m", "z", "a"]);
+        assert_eq!(
+            a, b,
+            "acl input order (and duplicates) must not affect snapshot bytes"
+        );
+    }
+
+    #[test]
+    fn v2_bytes_identical_with_two_parallel_edges_differing_only_in_acl() {
+        // Regression guard for the sort-key extension: two parallel A->B edges
+        // that tie on (from_idx, to_idx, kind, field_name, base_weight) but
+        // differ in acl must still sort into a canonical (insertion-order-
+        // independent) position — otherwise Vec::sort_by's STABILITY would let
+        // pre-sort (petgraph) insertion order leak into the byte stream.
+        let build = |edges: Vec<crate::types::EdgeInput>| {
+            let nodes = vec![("A", "m"), ("B", "m")]
+                .into_iter()
+                .map(|(name, kind)| crate::types::NodeInput {
+                    name: name.into(),
+                    kind: kind.into(),
+                    metadata: HashMap::new(),
+                    base_weight: 0.5,
+                    noise_penalty: 0.0,
+                })
+                .collect();
+            let (g, m) = crate::builder::build_graph(nodes, edges);
+            to_rkyv_v2(&OrpheusGraphInner::new(g, m))
+        };
+        let mk = |acl: &str| crate::types::EdgeInput {
+            from: "A".into(),
+            to: "B".into(),
+            kind: "rel".into(),
+            field_name: None,
+            base_weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+            acl: vec![acl.to_string()],
+        };
+        let forward = build(vec![mk("x"), mk("y")]);
+        let backward = build(vec![mk("y"), mk("x")]);
+        assert_eq!(
+            forward, backward,
+            "parallel edges differing only in acl must sort canonically regardless of insertion order"
+        );
+    }
+
+    #[test]
+    fn v2_temporal_and_acl_fields_round_trip_through_mmap_open() {
+        let owned = inner_with_edge_fields(
+            vec![("A", "m"), ("B", "m")],
+            vec![("A", "B", "rel")],
+            Some(10),
+            Some(20),
+            vec!["team-x", "team-y"],
+        );
+        let bytes = to_rkyv_v2(&owned);
+        let base = open_csr(&bytes, Validate::Full).unwrap();
+        let view = base.as_accessor();
+        let nb = &view.outgoing_neighbors("A")[0];
+        assert_eq!(nb.valid_from, Some(10));
+        assert_eq!(nb.valid_to, Some(20));
+        assert_eq!(nb.acl, vec!["team-x".to_string(), "team-y".to_string()]);
+
+        let inc = &view.incoming_neighbors("B")[0];
+        assert_eq!(inc.valid_from, Some(10));
+        assert_eq!(inc.valid_to, Some(20));
+        assert_eq!(inc.acl, vec!["team-x".to_string(), "team-y".to_string()]);
+    }
+
+    #[test]
+    fn v2_owned_rebuild_preserves_temporal_and_acl_fields() {
+        let owned = inner_with_edge_fields(
+            vec![("A", "m"), ("B", "m")],
+            vec![("A", "B", "rel")],
+            Some(5),
+            None,
+            vec!["public-ish"],
+        );
+        let bytes = to_rkyv_v2(&owned);
+        let rebuilt = from_rkyv_rebuild_v2(&bytes).unwrap();
+        let nb = &rebuilt.outgoing_neighbors("A")[0];
+        assert_eq!(nb.valid_from, Some(5));
+        assert_eq!(nb.valid_to, None);
+        assert_eq!(nb.acl, vec!["public-ish".to_string()]);
     }
 
     #[test]

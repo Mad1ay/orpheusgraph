@@ -48,18 +48,30 @@ fn child_loop(dir: &Path, policy: FsyncPolicy) -> ! {
         .append(true)
         .open(dir.join("acked.log"))
         .expect("child: open acked.log");
+    // Separate ground-truth ledger of the DURABLE-COMMIT high-water (the COMMIT
+    // marker). Under the strict per-frame marker, only committed data is
+    // guaranteed to survive a crash — under OnFlush an acked-but-un-flushed batch
+    // is NOT committed. So `max_committed` is the universal survival lower bound;
+    // `max_acked` is only a lower bound under EveryBatch (where ack => committed).
+    let mut committed = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("committed.log"))
+        .expect("child: open committed.log");
     let mut n = pg.seq() + 1;
     loop {
         match pg.apply(vec![marker_op(n)], None) {
             Ok(seq) => {
-                // Ground-truth ledger: record what apply() ACKed, fsync so the
-                // parent reads the true high-water mark even after the kill.
-                // FIXED-WIDTH 20-digit lines: a kill mid-write leaves a short
-                // torn record, and a following append then forms a >20-digit
-                // line that overflows u64 parsing — so `max_acked` rejects both
-                // torn and concatenated records instead of misreading them.
+                // Ground-truth ledgers: record what apply() ACKed and what is now
+                // durably COMMITTED, fsync so the parent reads the true high-water
+                // even after the kill. FIXED-WIDTH 20-digit lines: a kill mid-write
+                // leaves a short torn record, and a following append then forms a
+                // >20-digit line that overflows u64 parsing — so the readers reject
+                // both torn and concatenated records instead of misreading them.
                 let _ = writeln!(acked, "{seq:020}");
                 let _ = acked.sync_all();
+                let _ = writeln!(committed, "{:020}", pg.committed_seq());
+                let _ = committed.sync_all();
                 n = seq + 1;
             }
             // A poison/CAS/etc. is unexpected here; exit non-zero so a hang or
@@ -69,12 +81,13 @@ fn child_loop(dir: &Path, policy: FsyncPolicy) -> ! {
     }
 }
 
-fn max_acked(dir: &Path) -> u64 {
-    std::fs::read_to_string(dir.join("acked.log"))
+/// Highest intact fixed-width record in a ground-truth ledger. Only exactly-
+/// 20-digit records are intact (torn = short, concat = long); parse still guards
+/// against a 20-digit value > u64::MAX.
+fn max_ledger(dir: &Path, file: &str) -> u64 {
+    std::fs::read_to_string(dir.join(file))
         .unwrap_or_default()
         .lines()
-        // Only exactly-20-digit records are intact (torn=short, concat=long);
-        // parse still guards against a 20-digit value > u64::MAX.
         .filter(|l| l.len() == 20 && l.bytes().all(|b| b.is_ascii_digit()))
         .filter_map(|l| l.parse::<u64>().ok())
         .max()
@@ -139,9 +152,13 @@ fn kill9_crash_harness() {
                 panic!("[{policy_name} #{i}] reopen after kill -9 failed: {e}")
             });
             let seq = pg.seq();
-            let acked = max_acked(&dir);
+            let acked = max_ledger(&dir, "acked.log");
+            let committed = max_ledger(&dir, "committed.log");
 
-            // (ii) clean prefix: boundary marker present, nothing beyond seq.
+            // (ii) clean prefix: boundary marker present, nothing beyond seq. With
+            // the per-frame commit marker the recovered state is EXACTLY the
+            // committed prefix (no "lucky" un-fsync'd tail), so this must always
+            // be a hole-free prefix with no phantom past the boundary.
             let s = pg.snapshot();
             let acc = DeltaAccessor::new(s.base.as_accessor(), s.delta.as_ref());
             if seq > 0 {
@@ -156,11 +173,26 @@ fn kill9_crash_harness() {
                 seq + 1
             );
 
-            // (iii) process death loses nothing acked, under ANY policy.
+            // (iii) UNIVERSAL durability: anything ever reported as durably
+            // committed (the COMMIT marker) survives a kill -9 under ANY policy —
+            // the marker only ever advances after a successful fsync, and process
+            // death preserves the page cache. This is the strict successor to the
+            // old "seq >= max_acked under any policy" invariant.
             assert!(
-                seq >= acked,
-                "[{policy_name} #{i}] recovered seq {seq} < max_acked {acked}: kill -9 lost an acked batch"
+                seq >= committed,
+                "[{policy_name} #{i}] recovered seq {seq} < max_committed {committed}: kill -9 lost committed data"
             );
+
+            // (iii-b) Under EveryBatch every apply fsyncs before it acks, so
+            // ack => committed and the stronger "all acked survive" still holds.
+            // Under OnFlush an acked-but-un-flushed tail is intentionally dropped,
+            // so `seq >= acked` need NOT hold there (only `seq >= committed`).
+            if policy_name == "every" {
+                assert!(
+                    seq >= acked,
+                    "[{policy_name} #{i}] recovered seq {seq} < max_acked {acked}: EveryBatch lost an acked batch"
+                );
+            }
 
             // (iv) monotonic across incarnations + epoch re-mint on unclean reopen.
             assert!(

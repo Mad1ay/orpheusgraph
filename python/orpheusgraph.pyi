@@ -10,6 +10,13 @@ class OrpheusGraph:
     def get_node(self, name: str) -> NodeResult | None: ...
     def outgoing_edges(self, name: str) -> list[EdgeResult]: ...
     def incoming_edges(self, name: str) -> list[EdgeResult]: ...
+    # NOTE: outgoing_edges/incoming_edges are RAW, UNFILTERED adjacency: they take
+    # no DynamicContext and apply NO temporal (`valid_from`/`valid_to`) or ACL
+    # (`acl`) visibility filtering. Every edge is returned with its full `acl`
+    # tag list. Temporal/ACL visibility applies ONLY to the ctx-taking traversal
+    # methods (beam_traverse, find_path, contextual_subgraph,
+    # multi_beam_intersection). Do NOT surface these raw lists to an end user
+    # under an access-control assumption.
     def beam_traverse(
         self, start: str, k: int, depth: int, ctx: DynamicContext
     ) -> list[NodeResult]: ...
@@ -55,18 +62,45 @@ class PersistentGraph:
              "noise_penalty": float, "metadata": dict}``
           - ``{"op": "remove_node", "name": str}``
           - ``{"op": "add_edge", "from": str, "to": str, "kind": str,
-             "field": str | None, "base_weight": float}``
+             "field": str | None, "base_weight": float,
+             "valid_from": int | None, "valid_to": int | None,
+             "acl": list[str] | None}``
           - ``{"op": "remove_edge", "from": str, "to": str, "kind": str}``
 
         ``expected_seq`` enables optimistic CAS: if the store advanced past it,
         ``ConflictError`` is raised and nothing is written. Weights must be
         pre-normalized to [0.0, 1.0] or ``ValueError`` is raised.
+
+        ``valid_from``/``valid_to`` (opaque caller-defined valid-time instants,
+        half-open ``[valid_from, valid_to)``) and ``acl`` (tag list; empty/absent
+        = public) default to unbounded/public when omitted. A malformed
+        ``valid_from > valid_to`` range raises ``ValueError`` (the whole batch is
+        rejected, nothing written). These fields are QUERY-TIME ONLY filters
+        (via ``DynamicContext.as_of``/``principals``) — they never affect
+        PageRank or any other base metric, which are always computed over the
+        full, unfiltered graph.
+
+        Durability: a returned seq means the batch is DURABLE (its WAL frame and a
+        covering COMMIT marker are both fsync'd) — it survives process death and
+        power loss. A raised error means durability is INDETERMINATE: a COMMIT
+        fsync can fail while its slot still persists, so the batch MAY be visible
+        or invisible after a reopen. Recovery always reopens to a consistent
+        committed prefix and never loses an acked batch; reconcile an error by
+        re-opening the store and reading ``seq`` (the recovered committed prefix),
+        NOT by blindly retrying (a non-idempotent batch could double-apply).
         """
     def flush(self) -> None: ...
     def compact(self) -> None: ...
     def get_node(self, name: str) -> NodeResult | None: ...
     def outgoing_edges(self, name: str) -> list[EdgeResult]: ...
     def incoming_edges(self, name: str) -> list[EdgeResult]: ...
+    # NOTE: outgoing_edges/incoming_edges are RAW, UNFILTERED adjacency: they take
+    # no DynamicContext and apply NO temporal (`valid_from`/`valid_to`) or ACL
+    # (`acl`) visibility filtering. Every edge is returned with its full `acl`
+    # tag list. Temporal/ACL visibility applies ONLY to the ctx-taking traversal
+    # methods (beam_traverse, find_path, contextual_subgraph,
+    # multi_beam_intersection). Do NOT surface these raw lists to an end user
+    # under an access-control assumption.
     def beam_traverse(
         self, start: str, k: int, depth: int, ctx: DynamicContext
     ) -> list[NodeResult]: ...
@@ -109,6 +143,11 @@ class DynamicContext:
     w_semantic: float
     w_noise: float
     w_override: float
+    as_of: int | None
+    """Valid-time instant for temporal edge filtering. None = no filtering."""
+    principals: list[str]
+    """ACL principals held by the caller. Normalized (sorted+deduped) on use.
+    Empty means an ACL-tagged edge is never visible (fail-closed)."""
 
     def __init__(
         self,
@@ -123,7 +162,12 @@ class DynamicContext:
         w_override: float = 1.0,
         overlay_nodes: list[dict[str, str]] | None = None,
         overlay_edges: list[dict[str, str]] | None = None,
-    ) -> None: ...
+        as_of: int | None = None,
+        principals: list[str] | None = None,
+    ) -> None:
+        """overlay_edges do NOT support valid_from/valid_to/acl (the dict
+        schema is string-valued only) — overlay edges are always
+        unbounded/public regardless of as_of/principals."""
     def add_boost(self, name: str, value: float) -> None: ...
     def add_override(self, name: str, value: float) -> None: ...
     def add_noise_tag(self, tag: str) -> None: ...
@@ -144,6 +188,9 @@ class EdgeResult:
     kind: str
     field_name: str | None
     weight: float
+    valid_from: int | None
+    valid_to: int | None
+    acl: list[str]
 
 class PathStep:
     node: str
@@ -157,7 +204,13 @@ class SubGraph:
 
 def build_graph(
     nodes: list[dict], edges: list[dict]
-) -> OrpheusGraph: ...
+) -> OrpheusGraph:
+    """Edge dicts accept optional ``valid_from``/``valid_to`` (int | None) and
+    ``acl`` (list[str] | None), defaulting to unbounded/public. A malformed
+    ``valid_from > valid_to`` range is silently DROPPED (the edge is skipped,
+    matching the existing behavior for an edge referencing an unknown node) —
+    it is not an error here, unlike ``PersistentGraph.apply()``.
+    """
 
 def from_rkyv(data: bytes) -> OrpheusGraph: ...
 

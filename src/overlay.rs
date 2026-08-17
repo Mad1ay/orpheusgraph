@@ -14,14 +14,39 @@ pub struct NeighborEntry {
     pub edge_weight: f32,
     /// Whether this came from the base graph or the overlay
     pub is_overlay: bool,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub acl: Vec<String>,
 }
 
-/// Get all outgoing neighbors of a node, combining base graph edges with overlay edges.
+/// Get all outgoing neighbors of a node, combining base graph edges with
+/// overlay edges, THEN applying query-time edge visibility
+/// (`DynamicContext::is_edge_visible`: temporal `as_of` + ACL `principals`).
 ///
+/// This is the ONE choke point `beam_traverse`/`find_path`/
+/// `contextual_subgraph` (and, transitively via `beam_traverse`, the beam-launch
+/// phase of `multi_beam_intersection`) expand through, so filtering here alone
+/// covers all of them — see module docs on why filtering lives in the
+/// traversal/query layer and not in `GraphAccessor` impls.
+pub fn neighbors_with_overlay(
+    graph: &dyn GraphAccessor,
+    ctx: &DynamicContext,
+    node_name: &str,
+) -> Vec<NeighborEntry> {
+    neighbors_with_overlay_unfiltered(graph, ctx, node_name)
+        .into_iter()
+        .filter(|n| ctx.is_edge_visible(n.valid_from, n.valid_to, &n.acl))
+        .collect()
+}
+
 /// Implements **max_fan_out cutoff** (Risk #8) with two bypass conditions:
 /// - Node has a semantic boost in the context (Risk #8)
 /// - Node has high pagerank_weight (Risk #13)
-pub fn neighbors_with_overlay(
+///
+/// Returns the RAW combined base+overlay neighbor list, unfiltered by
+/// temporal/ACL visibility — `neighbors_with_overlay` applies that filter
+/// once, uniformly, over the result of this function.
+fn neighbors_with_overlay_unfiltered(
     graph: &dyn GraphAccessor,
     ctx: &DynamicContext,
     node_name: &str,
@@ -52,6 +77,9 @@ pub fn neighbors_with_overlay(
                 field_name: neighbor.field_name,
                 edge_weight: neighbor.edge_weight,
                 is_overlay: false,
+                valid_from: neighbor.valid_from,
+                valid_to: neighbor.valid_to,
+                acl: neighbor.acl,
             });
         }
     }
@@ -74,6 +102,9 @@ fn collect_overlay_edges(
                 field_name: edge.field_name.clone(),
                 edge_weight: edge.base_weight,
                 is_overlay: true,
+                valid_from: edge.valid_from,
+                valid_to: edge.valid_to,
+                acl: edge.acl.clone(),
             });
         }
     }
@@ -113,6 +144,20 @@ mod tests {
             kind: "relates_to".to_string(),
             field_name: None,
             base_weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+            acl: Vec::new(),
+        }
+    }
+
+    fn overlay_edge_data(kind: &str) -> EdgeData {
+        EdgeData {
+            kind: kind.to_string(),
+            field_name: None,
+            base_weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+            acl: Vec::new(),
         }
     }
 
@@ -149,11 +194,7 @@ mod tests {
         ctx.overlay_edges.push((
             "sale.order".to_string(),
             "x_custom".to_string(),
-            EdgeData {
-                kind: "relates_to".to_string(),
-                field_name: None,
-                base_weight: 1.0,
-            },
+            overlay_edge_data("relates_to"),
         ));
 
         let neighbors = neighbors_with_overlay(&graph, &ctx, "sale.order");
@@ -170,11 +211,7 @@ mod tests {
         ctx.overlay_edges.push((
             "sale.order".to_string(),
             "x_custom".to_string(),
-            EdgeData {
-                kind: "relates_to".to_string(),
-                field_name: None,
-                base_weight: 1.0,
-            },
+            overlay_edge_data("relates_to"),
         ));
 
         let _ = neighbors_with_overlay(&graph, &ctx, "sale.order");
@@ -269,22 +306,14 @@ mod tests {
         ctx_a.overlay_edges.push((
             "sale.order".to_string(),
             "x_warehouse".to_string(),
-            EdgeData {
-                kind: "relates_to".to_string(),
-                field_name: None,
-                base_weight: 1.0,
-            },
+            overlay_edge_data("relates_to"),
         ));
 
         let mut ctx_b = DynamicContext::default();
         ctx_b.overlay_edges.push((
             "sale.order".to_string(),
             "x_hr_skill".to_string(),
-            EdgeData {
-                kind: "relates_to".to_string(),
-                field_name: None,
-                base_weight: 1.0,
-            },
+            overlay_edge_data("relates_to"),
         ));
 
         let names_a: Vec<String> = neighbors_with_overlay(&graph, &ctx_a, "sale.order")
@@ -327,5 +356,104 @@ mod tests {
         let neighbors = neighbors_with_overlay(&graph, &ctx, "sale.order");
         assert_eq!(neighbors.len(), 2);
         assert!(neighbors.iter().all(|n| !n.is_overlay));
+    }
+
+    // ---- temporal + ACL visibility filtering (the shared choke point) ---
+
+    fn make_edge_full(from: &str, to: &str, edge: EdgeData) -> EdgeInput {
+        EdgeInput {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: edge.kind,
+            field_name: edge.field_name,
+            base_weight: edge.base_weight,
+            valid_from: edge.valid_from,
+            valid_to: edge.valid_to,
+            acl: edge.acl,
+        }
+    }
+
+    #[test]
+    fn neighbors_with_overlay_filters_temporal_base_edge() {
+        let mut expired = overlay_edge_data("relates_to");
+        expired.valid_to = Some(100);
+        let nodes = vec![make_node("a", 1.0), make_node("b", 1.0)];
+        let edges = vec![make_edge_full("a", "b", expired)];
+        let (g, m) = build_graph(nodes, edges);
+        let graph = OrpheusGraphInner::new(g, m);
+
+        let ctx = DynamicContext {
+            as_of: Some(200), // past valid_to=100 -> invisible
+            ..DynamicContext::default()
+        };
+        assert!(neighbors_with_overlay(&graph, &ctx, "a").is_empty());
+
+        let ctx_within = DynamicContext {
+            as_of: Some(50), // before valid_to=100 -> visible
+            ..DynamicContext::default()
+        };
+        assert_eq!(neighbors_with_overlay(&graph, &ctx_within, "a").len(), 1);
+
+        // No as_of at all -> no temporal filtering, always visible.
+        let ctx_unfiltered = DynamicContext::default();
+        assert_eq!(
+            neighbors_with_overlay(&graph, &ctx_unfiltered, "a").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn neighbors_with_overlay_filters_acl_base_edge() {
+        let mut tagged = overlay_edge_data("relates_to");
+        tagged.acl = vec!["team-x".into()];
+        let nodes = vec![make_node("a", 1.0), make_node("b", 1.0)];
+        let edges = vec![make_edge_full("a", "b", tagged)];
+        let (g, m) = build_graph(nodes, edges);
+        let graph = OrpheusGraphInner::new(g, m);
+
+        // No principals -> fail closed for a tagged edge.
+        let ctx_none = DynamicContext::default();
+        assert!(neighbors_with_overlay(&graph, &ctx_none, "a").is_empty());
+
+        // Wrong principal -> still invisible.
+        let ctx_wrong = DynamicContext {
+            principals: vec!["team-y".into()],
+            ..DynamicContext::default()
+        };
+        assert!(neighbors_with_overlay(&graph, &ctx_wrong, "a").is_empty());
+
+        // Matching principal -> visible.
+        let ctx_match = DynamicContext {
+            principals: vec!["team-x".into()],
+            ..DynamicContext::default()
+        };
+        assert_eq!(neighbors_with_overlay(&graph, &ctx_match, "a").len(), 1);
+    }
+
+    #[test]
+    fn neighbors_with_overlay_filters_overlay_edge_acl() {
+        // Overlay (virtual) edges are `EdgeData` too — same visibility rule.
+        let graph = build_simple_graph();
+        let mut tagged = overlay_edge_data("relates_to");
+        tagged.acl = vec!["secret".into()];
+        let mut ctx = DynamicContext::default();
+        ctx.overlay_edges
+            .push(("sale.order".to_string(), "x_custom".to_string(), tagged));
+
+        let names: Vec<String> = neighbors_with_overlay(&graph, &ctx, "sale.order")
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(
+            !names.contains(&"x_custom".to_string()),
+            "untagged principal must not see the ACL-tagged overlay edge"
+        );
+
+        ctx.principals.push("secret".to_string());
+        let names: Vec<String> = neighbors_with_overlay(&graph, &ctx, "sale.order")
+            .iter()
+            .map(|n| n.name.clone())
+            .collect();
+        assert!(names.contains(&"x_custom".to_string()));
     }
 }

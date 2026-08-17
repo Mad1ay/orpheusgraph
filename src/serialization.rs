@@ -21,6 +21,9 @@ pub struct SerializableEdge {
     pub kind: String,
     pub field_name: Option<String>,
     pub base_weight: f32,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub acl: Vec<String>,
 }
 
 /// Serialize an owned graph to rkyv bytes.
@@ -50,6 +53,9 @@ pub fn to_rkyv(graph: &OrpheusGraphInner) -> Vec<u8> {
             kind: edge_data.kind.clone(),
             field_name: edge_data.field_name.clone(),
             base_weight: edge_data.base_weight,
+            valid_from: edge_data.valid_from,
+            valid_to: edge_data.valid_to,
+            acl: edge_data.acl.clone(),
         });
     }
 
@@ -78,6 +84,9 @@ pub fn from_rkyv_rebuild(data: &[u8]) -> Result<OrpheusGraphInner, String> {
                     kind: e.kind,
                     field_name: e.field_name,
                     base_weight: e.base_weight,
+                    valid_from: e.valid_from,
+                    valid_to: e.valid_to,
+                    acl: e.acl,
                 },
             )
         })
@@ -195,6 +204,9 @@ impl GraphAccessor for ArchivedGraphView {
                     edge_kind: e.kind.to_string(),
                     field_name: e.field_name.as_ref().map(|s| s.to_string()),
                     edge_weight: e.base_weight.into(),
+                    valid_from: e.valid_from.as_ref().map(|v| v.to_native()),
+                    valid_to: e.valid_to.as_ref().map(|v| v.to_native()),
+                    acl: e.acl.iter().map(|s| s.to_string()).collect(),
                 }
             })
             .collect()
@@ -222,6 +234,9 @@ impl GraphAccessor for ArchivedGraphView {
                     edge_kind: e.kind.to_string(),
                     field_name: e.field_name.as_ref().map(|s| s.to_string()),
                     edge_weight: e.base_weight.into(),
+                    valid_from: e.valid_from.as_ref().map(|v| v.to_native()),
+                    valid_to: e.valid_to.as_ref().map(|v| v.to_native()),
+                    acl: e.acl.iter().map(|s| s.to_string()).collect(),
                 }
             })
             .collect()
@@ -266,6 +281,9 @@ mod tests {
                 kind: "relates_to".into(),
                 field_name: Some("partner_id".into()),
                 base_weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             },
             EdgeInput {
                 from: "B".into(),
@@ -273,6 +291,9 @@ mod tests {
                 kind: "contains".into(),
                 field_name: None,
                 base_weight: 0.5,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             },
         ];
         let (g, m) = build_graph(nodes, edges);
@@ -329,6 +350,9 @@ mod tests {
                 kind: "relates_to".into(),
                 field_name: None,
                 base_weight: 1.0,
+                valid_from: None,
+                valid_to: None,
+                acl: Vec::new(),
             }],
         };
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&sg)
@@ -356,5 +380,80 @@ mod tests {
         assert_eq!(accessor.node_count(), 3);
         assert!(accessor.get_node("B").is_some());
         assert!(accessor.get_node("nonexistent").is_none());
+    }
+
+    // ---- old (pre-temporal/ACL) layout bytes fail safely, never panic -----
+
+    /// Mirrors the PRE-this-change `SerializableEdge` shape (no
+    /// valid_from/valid_to/acl) — a stand-in for a real V0 snapshot cached by
+    /// an old binary (e.g. the OSDS Redis consumer). rkyv's bytecheck
+    /// validates against the CURRENT (new) `ArchivedSerializableGraph` shape,
+    /// so these old-shape bytes must fail structural validation and surface
+    /// as `Err`, never a panic/UB — this is the accepted pre-release break the
+    /// task spec calls out explicitly (old caches rebuild).
+    #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[rkyv(derive(Debug))]
+    struct OldSerializableEdge {
+        from_idx: u32,
+        to_idx: u32,
+        kind: String,
+        field_name: Option<String>,
+        base_weight: f32,
+    }
+
+    #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[rkyv(derive(Debug))]
+    struct OldSerializableGraph {
+        nodes: Vec<NodeData>,
+        edges: Vec<OldSerializableEdge>,
+    }
+
+    #[test]
+    fn from_bytes_rejects_old_pre_temporal_acl_layout_without_panic() {
+        let old = OldSerializableGraph {
+            nodes: vec![
+                NodeData {
+                    name: "A".into(),
+                    kind: "model".into(),
+                    metadata: HashMap::new(),
+                    base_weight: 0.5,
+                    noise_penalty: 0.0,
+                    pagerank_weight: 0.0,
+                },
+                NodeData {
+                    name: "B".into(),
+                    kind: "model".into(),
+                    metadata: HashMap::new(),
+                    base_weight: 0.5,
+                    noise_penalty: 0.0,
+                    pagerank_weight: 0.0,
+                },
+            ],
+            edges: vec![OldSerializableEdge {
+                from_idx: 0,
+                to_idx: 1,
+                kind: "relates_to".into(),
+                field_name: None,
+                base_weight: 1.0,
+            }],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&old)
+            .expect("old-shape serialization failed")
+            .to_vec();
+
+        // Must return Err (structural validation failure on the new, larger
+        // ArchivedSerializableGraph shape) — never panic/UB.
+        let result = ArchivedGraphView::from_bytes(bytes.clone());
+        assert!(
+            result.is_err(),
+            "old-layout bytes must be rejected, not silently accepted"
+        );
+
+        // Same for the owned-rebuild path.
+        let result2 = from_rkyv_rebuild(&bytes);
+        assert!(
+            result2.is_err(),
+            "old-layout bytes must be rejected by from_rkyv_rebuild too, not panic"
+        );
     }
 }

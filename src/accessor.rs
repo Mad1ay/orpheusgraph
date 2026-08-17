@@ -36,9 +36,18 @@ pub struct NeighborView {
     pub edge_kind: String,
     pub field_name: Option<String>,
     pub edge_weight: f32,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub acl: Vec<String>,
 }
 
 /// Unified read-only graph access for both owned and archived graphs.
+///
+/// Deliberately ctx-free: `DynamicContext`-aware temporal/ACL visibility
+/// filtering (`DynamicContext::is_edge_visible`) is applied ONLY by the
+/// traversal/query layer, never here — every accessor returns ALL edges with
+/// the `valid_from`/`valid_to`/`acl` fields carried through unfiltered, so
+/// base metrics (PageRank, counts) stay computed over the full graph.
 pub trait GraphAccessor: Send + Sync {
     fn node_count(&self) -> usize;
     fn edge_count(&self) -> usize;
@@ -111,6 +120,9 @@ fn graph_neighbors(
                 edge_kind: edge_data.kind.clone(),
                 field_name: edge_data.field_name.clone(),
                 edge_weight: edge_data.base_weight,
+                valid_from: edge_data.valid_from,
+                valid_to: edge_data.valid_to,
+                acl: edge_data.acl.clone(),
             }
         })
         .collect()
