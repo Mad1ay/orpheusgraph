@@ -2,6 +2,50 @@
 
 All notable changes to orpheusgraph.
 
+## [Unreleased]
+
+Three deferred persistence features delivered; on-disk `format_version` bumped **2 → 3**
+(the COMMIT sidecar is the addition; the CSR byte layout is unchanged). Legacy stores 0/1/2
+are rejected at `open()` with `CorruptError` — pre-release, no migration; recreate the store.
+
+### Durability — per-frame COMMIT marker + honest `apply()` contract
+- Recovery now trusts an authoritative fsync-gated **COMMIT** high-water marker (two-slot
+  torn-safe ping-pong sidecar) instead of "whatever crc-valid WAL frames survived". Recovered
+  state is EXACTLY the committed prefix; crc-valid frames beyond the marker are truncated and
+  counted. **Behavior change:** an `OnFlush` write-through tail that survives a process crash but
+  was never fsync-acknowledged is now discarded (it was never `apply`-`Ok`-durable).
+- **`apply()` durability contract, stated honestly** (a single fsync cannot distinguish
+  fails-but-persists from success): `apply`-`Ok` ⇒ durable; `apply`-`Err` ⇒ **indeterminate** —
+  the batch may or may not be visible on reopen, but recovery ALWAYS yields a consistent
+  committed prefix with no `Ok`-acked loss. Reconcile an `Err` by reading `committed_seq()` /
+  `recovery_report()` after reopen, never by blind retry (double-apply risk on non-idempotent ops).
+- New Rust surface: `RecoveryReport { uncommitted_tail_frames, torn_tail_frames }` (re-exported),
+  `PersistentGraph::committed_seq()`, `PersistentGraph::recovery_report()`. *(Not yet exposed to
+  Python — a Python caller reconciles via `seq` after reopen, which equals `committed_seq`.)*
+
+### Durability testing — deterministic power-loss harness (`Vfs`)
+- New public `Vfs` / `VfsFile` / `RealVfs` seam over the persist layer's write-and-durability
+  ops (a RocksDB-`Env`-style extension point; prod uses `RealVfs`, a zero-cost `std::fs`
+  passthrough — the hot read path never touches it). `PersistentGraph::create_with_vfs` /
+  `open_with_vfs` (`#[doc(hidden)]`) accept a custom `Vfs`.
+- A deterministic userspace fault-injection FS (`FaultVfs`) + `tests/powerloss_harness.rs`
+  replace the spec's `dm-flakey`/VM plan — seeded, CI-able, models torn writes and the
+  fsync-fails-but-persists ambiguity. 1600+ randomized power cuts found no marker/recovery bug.
+
+### Query — temporal validity + edge-level ACL (query-time filtering)
+- Edges gain `valid_from` / `valid_to` (`Optional[int]`, half-open `[from, to)`, `None` = unbounded)
+  and `acl` (`list[str]`, empty = public, sorted+deduped at ingest). `DynamicContext` gains
+  `as_of` (`None` = no temporal filter) and `principals` (fail-closed: a tagged edge is visible
+  iff its `acl` intersects `principals`; empty `principals` sees only public edges).
+- Filtering is **query-time only** and applied by all four ctx-taking ops (`beam_traverse`,
+  `find_path`, `contextual_subgraph`, `multi_beam_intersection`); PageRank and all base metrics
+  still run over ALL edges. The raw `outgoing_edges`/`incoming_edges` inspectors are UNFILTERED by
+  design (documented) — do not surface them under an access-control assumption.
+- Python: `add_edge` op dicts and `build_graph` edge dicts accept `valid_from`/`valid_to`/`acl`;
+  `DynamicContext(as_of=None, principals=None)`; `EdgeResult` exposes the three fields. Fully
+  backward-compatible (missing keys default to unbounded/public). A `valid_from > valid_to` edge is
+  skipped by `build_graph` but hard-rejects a `PersistentGraph.apply` batch (`ValueError`).
+
 ## [0.1.0] — 2026-03-08
 
 ### Sprint 7 — Python Persistence API (Phase 3)

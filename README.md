@@ -136,9 +136,34 @@ with og.create_persistent(
 > store; `create_persistent` refuses to clobber an existing one. Weights passed to `apply`
 > must already be normalized to `[0.0, 1.0]` — an out-of-range value raises `ValueError`.
 
-> The on-disk snapshot format is **V2**, which persists a `name -> idx` index inside the
-> snapshot for O(1) warm-open (no per-open index build). Stores written by an older build
-> are not auto-migrated — `open()` raises `CorruptError`; recreate the store.
+> The on-disk store is `format_version` **3** (a CSR snapshot with a persisted `name -> idx`
+> index for O(1) warm-open, plus a fsync-gated COMMIT marker). Stores written by an older
+> build (0/1/2) are not auto-migrated — `open()` raises `CorruptError`; recreate the store.
+
+> **Durability contract.** `apply()` returning normally ⇒ the batch is durable. `apply()`
+> raising ⇒ durability is **indeterminate**: the batch may or may not survive a reopen, but
+> recovery always yields a consistent committed prefix and never loses an already-acknowledged
+> batch. Reconcile a failed `apply` by reopening and reading `.seq` (the recovered committed
+> prefix) — do **not** blindly retry a non-idempotent batch. `OnFlush` (the default fsync
+> policy) trades post-`flush()` tail durability for speed; use `EveryBatch` for per-batch fsync.
+
+### Temporal validity & edge ACL (query-time)
+
+Edges may carry `valid_from`/`valid_to` (half-open `[from, to)`, `None` = unbounded) and `acl`
+(a list of tags; empty = public). A `DynamicContext` may carry `as_of` (an instant; `None` =
+no temporal filter) and `principals` (tags the caller holds). A traversal shows an edge only if
+it is temporally valid at `as_of` **and** ACL-visible (public, or `acl ∩ principals ≠ ∅`; empty
+`principals` sees only public edges — fail-closed). Filtering is query-time only: PageRank and
+all base metrics are computed over every edge, and the raw `.outgoing_edges`/`.incoming_edges`
+inspectors return unfiltered adjacency (do not surface them under an access-control assumption).
+
+```python
+edges = [{"from": "a", "to": "b", "kind": "relates_to", "base_weight": 1.0,
+          "valid_from": 100, "valid_to": 200, "acl": ["finance"]}]
+ctx = og.DynamicContext(as_of=150, principals=["finance"])   # sees the edge
+ctx = og.DynamicContext(as_of=250)                            # expired -> hidden
+ctx = og.DynamicContext(as_of=150)                            # no principals -> hidden (tagged)
+```
 
 ## API Reference
 

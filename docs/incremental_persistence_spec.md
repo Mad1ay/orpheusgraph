@@ -314,9 +314,19 @@ payload := postcard(WalRecord { seq: u64, ops: Vec<Op> })
 - **Write vs fsync semantics.** Every `apply()` writes its frame through to the
   OS (`write()`; any userspace buffer is flushed per batch — no frame ever
   lives only in process memory). Consequently a *process* crash (kill -9,
-  panic, OOM) loses nothing under any policy — the OS page cache survives and
-  is written back by the kernel. Only a *machine* failure (power loss, kernel
-  panic) can lose the tail written after the last fsync.
+  panic, OOM) does not lose any *acknowledged* (`apply`-`Ok`) batch — the OS page
+  cache survives and is written back by the kernel. Only a *machine* failure
+  (power loss, kernel panic) can lose the tail written after the last fsync.
+  > **Amendment (honest contract — DELIVERED, impl-log "Honest apply() durability
+  > contract").** The shipped **COMMIT marker** makes recovery replay EXACTLY the
+  > committed prefix, which refines this paragraph: under `OnFlush` a process crash
+  > DOES discard a write-through tail that was never fsync-acknowledged (it was never
+  > `apply`-`Ok`-durable to begin with). The precise, achievable contract is:
+  > `apply`-`Ok` ⇒ durable; `apply`-`Err` ⇒ **indeterminate** (a COMMIT-slot fsync
+  > that fails but persists can still make the batch visible on reopen — irreducible
+  > for any single fsync); recovery ALWAYS yields a consistent committed prefix with
+  > no `Ok`-acked loss. Callers reconcile an `Err` via `committed_seq()`/
+  > `recovery_report()` on reopen, never by blind retry.
 - fsync policy (config): `EveryBatch` | `EveryN(n)` | `OnFlush` (default).
   Under `OnFlush`, fsync happens on explicit `flush()` and always on
   `close()`; compaction durability is independent (tmp+fsync+rename, §4.4).
@@ -658,6 +668,15 @@ persistent store is additive.
   tmpfs). Power-loss semantics (losing the OS page cache) are NOT covered by
   kill -9; validating them needs `dm-flakey` or a VM harness — documented as
   out of scope for v1, revisit if a durability-critical consumer appears.
+  > **Amendment (DELIVERED — impl-log "Deferred features delivered" §B):** power-loss
+  > is now validated by a deterministic userspace fault FS (`Vfs`/`FaultVfs`,
+  > `tests/powerloss_harness.rs`) instead of `dm-flakey` — no root, deterministic,
+  > CI-able; it models torn writes and the fsync-fails-but-persists ambiguity, and
+  > runs seeded multi-generation cuts + targeted cases. Also amends "(c) nothing is
+  > missing under any fsync policy": the shipped **COMMIT marker** makes recovered
+  > state the EXACT committed prefix, so an `OnFlush` write-through tail that was
+  > never fsync-acknowledged is deliberately discarded (see the honest-contract note
+  > at §4.2 and impl-log "Honest apply() durability contract").
 - **Concurrency**: N reader threads traversing in a loop while the writer
   applies + compacts; assert no torn reads (every traversal sees a valid
   `seq`) under `cargo test` + a `loom`-lite smoke or `ThreadSanitizer` job.
@@ -679,9 +698,11 @@ persistent store is additive.
 | 2b | Compaction + auto-threshold + mmap base + GC + benches | ~1 week |
 | — | Docs: README section, CHANGELOG, migration note (none needed — additive) | 1–2 days |
 
-Out of scope, unlocked next (format headroom already reserved): temporal
+Out of scope, unlocked next (format headroom already reserved): ~~temporal
 validity on edges (`valid_from`/`valid_to` + `as_of` in ctx), edge-level ACL
-tags filtered via ctx, SQLite-style cross-process readers (mmap snapshot +
+tags filtered via ctx~~ (**DELIVERED — impl-log "Deferred features delivered" §C:
+query-time `is_edge_visible` filter, fail-closed ACL, PageRank still over all
+edges**), SQLite-style cross-process readers (mmap snapshot +
 WAL tail follow), thin gRPC/MCP facade.
 
 **Cheap unlock — WAL retention (event-sourced history).** The WAL already IS

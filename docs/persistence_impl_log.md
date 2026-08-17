@@ -514,11 +514,16 @@ now incl. out-of-contract weights across compaction).
 - ~~**Python API** (`open`/`apply`/`flush`/`compact` PyO3 bindings for `PersistentGraph`) — the
   store is Rust-native today; wiring it into `pybridge` + Orpheus is a distinct Phase 3.~~
   **DELIVERED — see "Phase 3 — Python API (PyO3 bindings)" below.**
-- **Temporal validity + edge-level ACL** (format headroom reserved; roadmap).
-- **fsync-failure per-frame commit marker** (documented limitation: `apply`-Err ≠ strictly
-  not-durable under an fsync error; reconcile via `(epoch, seq)` on reopen).
-- **Power-loss harness** (`dm-flakey`/VM) — the `kill -9` harness proves process-death
-  durability; power-loss (page-cache loss) is the spec's separately-scoped case.
+- ~~**Temporal validity + edge-level ACL** (format headroom reserved; roadmap).~~
+  **DELIVERED — see "Deferred features delivered" below.**
+- ~~**fsync-failure per-frame commit marker** (documented limitation: `apply`-Err ≠ strictly
+  not-durable under an fsync error; reconcile via `(epoch, seq)` on reopen).~~
+  **DELIVERED (COMMIT sidecar) — see "Deferred features delivered" + "Honest apply()
+  durability contract" below. The limitation is now precisely bounded, not removed.**
+- ~~**Power-loss harness** (`dm-flakey`/VM) — the `kill -9` harness proves process-death
+  durability; power-loss (page-cache loss) is the spec's separately-scoped case.~~
+  **DELIVERED as a deterministic userspace fault-injection `Vfs` (`FaultVfs`), stronger than
+  `dm-flakey` (no root, deterministic, CI-able) — see "Deferred features delivered" below.**
 
 ---
 
@@ -655,3 +660,159 @@ One P1 and four P2s, all fixed before commit:
   possible from a hostile table (name-confirmed hits + uniqueness), legacy 0|1 rejection,
   mmap bounds-checking, delta.rs retain-masking equivalence, and zero Cyrillic across the
   diff and all branch commits were verified explicitly.
+
+---
+
+## Deferred features delivered (2026-08-15 → 08-17)
+
+The three items parked in "Deferred (out of the implemented scope)" above were implemented
+in one push, orchestrated per feature with an adversarial verification round each. Format is
+now `format_version = 3` (the COMMIT sidecar is the version-bumping addition; the CSR byte
+layout is unchanged and still named "V2"). Legacy 0/1/2 are rejected at `open()`.
+
+### A. fsync-failure per-frame commit marker — the COMMIT sidecar (`src/persist/commit.rs`)
+An authoritative durable-commit high-water mark recovery trusts INSTEAD of "whatever crc-valid
+WAL frames survived". Two-slot ping-pong at fixed offsets, each slot
+`magic‖version‖gen‖epoch‖committed_seq‖crc32` (44 B); a reader picks the crc-valid slot with the
+highest **`gen`** (a monotonic write counter — `epoch` is a random u128 and can't order across a
+re-mint; `committed_seq` ties on the open-time re-stamp). Ack protocol: WAL append → WAL fsync
+(per policy) → on success advance the marker (write slot + fsync) → only then `apply()` returns
+`Ok`. Recovery cap `commit_hw = max(COMMIT.committed_seq, snapshot_seq)`; crc-valid WAL frames
+beyond it are the ambiguity artifact → truncated + counted in `RecoveryReport`. `durable_seq` now
+moves only through the marker; MANIFEST `high_seq` consistency-checked against it. This CLOSES the
+audit-#6 "MANIFEST high_seq granularity" limitation (the marker is the cheap per-fsync high-water
+that comment said would be too costly). **Behavior change:** strict semantics — recovered state is
+EXACTLY the committed prefix, so an `OnFlush` write-through "lucky tail" that survives a `kill -9`
+is now discarded (it was never fsync-acknowledged). Its residual limit — a COMMIT-fsync that fails
+but whose slot persists — is bounded, not removed; see "Honest apply() durability contract" below.
+Audit: the marker's `durable_seq`/`high_seq`/`epoch`/`clean_shutdown` interactions were traced;
+one design deviation (`gen` freshness key over `(epoch, committed_seq)`) with justification.
+
+### B. Power-loss harness — a deterministic userspace fault FS (`Vfs` + `FaultVfs`)
+Instead of the spec's `dm-flakey`/VM (root, nondeterministic), a `Vfs` seam over the persist
+layer's write-and-durability ops (prod = `RealVfs`, a zero-cost `std::fs` passthrough; the hot read
+path never touches it). The test `FaultVfs` (RocksDB `FaultInjectionTestFS` pattern) passes every op
+through to the real FS while shadowing last-fsync'd state + an un-synced journal; `power_cut()`
+deterministically restores the real directory to the crash image (byte-granular torn writes,
+undone-un-fsync'd renames/creates/removes) and `fail_next_fsync(path, persist)` models the
+fails-but-persists ambiguity. The harness (`tests/powerloss_harness.rs`) runs seeded multi-generation
+cuts (`OG_POWERLOSS_ITERS`-scalable) plus targeted cases: crown-jewel (WAL fsync fails but persists →
+Err'd frame invisible + counted), mid-COMMIT-slot torn, snapshot_seq-floor mid-compaction,
+rename-before-`fsync_dir` undo. 1600+ randomized cuts found NO bug in the marker/recovery core.
+
+### C. Temporal validity + edge-level ACL (query-time filtering)
+Every edge representation (`EdgeInput`/`EdgeData`, delta `Op`, ephemeral `SerializableEdge`, `CsrEdge`,
+`NeighborView`) gains `valid_from`/`valid_to: Option<u64>` (half-open `[from, to)`, `None` = unbounded)
+and `acl: Vec<String>` (empty = public; sorted+deduped at every ingest funnel for byte-determinism).
+`DynamicContext` gains `as_of: Option<u64>` (`None` = temporal filter off) and `principals: Vec<String>`.
+One shared oracle `DynamicContext::is_edge_visible(valid_from, valid_to, acl)` — temporal passes iff
+`as_of` is `None` or in `[from, to)`; ACL passes iff `acl` is empty or intersects `principals` (empty
+principals ⇒ only public edges pass, **fail-closed**) — applied at exactly the two query-layer choke
+points (`overlay::neighbors_with_overlay` feeding beam/find_path/contextual_subgraph, and
+`multi_beam_intersection`'s own reconstruction). Accessors stay ctx-free; **PageRank and all base
+metrics run over ALL edges** (filtering is query-time only). `to_rkyv_v2`'s edge sort key was extended
+to `(…, valid_from, valid_to, acl)` so two parallel edges differing only in those fields still
+serialize byte-identically. Design notes: builder SKIPS a `valid_from > valid_to` edge (matching its
+unknown-endpoint precedent) while delta `apply` HARD-REJECTS the batch; raw `outgoing_edges`/
+`incoming_edges` are ctx-free UNFILTERED adjacency by design (documented in `.pyi` — do not surface to
+end users under an access-control assumption); `add_edge` is always a parallel edge, so tightening a
+public edge needs `remove_edge` then re-add (documented in `delta.rs`). Adversarial review: no
+P0/P1, ACL confirmed fail-closed across all four ops both directions; five P2 doc/hardening items.
+
+**Follow-up noted (not yet done):** `committed_seq()`/`recovery_report()` are Rust-only; a Python
+caller reconciles an `apply`-`Err` via `seq` after reopen (== `committed_seq`), but cannot read the
+dropped-frame count. Exposing both to Python is a clean future addition.
+
+---
+
+## Honest apply() durability contract (2026-08-17, COMMIT-marker verification round)
+
+**Scope:** a targeted verification pass over the COMMIT sidecar (`commit.rs`) + power-loss
+harness added to close the fsync-failure ambiguity. It found the sidecar's docstring
+OVER-CLAIMING what the marker buys, empirically reproduced the gap, and replaced the
+unachievable guarantee with an honest, still-strong contract. No format change; the marker
+stays.
+
+### The bug (CONFIRMED, reproduced)
+
+The COMMIT marker was documented as making `apply()`-`Err` mean "not durable / invisible on
+reopen" ("A frame is below the marker ONLY after its fsync succeeded … above-marker == not
+durable against either"). That is FALSE for one direction:
+
+- Ack protocol (`apply`, mod.rs): WAL append → WAL fsync (per policy) → on success
+  `advance_commit` (write COMMIT slot + fsync) → only then return `Ok`.
+- Trace: WAL frame `N`'s fsync SUCCEEDS (frame durable), then the COMMIT slot's OWN `fsync`
+  returns `Err` **while the fully-written 44-byte slot still persists** (kernel writeback).
+  `advance_commit` poisons the writer and propagates `Err`, so `apply()` returns `Err` and the
+  in-memory seq stays at `N-1` — BUT the on-disk marker now reads `committed_seq = N`.
+- On reopen: the highest-`gen` crc-valid slot wins → `commit_hw = N` → the (durably fsync'd)
+  frame `N` is REPLAYED and VISIBLE. So an `apply()`-`Err` batch is visible — violating the old
+  docstring and the implied "apply-Err ⇒ invisible / recovered == exactly the committed prefix".
+
+### Theory: the ambiguity is irreducible; the marker RELOCATES it, not removes it
+
+fsync-fails-but-persists cannot be distinguished from fsync-success at recovery time by ANY
+on-disk means, for ANY single fsync. The marker genuinely removes the WAL-frame directions
+(a WAL fsync that fails, or a never-fsync'd `OnFlush` tail, does not advance the marker → its
+frame stays above-marker and is discarded — the `crown_jewel` test), and it strengthens the
+`Ok` side. But it simply MOVES the identical property onto the COMMIT slot's own fsync. Adding
+slots + crc defends only against a TORN slot, never against a fully-written slot whose fsync
+merely erred. Therefore "apply-Err ⇒ invisible" is UNACHIEVABLE and was not pursued (no WAL
+reformat, no extra slots).
+
+### Resolution: the honest contract
+
+- **`apply()`-`Ok` ⇒ durable** — the WAL frame is fsync'd AND a marker covering it is fsync'd;
+  survives process death and power loss. (Under `OnFlush` the marker advances at the next
+  `flush`/`close`/compaction; until then an applied batch is visible but `> committed_seq()`.)
+  Kept as a strong assertion.
+- **`apply()`-`Err` ⇒ durability INDETERMINATE** — the batch may be visible on reopen (this
+  COMMIT-fsync-persist path) or invisible (the WAL-fsync-fails path). What recovery ALWAYS
+  guarantees: (1) the store opens to a CONSISTENT committed prefix (batches are all-or-nothing —
+  no torn/half-applied batch), and (2) no `Ok`-acked batch is ever lost. The caller reconciles
+  an `Err` by reading `committed_seq()` / `recovery_report()` after reopen, NOT by blind retry
+  (re-applying a non-idempotent batch on the persist path double-applies).
+
+Docs corrected to state this exactly: the `commit.rs` module docstring (WAL directions still
+fixed, COMMIT-slot direction now called out as irreducible; "below-marker" == "acked durable on
+the Ok path", not "every fsync literally succeeded"), the Rust `PersistentGraph::apply` doc,
+the Python `apply` docstring (`pybridge.rs` + `orpheusgraph.pyi` — Python reconciles by reopening
+and reading `seq`, its committed-prefix equivalent).
+
+### New test + oracle tightening (the gap that hid this)
+
+- **New targeted test** `commit_fsync_persist_makes_apply_err_indeterminate_but_prefix_consistent`
+  (powerloss harness): arms `fail_next_fsync("COMMIT", persist=true)` on the seq-3 apply, asserts
+  `apply` Errs + the writer poisons, then drops-without-close and reopens. It asserts the
+  ACHIEVABLE invariant — NOT invisibility: (a) open succeeds (not `Corrupt`); (b) `committed_seq()`
+  is EXACTLY the pre-batch seq (2) OR the batch seq (3), nothing else; (c) the recovered content
+  equals the materialization of exactly that prefix (root + one node/edge per committed batch, by
+  exact `node_count`/`edge_count` + per-batch presence — no torn edge); (d) both acked batches
+  survive. Under drop-all it deterministically takes the VISIBLE direction (marker persisted →
+  `commit_hw = 3`, r = 3).
+- **Oracle tightening.** The multi-generation `verify()` was strengthened: an explicit
+  consistent-prefix materialization check (recovered content == prefix-`r` materialization,
+  set-for-set via presence-of-all + exact counts) and an explicit, independent NO-ACKED-LOSS
+  loop (every `seq <= max_committed` present and fully materialized — `max_committed` = the
+  running max of `committed_seq()`, the correct "acked & durable" high-water since an `OnFlush`
+  `apply`-Ok is not yet durable). No existing assertion weakened.
+- **Fault mix.** The COMMIT-fsync-persist injection (persist=true on the COMMIT file) was ADDED
+  to the multi-generation loop — the previously-unexercised visible-after-Err direction (the
+  actual gap that hid the bug). Under the strengthened, correct oracle it PASSES (consistent
+  prefix). Determinism preserved (fixed seeds, `OG_POWERLOSS_ITERS`-scalable, seed printed on
+  failure). Verified: harness green at `OG_POWERLOSS_ITERS=200`.
+- **Teeth (mutation-verified, reverted).** (A) Replaying one frame PAST the marker
+  (`rec.seq > commit_hw` → `> commit_hw + 1`) — a leaked phantom — the multi-gen oracle catches
+  it (`committed_seq != seq`). (B) Dropping the frame AT the marker (`>` → `>= commit_hw`) — a
+  hole / acked-loss — both the new targeted test and the harness catch it (`recovered seq < commit
+  marker`). Confirms the strengthened oracle fails a real prefix-consistency regression.
+
+### NOTE — deferred simplification (option b, not a correctness necessity)
+
+Fold the commit high-water INTO the WAL frame (a single fsync domain): stamp the committed-seq
+high-water into the WAL frame itself instead of a separate fsync'd sidecar. This collapses the
+TWO ambiguity windows (WAL-frame fsync + COMMIT-slot fsync) into ONE and halves the `EveryBatch`
+fsync count, delivering the SAME achievable contract (Ok ⇒ durable / Err ⇒ indeterminate /
+consistent prefix + no acked loss) with less surface area. Deferred as a future simplification —
+the current two-fsync marker is already correct under the honest contract, so this is an
+optimization, not a fix.
