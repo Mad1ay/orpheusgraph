@@ -10,12 +10,19 @@ readme = "README.md"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# The Python bindings (pybridge / PyO3) are opt-in, so pure-Rust consumers use
+# orpheusgraph as a plain rlib without pulling PyO3 or requiring a Python
+# toolchain. Python packaging builds with `--features python`.
+default = []
+python = ["dep:pyo3"]
+
 [dependencies]
 petgraph = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.8"
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 rkyv = { version = "0.8", features = ["bytecheck"] }
 bytecheck = "0.8"
 indexmap = "2"

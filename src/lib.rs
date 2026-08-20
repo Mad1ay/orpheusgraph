@@ -10,6 +10,7 @@ pub mod delta;
 pub mod graph;
 pub mod overlay;
 pub mod persist;
+#[cfg(feature = "python")]
 pub mod pybridge;
 pub mod scoring;
 pub mod serialization;
@@ -26,9 +27,11 @@ pub use scoring::compute_score;
 pub use traversal::{beam_traverse, contextual_subgraph, find_path, multi_beam_intersection};
 pub use types::*;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 /// Python module entry point.
+#[cfg(feature = "python")]
 #[pymodule]
 fn orpheusgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pybridge::PyOrpheusGraph>()?;
