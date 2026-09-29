@@ -11,4 +11,9 @@ license = { file = "LICENSE.md" }
 readme = "README.md"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+# The bindings live behind the crate's `python` feature (which enables the
+# optional pyo3 dep, itself declaring "extension-module"). Naming
+# `pyo3/extension-module` here would pull PyO3 in but leave `python` off, so
+# pybridge and the #[pymodule] entry point would be cfg'd out and the wheel
+# would ship no PyInit_orpheusgraph.
+features = ["python"]

@@ -4,7 +4,7 @@
 ![License: PolyForm NC 1.0.0](https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-blue)
 ![Status: v0.1.0](https://img.shields.io/badge/status-v0.1.0%20(early)-orange)
 
-> Rust library with Python bindings for context-aware weighted graph traversal.
+> Rust library with optional Python bindings for context-aware weighted graph traversal.
 > Source-available. Domain-agnostic. Built for RAG pipelines that need deterministic structure.
 
 **Status:** v0.1.0 — early and source-available; the API may still change.
@@ -29,17 +29,38 @@ returns the Top-K relevant nodes in microseconds.
 
 ## Quick Start
 
+The Python bindings are **opt-in** behind the `python` feature (default off), so a
+pure-Rust consumer uses orpheusgraph as a plain rlib — no PyO3 compiled, no Python
+toolchain required.
+
+### Rust
+
+```toml
+[dependencies]
+orpheusgraph = { git = "https://github.com/Mad1ay/orpheusgraph" }
+```
+
 ```bash
-# Prerequisites: Rust toolchain, Python 3.11+, maturin
+cargo build --lib   # zero pyo3 crates
+cargo test
+```
+
+### Python
+
+```bash
+# Prerequisites: Rust toolchain, CPython 3.10-3.13, maturin
 pip install maturin
 
-# Development build
+# Development build - maturin passes --features python via pyproject.toml
 cd orpheusgraph
 maturin develop
 
 # Verify
 python -c "import orpheusgraph; print('OK')"
 ```
+
+PyO3 0.23 supports CPython up to 3.13. On a newer interpreter the build additionally
+needs `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` and is untested.
 
 ## Usage
 
@@ -283,7 +304,7 @@ src/
 ├── overlay.rs        # Virtual overlay iterator + max_fan_out
 ├── traversal.rs      # beam_traverse, find_path, contextual_subgraph
 ├── serialization.rs  # rkyv zero-copy serialization
-├── pybridge.rs       # PyO3 Python bindings + overlay cache
+├── pybridge.rs       # PyO3 Python bindings (feature `python`)
 └── lib.rs            # Module registration
 ```
 
