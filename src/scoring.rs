@@ -131,12 +131,26 @@ mod tests {
     }
 
     #[test]
-    fn test_weight_override() {
+    fn weight_bonus_adds_to_the_base_term_instead_of_replacing_it() {
+        // Scored at the compute_score level, so base_weight is taken as given and the
+        // arithmetic is exact: 0.3 + 0.5 = 0.8. Note this does NOT hold end to end from
+        // build_graph, which normalizes base_weight first — hence the README describes the
+        // shape rather than promising these numbers.
         let node = make_node("sale.order", 0.3, 0.0);
         let mut ctx = DynamicContext::default();
         ctx.weight_bonuses.insert("sale.order".to_string(), 0.5);
         let result = compute_score(&node, &ctx);
-        assert!((result.weight - 0.8).abs() < 0.001);
+        assert!(
+            (result.weight - 0.8).abs() < 0.001,
+            "expected base 0.3 + bonus 0.5 = 0.8, got {}",
+            result.weight
+        );
+        // Pin the semantics the old `weight_overrides` name wrongly advertised: a bonus
+        // must not stand in for the base term.
+        assert!(
+            (result.weight - 0.5).abs() > 0.001,
+            "a bonus must not replace base_weight"
+        );
     }
 
     #[test]
