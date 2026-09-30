@@ -20,6 +20,20 @@ rather than one-off analysis; unlike a graph database (neo4j), it is an embeddab
 in-process library with no server to run — it sits inside your retrieval pipeline and
 returns the Top-K relevant nodes in microseconds.
 
+The mechanism worth knowing before anything else: **the caller supplies the objective
+function, per request, without writing to the store.** A `DynamicContext` is an ordinary
+function argument, never persisted, and it can re-weight any node (`weight_overrides`), add
+an embedding-derived boost (`semantic_boosts`), suppress a whole class of nodes by metadata
+domain (`noise_tags`), cut hubs (`max_fan_out`), inject nodes and edges that do not exist in
+the store (`overlay_nodes`/`overlay_edges`), view the graph at a past instant (`as_of`) and
+restrict it to what the caller may see (`principals`). The score is computed *inside* the
+expansion loop and decides which nodes are expanded next, so it steers the walk rather than
+re-ranking its output. The next request sees none of it — which is why tenant isolation here
+is a consequence of the API shape, not a feature bolted on.
+
+The flip side is in [Retrieval quality](#retrieval-quality--what-the-pruning-costs): the
+engine is only as good as the objective you hand it.
+
 ## What It Does
 
 1. **Build** weighted knowledge graphs from any structured data
@@ -292,6 +306,42 @@ typical. Moving the frontier to node indices is on the roadmap.
 
 Reproduce with `cargo bench`.
 
+### Retrieval quality — what the pruning costs
+
+`beam_traverse(k, depth)` keeps only the k best-scoring nodes per level, so a node that
+would score high at depth 3 is lost when its depth-1 ancestor misses the cut. Measured
+against exhaustive traversal (`k = node_count`, which prunes nothing) scored by the same
+formula — synthetic social graph, 10K nodes / 113K edges, ~1,280 nodes reachable at
+depth 3, 24 seeds, ties broken deterministically by name. Recall is a set overlap and so
+hardware-independent; the cost ratios quoted below were measured on a different machine
+than the latency table above, so compare them with each other, not with those absolutes:
+
+| k | recall@5, score correlates with structure | recall@5, score uncorrelated |
+|---|---|---|
+| **5** | **0.48** | **0.09** |
+| 10 | 0.72 | 0.13 |
+| 20 | 0.87 | 0.21 |
+| 50 | 0.98 | 0.48 |
+| exhaustive | 1.00 | 1.00 |
+
+Two consequences, both more important than the latency table above.
+
+**Pruning only pays when your score signal correlates with graph locality.** The left column
+scores nodes by follower count, which is structural by construction; the right column scores
+by an attribute unrelated to the edges. With an uncorrelated signal the beam has nothing to
+follow, reaching the same recall needs k ≈ 500 — about 86% of the cost of just traversing
+exhaustively — and randomly placed `semantic_boosts` measure slightly *worse* than no boosts
+at all. If your boosts come from embeddings and the relevant nodes are scattered rather than
+clustered, prefer a large k or the exhaustive path, and do not assume a small beam is a free
+optimisation.
+
+**Choose k as a fraction of the reachable set, not as an absolute.** k does not transfer
+between graphs: k=100 is 7.8% of the reachable set on the graph above and 1.9% on a
+100K-node / 2.4M-edge one. With a structural signal the economics improve with scale — on
+the larger graph recall@10 reaches 1.00 at k=100, 4.6x faster than exhaustive. The `k=5` used
+in this README's examples is deliberately minimal for readability and sits far inside the
+lossy regime; it is not a recommended default.
+
 ## Architecture
 
 ```
@@ -307,6 +357,21 @@ src/
 ├── pybridge.rs       # PyO3 Python bindings (feature `python`)
 └── lib.rs            # Module registration
 ```
+
+## What It Is Not
+
+orpheusgraph is an index, not a database, and the difference is load-bearing:
+
+- **No query language and no planner.** Traversals are function calls.
+- **No aggregation.** There is no `count`/`avg`/`GROUP BY`/`ORDER BY` over the graph.
+- **No node enumeration.** The read surface is `get_node(name)`, `outgoing_edges(name)`,
+  `incoming_edges(name)` and traversals from a seed. Nothing scans all nodes of a kind, so
+  queries shaped like "every Person, grouped by city" are out of scope by construction.
+- **Not the source of truth.** It indexes data owned elsewhere; rebuild it, do not migrate it.
+- **Not a ledger.** No invariants, no cross-record constraints, no replication.
+
+If you need those, you need a graph database. This library trades them for a microsecond
+hot path, per-request scoring and determinism.
 
 ## License
 
