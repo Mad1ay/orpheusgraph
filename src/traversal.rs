@@ -2,7 +2,9 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::accessor::GraphAccessor;
-use crate::overlay::{neighbors_with_overlay, resolve_overlay_node};
+use crate::overlay::{
+    neighbors_with_overlay_indexed, resolve_overlay_node_indexed, OverlayIndex,
+};
 use crate::scoring::compute_score;
 use crate::types::{DynamicContext, EdgeResult, NodeResult, PathStep, SubGraph};
 
@@ -34,6 +36,9 @@ pub fn beam_traverse(
     let mut all_results: Vec<NodeResult> = Vec::with_capacity(cap_hint);
     let mut frontier: Vec<String> = vec![start.to_string()];
 
+    // Built once per traversal, not once per expanded node: see OverlayIndex.
+    let overlay = OverlayIndex::build(ctx);
+
     for _ in 0..depth {
         // Nothing left to expand — stop early instead of spinning `depth`
         // times over an empty frontier (hostile depth = wasted CPU otherwise).
@@ -46,7 +51,8 @@ pub fn beam_traverse(
         let mut level_map: HashMap<String, NodeResult> = HashMap::new();
 
         for node_name in &frontier {
-            let neighbors = neighbors_with_overlay(graph, ctx, node_name);
+            let neighbors =
+                neighbors_with_overlay_indexed(graph, ctx, &overlay, node_name);
 
             for neighbor in neighbors {
                 if visited.contains(&neighbor.name) {
@@ -56,7 +62,7 @@ pub fn beam_traverse(
                 // Score the neighbor node
                 let result = if let Some(node_view) = graph.get_node(&neighbor.name) {
                     compute_score(&node_view, ctx)
-                } else if let Some(overlay_view) = resolve_overlay_node(&neighbor.name, ctx) {
+                } else if let Some(overlay_view) = resolve_overlay_node_indexed(&neighbor.name, &overlay) {
                     compute_score(&overlay_view, ctx)
                 } else {
                     continue;
@@ -153,6 +159,8 @@ pub fn find_path(
     start: &str,
     end: &str,
 ) -> Option<Vec<PathStep>> {
+    let overlay = OverlayIndex::build(ctx);
+
     if start == end {
         return Some(vec![PathStep {
             node: start.to_string(),
@@ -183,12 +191,12 @@ pub fn find_path(
             }
         }
 
-        let neighbors = neighbors_with_overlay(graph, ctx, &node);
+        let neighbors = neighbors_with_overlay_indexed(graph, ctx, &overlay, &node);
 
         for neighbor in neighbors {
             let target_score = if let Some(node_view) = graph.get_node(&neighbor.name) {
                 compute_score(&node_view, ctx).weight
-            } else if let Some(overlay_view) = resolve_overlay_node(&neighbor.name, ctx) {
+            } else if let Some(overlay_view) = resolve_overlay_node_indexed(&neighbor.name, &overlay) {
                 compute_score(&overlay_view, ctx).weight
             } else {
                 0.001
@@ -257,6 +265,8 @@ fn reconstruct_path(start: &str, end: &str, parent: &HashMap<String, ParentInfo>
 
 /// Extract a compact subgraph of `k` nodes most relevant to the context.
 pub fn contextual_subgraph(graph: &dyn GraphAccessor, ctx: &DynamicContext, k: usize) -> SubGraph {
+    let overlay = OverlayIndex::build(ctx);
+
     // Seed order must be deterministic: HashMap iteration order + a stable
     // sort on tied boosts would otherwise pick different seeds across runs.
     // Sort by (boost desc, name asc) so ties break by name (total_cmp is
@@ -280,7 +290,7 @@ pub fn contextual_subgraph(graph: &dyn GraphAccessor, ctx: &DynamicContext, k: u
 
         let result = if let Some(node_view) = graph.get_node(seed_name) {
             compute_score(&node_view, ctx)
-        } else if let Some(overlay_view) = resolve_overlay_node(seed_name, ctx) {
+        } else if let Some(overlay_view) = resolve_overlay_node_indexed(seed_name, &overlay) {
             compute_score(&overlay_view, ctx)
         } else {
             continue;
@@ -289,7 +299,8 @@ pub fn contextual_subgraph(graph: &dyn GraphAccessor, ctx: &DynamicContext, k: u
         node_set.insert(seed_name.to_string());
         nodes.push(result);
 
-        let neighbors = neighbors_with_overlay(graph, ctx, seed_name);
+        let neighbors =
+            neighbors_with_overlay_indexed(graph, ctx, &overlay, seed_name);
         for neighbor in neighbors {
             edges.push(EdgeResult {
                 source: seed_name.to_string(),
@@ -305,7 +316,7 @@ pub fn contextual_subgraph(graph: &dyn GraphAccessor, ctx: &DynamicContext, k: u
             if node_set.insert(neighbor.name.clone()) {
                 let neighbor_result = if let Some(nv) = graph.get_node(&neighbor.name) {
                     compute_score(&nv, ctx)
-                } else if let Some(ov) = resolve_overlay_node(&neighbor.name, ctx) {
+                } else if let Some(ov) = resolve_overlay_node_indexed(&neighbor.name, &overlay) {
                     compute_score(&ov, ctx)
                 } else {
                     continue;
@@ -358,6 +369,8 @@ pub fn multi_beam_intersection(
     threshold: usize,
 ) -> SubGraph {
     use rayon::prelude::*;
+
+    let overlay = OverlayIndex::build(ctx);
 
     // ── 1. Multi-beam launch ──────────────────────────────────────────
     // Each beam returns Vec<NodeResult>. Collect them all.
@@ -418,7 +431,7 @@ pub fn multi_beam_intersection(
                 // Score the start node itself
                 let nr = if let Some(nv) = graph.get_node(start) {
                     compute_score(&nv, ctx)
-                } else if let Some(ov) = resolve_overlay_node(start, ctx) {
+                } else if let Some(ov) = resolve_overlay_node_indexed(start, &overlay) {
                     compute_score(&ov, ctx)
                 } else {
                     continue;

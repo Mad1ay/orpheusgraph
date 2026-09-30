@@ -22,8 +22,9 @@ returns the Top-K relevant nodes in microseconds.
 
 The mechanism worth knowing before anything else: **the caller supplies the objective
 function, per request, without writing to the store.** A `DynamicContext` is an ordinary
-function argument, never persisted, and it can re-weight any node (`weight_overrides`), add
-an embedding-derived boost (`semantic_boosts`), suppress a whole class of nodes by metadata
+function argument, never persisted, and it can add a per-request bonus to any node
+(`weight_overrides`), add an embedding-derived bonus (`semantic_boosts`), suppress a whole
+class of nodes by metadata
 domain (`noise_tags`), cut hubs (`max_fan_out`), inject nodes and edges that do not exist in
 the store (`overlay_nodes`/`overlay_edges`), view the graph at a past instant (`as_of`) and
 restrict it to what the caller may see (`principals`). The score is computed *inside* the
@@ -260,10 +261,11 @@ Ephemeral per-request context. Never stored. All parameters optional:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `semantic_boosts` | `{}` | node → multiplier (from embeddings) |
-| `weight_overrides` | `{}` | node → weight override |
-| `noise_tags` | `{}` | domain tags to penalize (e.g. `{"technical"}`) |
-| `max_fan_out` | `None` | degree cutoff for God Objects |
+| `semantic_boosts` | `{}` | node → **additive** bonus, entering the score as `w_semantic × value` (not a multiplier) |
+| `weight_overrides` | `{}` | node → **additive** bonus, entering as `w_override × value`. Despite the name it does **not** replace `base_weight`: base `0.3` plus an entry of `0.5` scores `0.8`, not `0.5` |
+| `noise_tags` | `{}` | domain tags to penalize. Matched against `metadata["domain"]` **only** — that key is hardcoded, so tagging under any other key is a silent no-op |
+| `max_fan_out` | `None` | degree cutoff for God Objects. Not a hard bound — see below |
+| `fan_out_pagerank_bypass` | `0.5` | `pagerank_weight` above which a node escapes `max_fan_out`; `None` removes the escape |
 | `w_base` | `1.0` | base weight coefficient |
 | `w_semantic` | `1.5` | semantic boost coefficient |
 | `w_noise` | `1.0` | noise penalty coefficient |
@@ -274,9 +276,27 @@ Ephemeral per-request context. Never stored. All parameters optional:
 ### Scoring Formula
 
 ```
-raw = (w_base × base_weight) + (w_semantic × semantic_boost) + (w_override × override)
-W_total = raw × (1.0 - noise_penalty)
+raw             = (w_base × base_weight)
+                + (w_semantic × semantic_boost)
+                + (w_override × override)
+
+effective_noise = clamp(w_noise × noise_penalty, 0.0, 1.0)
+                  # raised to at least 0.9 when metadata["domain"] ∈ noise_tags
+
+W_total         = raw × (1.0 - effective_noise)
 ```
+
+All three numerator terms are **added**; none replaces `base_weight`. `w_noise` scales the
+penalty before clamping, so it only drops out of the formula at its default of `1.0`.
+
+**`max_fan_out` is not a bound on expanded degree.** A node escapes the cutoff if it carries
+a *positive* `semantic_boosts` entry or if its `pagerank_weight` exceeds
+`fan_out_pagerank_bypass`, and overlay edges are never subject to it at all — the caller
+injected those for this request, so they are not discarded. Set
+`fan_out_pagerank_bypass=None` to remove the PageRank escape. Note the threshold is absolute
+while PageRank's spread is graph-dependent: on a flat-degree graph nothing clears `0.5` and
+the escape never fires, while on a hub-heavy graph many nodes clear it and `max_fan_out` does
+nothing. Pick it from your own graph's distribution, the same way you pick `k`.
 
 ## Benchmarks
 

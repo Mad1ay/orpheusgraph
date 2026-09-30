@@ -139,6 +139,9 @@ class DynamicContext:
     weight_overrides: dict[str, float]
     noise_tags: set[str]
     max_fan_out: int | None
+    fan_out_pagerank_bypass: float | None
+    """pagerank_weight above which a node escapes max_fan_out. None removes the
+    escape, making max_fan_out an actual bound on base-edge expansion."""
     w_base: float
     w_semantic: float
     w_noise: float
@@ -156,6 +159,7 @@ class DynamicContext:
         weight_overrides: dict[str, float] | None = None,
         noise_tags: set[str] | None = None,
         max_fan_out: int | None = None,
+        fan_out_pagerank_bypass: float | None = 0.5,
         w_base: float = 1.0,
         w_semantic: float = 1.5,
         w_noise: float = 1.0,

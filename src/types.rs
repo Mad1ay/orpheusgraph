@@ -129,14 +129,23 @@ pub struct PathStep {
 /// The base graph is immutable; all per-request customization goes through this struct.
 #[derive(Debug, Clone)]
 pub struct DynamicContext {
-    /// Semantic boosts: node_name → multiplier (from embedding similarity)
+    /// Semantic bonus per node (typically from embedding similarity).
+    ///
+    /// ADDITIVE, not a multiplier: the value enters the score as
+    /// `w_semantic * value`, added to the base term. A node with
+    /// `base_weight == 0.0` is therefore still liftable, which a multiplier
+    /// could not do.
     pub semantic_boosts: HashMap<String, f32>,
 
     /// Virtual overlay: temporary nodes visible only during this traversal
     pub overlay_nodes: Vec<NodeData>,
     pub overlay_edges: Vec<(String, String, EdgeData)>, // (from, to, edge)
 
-    /// Per-request weight overrides (e.g. project-specific usage stats)
+    /// Per-request weight bonus (e.g. project-specific usage stats).
+    ///
+    /// ADDITIVE despite the name: the value enters as `w_override * value`,
+    /// added alongside `base_weight` — it does NOT replace it. A node with
+    /// `base_weight = 0.3` and an entry of `0.5` scores `0.8`, not `0.5`.
     pub weight_overrides: HashMap<String, f32>,
 
     /// Scoring coefficients — configurable for A/B testing without Rust recompile
@@ -149,8 +158,25 @@ pub struct DynamicContext {
     /// Nodes tagged with these domains get boosted noise_penalty
     pub noise_tags: HashSet<String>,
 
-    /// Degree cutoff for "God Object" nodes (e.g. res.partner with 1000+ edges)
+    /// Degree cutoff for "God Object" nodes (e.g. res.partner with 1000+ edges).
+    ///
+    /// NOT a hard bound on expanded degree: a node escapes the cutoff if it
+    /// carries a positive `semantic_boosts` entry or clears
+    /// `fan_out_pagerank_bypass`, and overlay edges are never subject to it.
+    /// Set `fan_out_pagerank_bypass: None` to remove the PageRank escape.
     pub max_fan_out: Option<usize>,
+
+    /// `pagerank_weight` above which a node escapes the `max_fan_out` cutoff,
+    /// on the grounds that a structurally central node is worth expanding even
+    /// when it is wide. `None` disables the escape, which is what makes
+    /// `max_fan_out` an actual bound on base-edge expansion.
+    ///
+    /// The default of `Some(0.5)` preserves historical behaviour, but note it
+    /// is an ABSOLUTE threshold against a graph-dependent distribution: on a
+    /// flat-degree graph nothing clears it and the escape never fires, while on
+    /// a hub-heavy graph many nodes clear it and `max_fan_out` does nothing.
+    /// Pick it from your own graph's PageRank spread rather than inheriting it.
+    pub fan_out_pagerank_bypass: Option<f32>,
 
     /// Valid-time instant for temporal filtering. `None` = no temporal
     /// filtering (every edge passes regardless of `valid_from`/`valid_to`).
@@ -180,6 +206,7 @@ impl Default for DynamicContext {
             w_override: 1.0,
             noise_tags: HashSet::new(),
             max_fan_out: None,
+            fan_out_pagerank_bypass: Some(0.5),
             as_of: None,
             principals: Vec::new(),
         }

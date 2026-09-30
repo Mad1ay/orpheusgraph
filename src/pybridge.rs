@@ -126,6 +126,7 @@ fn resolve_dynamic_context(ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
         weight_overrides: ctx.weight_overrides.clone(),
         noise_tags: ctx.noise_tags.clone(),
         max_fan_out: ctx.max_fan_out,
+        fan_out_pagerank_bypass: ctx.fan_out_pagerank_bypass,
         w_base: ctx.w_base,
         w_semantic: ctx.w_semantic,
         w_noise: ctx.w_noise,
@@ -355,6 +356,13 @@ pub struct PyDynamicContext {
     pub noise_tags: HashSet<String>,
     #[pyo3(get, set)]
     pub max_fan_out: Option<usize>,
+    /// `pagerank_weight` above which a node escapes the `max_fan_out` cutoff.
+    /// `None` removes the escape, making `max_fan_out` an actual bound on
+    /// base-edge expansion. Defaults to 0.5 (historical behaviour), which is an
+    /// absolute threshold against a graph-dependent distribution — pick it from
+    /// your own graph's PageRank spread.
+    #[pyo3(get, set)]
+    pub fan_out_pagerank_bypass: Option<f32>,
     #[pyo3(get, set)]
     pub w_base: f32,
     #[pyo3(get, set)]
@@ -395,6 +403,7 @@ impl PyDynamicContext {
         weight_overrides = None,
         noise_tags = None,
         max_fan_out = None,
+        fan_out_pagerank_bypass = Some(0.5),
         w_base = 1.0,
         w_semantic = 1.5,
         w_noise = 1.0,
@@ -410,6 +419,7 @@ impl PyDynamicContext {
         weight_overrides: Option<HashMap<String, f32>>,
         noise_tags: Option<HashSet<String>>,
         max_fan_out: Option<usize>,
+        fan_out_pagerank_bypass: Option<f32>,
         w_base: f32,
         w_semantic: f32,
         w_noise: f32,
@@ -424,6 +434,7 @@ impl PyDynamicContext {
             weight_overrides: weight_overrides.unwrap_or_default(),
             noise_tags: noise_tags.unwrap_or_default(),
             max_fan_out,
+            fan_out_pagerank_bypass,
             w_base,
             w_semantic,
             w_noise,

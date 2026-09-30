@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use crate::accessor::{GraphAccessor, NodeView};
-use crate::types::DynamicContext;
+use crate::types::{DynamicContext, EdgeData, NodeData};
 
 /// Neighbor entry returned by `neighbors_with_overlay`.
 #[derive(Debug, Clone)]
@@ -19,6 +21,39 @@ pub struct NeighborEntry {
     pub acl: Vec<String>,
 }
 
+/// Per-traversal index over a context's overlay, so a traversal does not rescan the
+/// whole overlay for every node it expands.
+///
+/// `overlay_edges`/`overlay_nodes` are flat `Vec`s on the context (the ergonomic shape
+/// for a caller assembling a request), but a beam expanding N nodes used to walk the
+/// entire edge list N times — the one part of the hot path that scaled with overlay
+/// size rather than with the graph. Build this once at the traversal entry point.
+pub struct OverlayIndex<'a> {
+    edges: HashMap<&'a str, Vec<&'a (String, String, EdgeData)>>,
+    nodes: HashMap<&'a str, &'a NodeData>,
+}
+
+impl<'a> OverlayIndex<'a> {
+    pub fn build(ctx: &'a DynamicContext) -> Self {
+        let mut edges: HashMap<&str, Vec<&(String, String, EdgeData)>> = HashMap::new();
+        for e in &ctx.overlay_edges {
+            edges.entry(e.0.as_str()).or_default().push(e);
+        }
+        // Last definition wins, matching the linear scan's `find` semantics only when
+        // names are unique; duplicates were already ambiguous.
+        let nodes = ctx.overlay_nodes.iter().map(|n| (n.name.as_str(), n)).collect();
+        Self { edges, nodes }
+    }
+
+    fn edges_from(&self, node_name: &str) -> &[&'a (String, String, EdgeData)] {
+        self.edges.get(node_name).map_or(&[][..], |v| v.as_slice())
+    }
+
+    fn node(&self, name: &str) -> Option<&'a NodeData> {
+        self.nodes.get(name).copied()
+    }
+}
+
 /// Get all outgoing neighbors of a node, combining base graph edges with
 /// overlay edges, THEN applying query-time edge visibility
 /// (`DynamicContext::is_edge_visible`: temporal `as_of` + ACL `principals`).
@@ -33,7 +68,19 @@ pub fn neighbors_with_overlay(
     ctx: &DynamicContext,
     node_name: &str,
 ) -> Vec<NeighborEntry> {
-    neighbors_with_overlay_unfiltered(graph, ctx, node_name)
+    let index = OverlayIndex::build(ctx);
+    neighbors_with_overlay_indexed(graph, ctx, &index, node_name)
+}
+
+/// Same as [`neighbors_with_overlay`], but reusing an [`OverlayIndex`] built once per
+/// traversal instead of per expanded node.
+pub fn neighbors_with_overlay_indexed(
+    graph: &dyn GraphAccessor,
+    ctx: &DynamicContext,
+    index: &OverlayIndex<'_>,
+    node_name: &str,
+) -> Vec<NeighborEntry> {
+    neighbors_with_overlay_unfiltered(graph, ctx, index, node_name)
         .into_iter()
         .filter(|n| ctx.is_edge_visible(n.valid_from, n.valid_to, &n.acl))
         .collect()
@@ -49,6 +96,7 @@ pub fn neighbors_with_overlay(
 fn neighbors_with_overlay_unfiltered(
     graph: &dyn GraphAccessor,
     ctx: &DynamicContext,
+    index: &OverlayIndex<'_>,
     node_name: &str,
 ) -> Vec<NeighborEntry> {
     let mut result = Vec::new();
@@ -59,12 +107,21 @@ fn neighbors_with_overlay_unfiltered(
 
         if let Some(max_fan_out) = ctx.max_fan_out {
             if base_neighbors.len() > max_fan_out {
-                let has_semantic_boost = ctx.semantic_boosts.contains_key(node_name);
-                let has_high_pagerank = node_view.pagerank_weight > 0.5;
+                // A boost keeps the hub only if it actually raises the node. Testing
+                // mere presence let `semantic_boosts[hub] = 0.0` — which means "this
+                // node is irrelevant to this request" — read as "keep this hub",
+                // inverting the caller's intent.
+                let has_semantic_boost = ctx
+                    .semantic_boosts
+                    .get(node_name)
+                    .is_some_and(|v| *v > 0.0);
+                let has_high_pagerank = ctx
+                    .fan_out_pagerank_bypass
+                    .is_some_and(|t| node_view.pagerank_weight > t);
 
                 if !has_semantic_boost && !has_high_pagerank {
                     // God Object cutoff: skip base edges, but still include overlay
-                    return collect_overlay_edges(ctx, node_name, result);
+                    return collect_overlay_edges(index, node_name, result);
                 }
             }
         }
@@ -84,18 +141,20 @@ fn neighbors_with_overlay_unfiltered(
         }
     }
 
-    // Add overlay edges
-    collect_overlay_edges(ctx, node_name, result)
+    // Add overlay edges. Deliberately not subject to max_fan_out: the caller injected
+    // them for this one request, so cutting them would discard what was explicitly asked
+    // for. Documented, because it means max_fan_out does not bound total expanded degree.
+    collect_overlay_edges(index, node_name, result)
 }
 
 /// Append overlay edges originating from `node_name` to the result vec.
 fn collect_overlay_edges(
-    ctx: &DynamicContext,
+    index: &OverlayIndex<'_>,
     node_name: &str,
     mut result: Vec<NeighborEntry>,
 ) -> Vec<NeighborEntry> {
-    for (from, to, edge) in &ctx.overlay_edges {
-        if from == node_name {
+    for (_from, to, edge) in index.edges_from(node_name) {
+        {
             result.push(NeighborEntry {
                 name: to.clone(),
                 edge_kind: edge.kind.clone(),
@@ -119,6 +178,14 @@ pub fn resolve_overlay_node(name: &str, ctx: &DynamicContext) -> Option<NodeView
         .map(NodeView::from)
 }
 
+/// Same as [`resolve_overlay_node`], over a prebuilt index.
+pub fn resolve_overlay_node_indexed(
+    name: &str,
+    index: &OverlayIndex<'_>,
+) -> Option<NodeView> {
+    index.node(name).map(NodeView::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +193,42 @@ mod tests {
     use crate::graph::OrpheusGraphInner;
     use crate::types::{EdgeData, EdgeInput, NodeData, NodeInput};
     use std::collections::HashMap;
+
+    /// 1 hub with 100 outgoing edges plus a cycle, so the hub carries real pagerank.
+    fn hub_graph() -> (OrpheusGraphInner, ()) {
+        let mut nodes = vec![make_node("hub", 1.0), make_node("other", 1.0)];
+        let mut edges = vec![];
+        for i in 0..100 {
+            let name = format!("target_{i}");
+            nodes.push(make_node(&name, 1.0));
+            edges.push(make_edge("hub", &name));
+            edges.push(make_edge(&name, "hub"));
+        }
+        let (g, m) = build_graph(nodes, edges);
+        (OrpheusGraphInner::new(g, m), ())
+    }
+
+    fn make_overlay_node(name: &str) -> NodeData {
+        NodeData {
+            name: name.to_string(),
+            kind: "virtual".to_string(),
+            metadata: HashMap::new(),
+            base_weight: 0.5,
+            noise_penalty: 0.0,
+            pagerank_weight: 0.0,
+        }
+    }
+
+    fn make_overlay_edge() -> EdgeData {
+        EdgeData {
+            kind: "relates_to".to_string(),
+            field_name: None,
+            base_weight: 1.0,
+            valid_from: None,
+            valid_to: None,
+            acl: Vec::new(),
+        }
+    }
 
     fn make_node(name: &str, weight: f32) -> NodeInput {
         NodeInput {
@@ -329,6 +432,92 @@ mod tests {
         assert!(!names_a.contains(&"x_hr_skill".to_string()));
         assert!(names_b.contains(&"x_hr_skill".to_string()));
         assert!(!names_b.contains(&"x_warehouse".to_string()));
+    }
+
+    #[test]
+    fn zero_semantic_boost_does_not_rescue_a_hub_from_max_fan_out() {
+        // A boost of 0.0 says "irrelevant to this request". Testing mere presence used to
+        // read that as "keep this hub", inverting the caller's intent.
+        let (graph, _) = hub_graph();
+        let mut ctx = DynamicContext {
+            max_fan_out: Some(10),
+            fan_out_pagerank_bypass: None,
+            ..Default::default()
+        };
+        ctx.semantic_boosts.insert("hub".to_string(), 0.0);
+        assert!(
+            neighbors_with_overlay(&graph, &ctx, "hub").is_empty(),
+            "a 0.0 boost must not bypass the cutoff"
+        );
+
+        ctx.semantic_boosts.insert("hub".to_string(), 0.1);
+        assert!(
+            !neighbors_with_overlay(&graph, &ctx, "hub").is_empty(),
+            "a positive boost must still bypass the cutoff"
+        );
+    }
+
+    #[test]
+    fn fan_out_pagerank_bypass_is_configurable_and_disablable() {
+        let (graph, _) = hub_graph();
+        let pr = graph.get_node("hub").unwrap().pagerank_weight;
+
+        // None => no escape, so the cutoff actually bounds base expansion.
+        let strict = DynamicContext {
+            max_fan_out: Some(10),
+            fan_out_pagerank_bypass: None,
+            ..Default::default()
+        };
+        assert!(neighbors_with_overlay(&graph, &strict, "hub").is_empty());
+
+        // A threshold below the node's pagerank lets it through.
+        let loose = DynamicContext {
+            max_fan_out: Some(10),
+            fan_out_pagerank_bypass: Some((pr - 0.01).max(0.0)),
+            ..Default::default()
+        };
+        assert!(!neighbors_with_overlay(&graph, &loose, "hub").is_empty());
+
+        // A threshold above it does not.
+        let tight = DynamicContext {
+            max_fan_out: Some(10),
+            fan_out_pagerank_bypass: Some(pr + 0.01),
+            ..Default::default()
+        };
+        assert!(neighbors_with_overlay(&graph, &tight, "hub").is_empty());
+    }
+
+    #[test]
+    fn overlay_index_matches_the_linear_scan() {
+        // The index is a performance change only; it must not alter what is returned.
+        let (graph, _) = hub_graph();
+        let ctx = DynamicContext {
+            overlay_nodes: vec![make_overlay_node("virt")],
+            overlay_edges: vec![
+                ("hub".to_string(), "virt".to_string(), make_overlay_edge()),
+                ("hub".to_string(), "target_0".to_string(), make_overlay_edge()),
+                ("other".to_string(), "virt".to_string(), make_overlay_edge()),
+            ],
+            ..Default::default()
+        };
+        let index = OverlayIndex::build(&ctx);
+        for node in ["hub", "other", "target_0", "absent"] {
+            let via_wrapper: Vec<String> = neighbors_with_overlay(&graph, &ctx, node)
+                .into_iter()
+                .map(|n| n.name)
+                .collect();
+            let via_index: Vec<String> =
+                neighbors_with_overlay_indexed(&graph, &ctx, &index, node)
+                    .into_iter()
+                    .map(|n| n.name)
+                    .collect();
+            assert_eq!(via_wrapper, via_index, "mismatch on {node}");
+        }
+        assert_eq!(
+            resolve_overlay_node("virt", &ctx).map(|v| v.name),
+            resolve_overlay_node_indexed("virt", &index).map(|v| v.name)
+        );
+        assert!(resolve_overlay_node_indexed("absent", &index).is_none());
     }
 
     #[test]
