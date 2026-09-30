@@ -97,9 +97,21 @@ impl PyOrpheusGraph {
 
     /// Resolve a PyDynamicContext into a fresh Rust DynamicContext.
     ///
-    /// Overlays are parsed on every call (cheap) — deliberately no caching, so
-    /// this stays `&self` and multiple readers can run concurrently under a
-    /// shared borrow while the GIL is released.
+    /// Overlays are re-parsed on every call so this stays `&self` and multiple
+    /// readers can run concurrently under a shared borrow while the GIL is
+    /// released. That concurrency property is worth keeping, but the parse is
+    /// NOT cheap and this comment used to claim it was: it is O(overlay size)
+    /// per traversal, and measured through the Python bindings a context
+    /// carrying 20k overlay edges costs ~6.2 ms per `beam_traverse` against
+    /// ~1.2 µs with no overlay — and that is with the traversal collecting none
+    /// of those edges. It dominates the hot path the moment an overlay is
+    /// non-trivial, and it dwarfs `OverlayIndex`, which only removes the
+    /// per-expanded-node rescan *inside* the traversal.
+    ///
+    /// Fixing it means caching the parsed overlay on the context while keeping
+    /// this path `&self` — so an interior-mutability cache plus explicit
+    /// setters that invalidate it, since `overlay_nodes_raw`/`overlay_edges_raw`
+    /// are settable from Python and a construction-time parse would go stale.
     fn resolve_context(&self, ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
         resolve_dynamic_context(ctx)
     }
