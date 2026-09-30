@@ -58,11 +58,15 @@ impl<'a> OverlayIndex<'a> {
 /// overlay edges, THEN applying query-time edge visibility
 /// (`DynamicContext::is_edge_visible`: temporal `as_of` + ACL `principals`).
 ///
-/// This is the ONE choke point `beam_traverse`/`find_path`/
-/// `contextual_subgraph` (and, transitively via `beam_traverse`, the beam-launch
-/// phase of `multi_beam_intersection`) expand through, so filtering here alone
-/// covers all of them — see module docs on why filtering lives in the
-/// traversal/query layer and not in `GraphAccessor` impls.
+/// There are TWO edge-read sites in this crate, and both must filter:
+/// this function, which `beam_traverse`/`find_path`/`contextual_subgraph` (and,
+/// transitively via `beam_traverse`, the beam-launch phase of
+/// `multi_beam_intersection`) expand through; and the edge-reconstruction loop
+/// in `multi_beam_intersection`, which reads `GraphAccessor::outgoing_neighbors`
+/// directly and re-applies `DynamicContext::is_edge_visible` itself via the same
+/// helper. Filtering here does NOT cover that second site — a third read site
+/// would have to apply `is_edge_visible` too. See module docs on why filtering
+/// lives in the traversal/query layer and not in `GraphAccessor` impls.
 pub fn neighbors_with_overlay(
     graph: &dyn GraphAccessor,
     ctx: &DynamicContext,

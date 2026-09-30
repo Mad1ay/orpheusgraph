@@ -269,7 +269,7 @@ Ephemeral per-request context. Never stored. All parameters optional:
 | `w_base` | `1.0` | base weight coefficient |
 | `w_semantic` | `1.5` | semantic boost coefficient |
 | `w_noise` | `1.0` | noise penalty coefficient |
-| `w_bonus` | `1.0` | weight override coefficient |
+| `w_bonus` | `1.0` | weight bonus coefficient |
 | `overlay_nodes` | `[]` | virtual tenant-specific nodes |
 | `overlay_edges` | `[]` | virtual tenant-specific edges |
 
@@ -278,7 +278,7 @@ Ephemeral per-request context. Never stored. All parameters optional:
 ```
 raw             = (w_base × base_weight)
                 + (w_semantic × semantic_boost)
-                + (w_bonus × override)
+                + (w_bonus × weight_bonus)
 
 effective_noise = clamp(w_noise × noise_penalty, 0.0, 1.0)
                   # raised to at least 0.9 when metadata["domain"] ∈ noise_tags

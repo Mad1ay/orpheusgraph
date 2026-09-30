@@ -61,7 +61,7 @@ pub struct DynamicContext {
     pub overlay_nodes: Vec<NodeData>,
     pub overlay_edges: Vec<(String, String, EdgeData)>,  // (from, to, edge)
 
-    /// Per-request weight overrides (e.g. project-specific usage stats)
+    /// Per-request weight bonuses (e.g. project-specific usage stats)
     pub weight_bonuses: HashMap<String, f32>,
 
     /// Scoring coefficients — configurable for A/B testing without Rust recompile
@@ -85,7 +85,13 @@ pub struct DynamicContext {
 
 ### Scoring Formula
 
-$$W_{total} = (w_{base} \cdot base\_weight) + (w_{semantic} \cdot semantic\_boost) - (w_{noise} \cdot noise\_penalty) + (w_{override} \cdot weight\_override)$$
+$$W_{total} = (w_{base} \cdot base\_weight) + (w_{semantic} \cdot semantic\_boost) - (w_{noise} \cdot noise\_penalty) + (w_{bonus} \cdot weight\_bonus)$$
+
+> **Superseded.** This is the original linear-subtraction form. It was rejected as unsafe
+> (a large `semantic_boost` can outrun the noise term) and the shipped formula applies noise
+> multiplicatively: `W_total = raw * (1.0 - effective_noise)`, where
+> `effective_noise = clamp(w_noise * noise_penalty, 0, 1)` and `noise_tags` raises it to at
+> least 0.9. See the v1 formula below and `src/scoring.rs`.
 
 All `w_*` coefficients live in `DynamicContext` — tunable per-request from Python.
 
@@ -795,7 +801,7 @@ user-supplied key.
 
 Linear subtraction is unsafe — high `semantic_boost` can override noise. **v1 formula**:
 ```
-W = (w_base * base_weight + w_semantic * semantic_boost + w_bonus * override) * (1.0 - noise_penalty)
+W = (w_base * base_weight + w_semantic * semantic_boost + w_bonus * weight_bonus) * (1.0 - noise_penalty)
 ```
 With `noise_penalty = 0.9`, even boosted nodes get 10% of their score → never in top-K.
 

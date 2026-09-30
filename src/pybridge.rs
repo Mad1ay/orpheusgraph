@@ -464,7 +464,7 @@ impl PyDynamicContext {
         self.semantic_boosts.insert(name, val);
     }
 
-    /// Insert/update a weight override. See `add_boost` for why the getter copy
+    /// Insert/update a weight bonus. See `add_boost` for why the getter copy
     /// cannot be mutated in place.
     fn add_bonus(&mut self, name: String, val: f32) {
         self.weight_bonuses.insert(name, val);
@@ -478,7 +478,7 @@ impl PyDynamicContext {
 
     fn __repr__(&self) -> String {
         format!(
-            "DynamicContext(boosts={}, overrides={}, noise_tags={}, max_fan_out={:?}, \
+            "DynamicContext(boosts={}, bonuses={}, noise_tags={}, max_fan_out={:?}, \
              as_of={:?}, principals={})",
             self.semantic_boosts.len(),
             self.weight_bonuses.len(),
