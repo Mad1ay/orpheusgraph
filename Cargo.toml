@@ -2,7 +2,7 @@
 name = "orpheusgraph"
 version = "0.1.0"
 edition = "2021"
-description = "Rust knowledge graph traversal engine with Python bindings"
+description = "Embedded graph index for context-aware weighted traversal: scoring weights come from the request, not the store. Domain-agnostic, deterministic, optional Python bindings."
 license-file = "LICENSE.md"
 repository = "https://github.com/Mad1ay/orpheusgraph"
 readme = "README.md"
