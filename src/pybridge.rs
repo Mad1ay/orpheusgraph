@@ -123,14 +123,14 @@ fn resolve_dynamic_context(ctx: &PyDynamicContext) -> PyResult<DynamicContext> {
 
     Ok(DynamicContext {
         semantic_boosts: ctx.semantic_boosts.clone(),
-        weight_overrides: ctx.weight_overrides.clone(),
+        weight_bonuses: ctx.weight_bonuses.clone(),
         noise_tags: ctx.noise_tags.clone(),
         max_fan_out: ctx.max_fan_out,
         fan_out_pagerank_bypass: ctx.fan_out_pagerank_bypass,
         w_base: ctx.w_base,
         w_semantic: ctx.w_semantic,
         w_noise: ctx.w_noise,
-        w_override: ctx.w_override,
+        w_bonus: ctx.w_bonus,
         overlay_nodes,
         overlay_edges,
         as_of: ctx.as_of,
@@ -351,7 +351,7 @@ pub struct PyDynamicContext {
     #[pyo3(get, set)]
     pub semantic_boosts: HashMap<String, f32>,
     #[pyo3(get, set)]
-    pub weight_overrides: HashMap<String, f32>,
+    pub weight_bonuses: HashMap<String, f32>,
     #[pyo3(get, set)]
     pub noise_tags: HashSet<String>,
     #[pyo3(get, set)]
@@ -370,7 +370,7 @@ pub struct PyDynamicContext {
     #[pyo3(get, set)]
     pub w_noise: f32,
     #[pyo3(get, set)]
-    pub w_override: f32,
+    pub w_bonus: f32,
     /// Valid-time instant for temporal edge filtering. `None` = no temporal
     /// filtering.
     #[pyo3(get, set)]
@@ -400,14 +400,14 @@ impl PyDynamicContext {
     #[new]
     #[pyo3(signature = (
         semantic_boosts = None,
-        weight_overrides = None,
+        weight_bonuses = None,
         noise_tags = None,
         max_fan_out = None,
         fan_out_pagerank_bypass = Some(0.5),
         w_base = 1.0,
         w_semantic = 1.5,
         w_noise = 1.0,
-        w_override = 1.0,
+        w_bonus = 1.0,
         overlay_nodes = None,
         overlay_edges = None,
         as_of = None,
@@ -416,14 +416,14 @@ impl PyDynamicContext {
     #[allow(clippy::too_many_arguments)]
     fn new(
         semantic_boosts: Option<HashMap<String, f32>>,
-        weight_overrides: Option<HashMap<String, f32>>,
+        weight_bonuses: Option<HashMap<String, f32>>,
         noise_tags: Option<HashSet<String>>,
         max_fan_out: Option<usize>,
         fan_out_pagerank_bypass: Option<f32>,
         w_base: f32,
         w_semantic: f32,
         w_noise: f32,
-        w_override: f32,
+        w_bonus: f32,
         overlay_nodes: Option<Vec<HashMap<String, String>>>,
         overlay_edges: Option<Vec<HashMap<String, String>>>,
         as_of: Option<u64>,
@@ -431,14 +431,14 @@ impl PyDynamicContext {
     ) -> Self {
         Self {
             semantic_boosts: semantic_boosts.unwrap_or_default(),
-            weight_overrides: weight_overrides.unwrap_or_default(),
+            weight_bonuses: weight_bonuses.unwrap_or_default(),
             noise_tags: noise_tags.unwrap_or_default(),
             max_fan_out,
             fan_out_pagerank_bypass,
             w_base,
             w_semantic,
             w_noise,
-            w_override,
+            w_bonus,
             as_of,
             principals: principals.unwrap_or_default(),
             overlay_nodes_raw: overlay_nodes.unwrap_or_default(),
@@ -454,8 +454,8 @@ impl PyDynamicContext {
 
     /// Insert/update a weight override. See `add_boost` for why the getter copy
     /// cannot be mutated in place.
-    fn add_override(&mut self, name: String, val: f32) {
-        self.weight_overrides.insert(name, val);
+    fn add_bonus(&mut self, name: String, val: f32) {
+        self.weight_bonuses.insert(name, val);
     }
 
     /// Add a noise tag. The `noise_tags` getter returns a copy, so mutating that
@@ -469,7 +469,7 @@ impl PyDynamicContext {
             "DynamicContext(boosts={}, overrides={}, noise_tags={}, max_fan_out={:?}, \
              as_of={:?}, principals={})",
             self.semantic_boosts.len(),
-            self.weight_overrides.len(),
+            self.weight_bonuses.len(),
             self.noise_tags.len(),
             self.max_fan_out,
             self.as_of,
@@ -578,7 +578,7 @@ pub struct PyNodeResult {
     #[pyo3(get)]
     pub noise_component: f32,
     #[pyo3(get)]
-    pub override_component: f32,
+    pub bonus_component: f32,
 }
 
 impl PyNodeResult {
@@ -590,7 +590,7 @@ impl PyNodeResult {
             base_component: nr.base_component,
             semantic_component: nr.semantic_component,
             noise_component: nr.noise_component,
-            override_component: nr.override_component,
+            bonus_component: nr.bonus_component,
         }
     }
 }
@@ -602,7 +602,7 @@ impl PyNodeResult {
         m.insert("base".to_string(), self.base_component);
         m.insert("semantic".to_string(), self.semantic_component);
         m.insert("noise".to_string(), self.noise_component);
-        m.insert("override".to_string(), self.override_component);
+        m.insert("bonus".to_string(), self.bonus_component);
         m.insert("total".to_string(), self.weight);
         m
     }

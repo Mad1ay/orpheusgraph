@@ -151,7 +151,7 @@ flowchart TB
     subgraph Sources["Data Sources Python"]
         VEC["pgvector search - semantic_boosts top-200"]
         DUMP["Structure Dump - overlay_nodes, overlay_edges"]
-        STATS["Project usage stats - weight_overrides"]
+        STATS["Project usage stats - weight_bonuses"]
         CONFIG["Pipeline config - w_base, w_semantic, noise_tags, max_fan_out"]
     end
 
@@ -159,8 +159,8 @@ flowchart TB
         SB["semantic_boosts: HashMap"]
         ON["overlay_nodes: Vec"]
         OE["overlay_edges: Vec"]
-        WO["weight_overrides: HashMap"]
-        WC["w_base / w_semantic / w_noise / w_override"]
+        WO["weight_bonuses: HashMap"]
+        WC["w_base / w_semantic / w_noise / w_bonus"]
         NT["noise_tags: HashSet"]
         MF["max_fan_out: Option usize"]
     end

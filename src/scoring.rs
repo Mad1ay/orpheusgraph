@@ -5,7 +5,7 @@ use crate::types::{DynamicContext, NodeResult};
 ///
 /// Uses the **multiplicative noise** formula (spec Risk #17):
 /// ```text
-/// raw = (w_base * base_weight) + (w_semantic * semantic_boost) + (w_override * weight_override)
+/// raw = (w_base * base_weight) + (w_semantic * semantic_boost) + (w_bonus * weight_bonus)
 /// W_total = raw * (1.0 - effective_noise)
 /// ```
 ///
@@ -16,8 +16,8 @@ pub fn compute_score(node: &NodeView, ctx: &DynamicContext) -> NodeResult {
     let semantic_boost = ctx.semantic_boosts.get(&node.name).copied().unwrap_or(0.0);
     let semantic_component = ctx.w_semantic * semantic_boost;
 
-    let weight_override = ctx.weight_overrides.get(&node.name).copied().unwrap_or(0.0);
-    let override_component = ctx.w_override * weight_override;
+    let weight_bonus = ctx.weight_bonuses.get(&node.name).copied().unwrap_or(0.0);
+    let bonus_component = ctx.w_bonus * weight_bonus;
 
     // Domain-aware noise: if node metadata contains a tag in ctx.noise_tags, force high penalty
     let mut effective_noise = (ctx.w_noise * node.noise_penalty).clamp(0.0, 1.0);
@@ -29,7 +29,7 @@ pub fn compute_score(node: &NodeView, ctx: &DynamicContext) -> NodeResult {
         }
     }
 
-    let raw = base_component + semantic_component + override_component;
+    let raw = base_component + semantic_component + bonus_component;
     let weight = raw * (1.0 - effective_noise);
 
     NodeResult {
@@ -39,7 +39,7 @@ pub fn compute_score(node: &NodeView, ctx: &DynamicContext) -> NodeResult {
         base_component,
         semantic_component,
         noise_component: effective_noise,
-        override_component,
+        bonus_component,
     }
 }
 
@@ -134,7 +134,7 @@ mod tests {
     fn test_weight_override() {
         let node = make_node("sale.order", 0.3, 0.0);
         let mut ctx = DynamicContext::default();
-        ctx.weight_overrides.insert("sale.order".to_string(), 0.5);
+        ctx.weight_bonuses.insert("sale.order".to_string(), 0.5);
         let result = compute_score(&node, &ctx);
         assert!((result.weight - 0.8).abs() < 0.001);
     }
@@ -144,14 +144,14 @@ mod tests {
         let node = make_node("sale.order", 0.6, 0.2);
         let mut ctx = DynamicContext::default();
         ctx.semantic_boosts.insert("sale.order".to_string(), 1.0);
-        ctx.weight_overrides.insert("sale.order".to_string(), 0.3);
+        ctx.weight_bonuses.insert("sale.order".to_string(), 0.3);
 
         let result = compute_score(&node, &ctx);
         let explained = result.explain_score();
 
         assert!((explained["base"] - 0.6).abs() < 0.001);
         assert!((explained["semantic"] - 1.5).abs() < 0.001);
-        assert!((explained["override"] - 0.3).abs() < 0.001);
+        assert!((explained["bonus"] - 0.3).abs() < 0.001);
         assert!((explained["noise"] - 0.2).abs() < 0.001);
         assert!((explained["total"] - 1.92).abs() < 0.001);
     }

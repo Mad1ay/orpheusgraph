@@ -136,7 +136,7 @@ class CorruptError(Exception):
 
 class DynamicContext:
     semantic_boosts: dict[str, float]
-    weight_overrides: dict[str, float]
+    weight_bonuses: dict[str, float]
     noise_tags: set[str]
     max_fan_out: int | None
     fan_out_pagerank_bypass: float | None
@@ -145,7 +145,7 @@ class DynamicContext:
     w_base: float
     w_semantic: float
     w_noise: float
-    w_override: float
+    w_bonus: float
     as_of: int | None
     """Valid-time instant for temporal edge filtering. None = no filtering."""
     principals: list[str]
@@ -156,14 +156,14 @@ class DynamicContext:
         self,
         *,
         semantic_boosts: dict[str, float] | None = None,
-        weight_overrides: dict[str, float] | None = None,
+        weight_bonuses: dict[str, float] | None = None,
         noise_tags: set[str] | None = None,
         max_fan_out: int | None = None,
         fan_out_pagerank_bypass: float | None = 0.5,
         w_base: float = 1.0,
         w_semantic: float = 1.5,
         w_noise: float = 1.0,
-        w_override: float = 1.0,
+        w_bonus: float = 1.0,
         overlay_nodes: list[dict[str, str]] | None = None,
         overlay_edges: list[dict[str, str]] | None = None,
         as_of: int | None = None,
@@ -173,7 +173,7 @@ class DynamicContext:
         schema is string-valued only) — overlay edges are always
         unbounded/public regardless of as_of/principals."""
     def add_boost(self, name: str, value: float) -> None: ...
-    def add_override(self, name: str, value: float) -> None: ...
+    def add_bonus(self, name: str, value: float) -> None: ...
     def add_noise_tag(self, tag: str) -> None: ...
 
 class NodeResult:
@@ -183,7 +183,7 @@ class NodeResult:
     base_component: float
     semantic_component: float
     noise_component: float
-    override_component: float
+    bonus_component: float
     def explain_score(self) -> dict[str, float]: ...
 
 class EdgeResult:

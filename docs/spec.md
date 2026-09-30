@@ -62,13 +62,13 @@ pub struct DynamicContext {
     pub overlay_edges: Vec<(String, String, EdgeData)>,  // (from, to, edge)
 
     /// Per-request weight overrides (e.g. project-specific usage stats)
-    pub weight_overrides: HashMap<String, f32>,
+    pub weight_bonuses: HashMap<String, f32>,
 
     /// Scoring coefficients — configurable for A/B testing without Rust recompile
     pub w_base: f32,      // default 1.0
     pub w_semantic: f32,  // default 1.5
     pub w_noise: f32,     // default 1.0
-    pub w_override: f32,  // default 1.0
+    pub w_bonus: f32,  // default 1.0
 
     /// Domain-aware noise filter (e.g. "technical", "audit", "messaging")
     /// Nodes tagged with these domains get boosted noise_penalty
@@ -332,7 +332,7 @@ pub struct DynamicContext {
     #[pyo3(get, set)]
     pub overlay_edges: Vec<(String, String, EdgeData)>,
     #[pyo3(get, set)]
-    pub weight_overrides: HashMap<String, f32>,
+    pub weight_bonuses: HashMap<String, f32>,
 }
 ```
 
@@ -407,7 +407,7 @@ ctx = orpheusgraph.DynamicContext(
     semantic_boosts={"stock.picking": 2.5, "stock.move": 2.0},
     overlay_nodes=[{"name": "x_custom", "kind": "model", "base_weight": 0.5}],
     overlay_edges=[{"from": "stock.picking", "to": "x_custom", "kind": "relates_to"}],
-    weight_overrides={"sale.order": 0.9},
+    weight_bonuses={"sale.order": 0.9},
 )
 
 results = graph.beam_traverse("sale.order", k=5, depth=3, ctx=ctx)
@@ -550,7 +550,7 @@ async def traverse_erp_graph(entity_name: str, version: str = "18.0") -> str:
     ctx = orpheusgraph.DynamicContext(
         semantic_boosts=await compute_semantic_boosts(state["transcript"]),
         overlay_nodes=await get_custom_fields(state["project_id"]),
-        weight_overrides=await get_project_usage_stats(state["project_id"]),
+        weight_bonuses=await get_project_usage_stats(state["project_id"]),
     )
 
     # 3. Beam Search (Rust, <1ms, immutable graph)
@@ -736,7 +736,7 @@ impl NodeResult {
             ("base".into(), self.base_component),
             ("semantic".into(), self.semantic_component),
             ("noise".into(), self.noise_component),
-            ("override".into(), self.override_component),
+            ("bonus".into(), self.bonus_component),
             ("total".into(), self.weight),
         ])
     }
@@ -795,7 +795,7 @@ user-supplied key.
 
 Linear subtraction is unsafe — high `semantic_boost` can override noise. **v1 formula**:
 ```
-W = (w_base * base_weight + w_semantic * semantic_boost + w_override * override) * (1.0 - noise_penalty)
+W = (w_base * base_weight + w_semantic * semantic_boost + w_bonus * override) * (1.0 - noise_penalty)
 ```
 With `noise_penalty = 0.9`, even boosted nodes get 10% of their score → never in top-K.
 

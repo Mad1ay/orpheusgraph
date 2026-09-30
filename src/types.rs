@@ -98,8 +98,8 @@ pub struct NodeResult {
     pub semantic_component: f32,
     /// Effective noise factor applied (multiplicative)
     pub noise_component: f32,
-    /// w_override * weight_override
-    pub override_component: f32,
+    /// w_bonus * weight_bonus
+    pub bonus_component: f32,
 }
 
 impl NodeResult {
@@ -109,7 +109,7 @@ impl NodeResult {
             ("base".into(), self.base_component),
             ("semantic".into(), self.semantic_component),
             ("noise".into(), self.noise_component),
-            ("override".into(), self.override_component),
+            ("bonus".into(), self.bonus_component),
             ("total".into(), self.weight),
         ])
     }
@@ -143,16 +143,17 @@ pub struct DynamicContext {
 
     /// Per-request weight bonus (e.g. project-specific usage stats).
     ///
-    /// ADDITIVE despite the name: the value enters as `w_override * value`,
-    /// added alongside `base_weight` — it does NOT replace it. A node with
-    /// `base_weight = 0.3` and an entry of `0.5` scores `0.8`, not `0.5`.
-    pub weight_overrides: HashMap<String, f32>,
+    /// ADDITIVE: the value enters as `w_bonus * value`, added alongside the
+    /// node's base term — it does NOT replace it. Note `base_weight` here is
+    /// the build-time normalized value, not the number handed to
+    /// `build_graph`, so do not predict the total from the raw input.
+    pub weight_bonuses: HashMap<String, f32>,
 
     /// Scoring coefficients — configurable for A/B testing without Rust recompile
     pub w_base: f32, // default 1.0
     pub w_semantic: f32, // default 1.5
     pub w_noise: f32,    // default 1.0
-    pub w_override: f32, // default 1.0
+    pub w_bonus: f32, // default 1.0
 
     /// Domain-aware noise filter (e.g. "technical", "audit", "messaging")
     /// Nodes tagged with these domains get boosted noise_penalty
@@ -199,11 +200,11 @@ impl Default for DynamicContext {
             semantic_boosts: HashMap::new(),
             overlay_nodes: Vec::new(),
             overlay_edges: Vec::new(),
-            weight_overrides: HashMap::new(),
+            weight_bonuses: HashMap::new(),
             w_base: 1.0,
             w_semantic: 1.5,
             w_noise: 1.0,
-            w_override: 1.0,
+            w_bonus: 1.0,
             noise_tags: HashSet::new(),
             max_fan_out: None,
             fan_out_pagerank_bypass: Some(0.5),
